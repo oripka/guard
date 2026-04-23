@@ -133,14 +133,14 @@ func showError(_ message: String) {
 }
 
 final class CardView: NSView {
-    init(fill: NSColor = NSColor.controlBackgroundColor.withAlphaComponent(0.56), border: NSColor = NSColor.separatorColor.withAlphaComponent(0.24)) {
+    init(fill: NSColor = NSColor.controlBackgroundColor.withAlphaComponent(0.42), border: NSColor = NSColor.separatorColor.withAlphaComponent(0.14)) {
         super.init(frame: .zero)
         wantsLayer = true
         layer?.cornerRadius = 10
         layer?.cornerCurve = .continuous
         layer?.backgroundColor = fill.cgColor
         layer?.borderColor = border.cgColor
-        layer?.borderWidth = 1
+        layer?.borderWidth = 0.5
     }
 
     required init?(coder: NSCoder) {
@@ -292,35 +292,44 @@ final class LauncherWindowController: NSObject, NSWindowDelegate {
         stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
 
-        stack.addArrangedSubview(settingsSection(
+        let group = CardView()
+        let groupStack = paddedStack(in: group, inset: 0)
+        groupStack.spacing = 0
+        groupStack.alignment = .width
+
+        groupStack.addArrangedSubview(settingsRow(
             symbol: "network",
             title: "Network Allowlist",
             subtitle: "Only vendor domains are allowed through Guard.",
             values: summary.network.allowedDomains,
             tint: .systemGreen
         ))
-        stack.addArrangedSubview(settingsSection(
+        groupStack.addArrangedSubview(separator())
+        groupStack.addArrangedSubview(settingsRow(
             symbol: "folder",
             title: "Read Access",
             subtitle: "App bundle and minimal support paths.",
             values: summary.filesystem.allowRead,
             tint: .systemBlue
         ))
-        stack.addArrangedSubview(settingsSection(
+        groupStack.addArrangedSubview(separator())
+        groupStack.addArrangedSubview(settingsRow(
             symbol: "lock",
             title: "Protected Paths",
             subtitle: "Critical roots and secret writes stay blocked.",
             values: summary.filesystem.denyRead + summary.filesystem.denyWrite,
             tint: .systemOrange
         ))
-        stack.addArrangedSubview(settingsSection(
+        groupStack.addArrangedSubview(separator())
+        groupStack.addArrangedSubview(settingsRow(
             symbol: summary.findings.isEmpty ? "checkmark.shield" : "exclamationmark.triangle",
             title: "Review",
             subtitle: reviewSubtitle(),
             values: reviewValues(),
             tint: summary.findings.isEmpty ? .systemGreen : .systemOrange,
-            initiallyExpanded: !summary.findings.isEmpty
+            initiallyExpanded: true
         ))
+        stack.addArrangedSubview(group)
 
         scroll.documentView = stack
         NSLayoutConstraint.activate([
@@ -355,27 +364,30 @@ final class LauncherWindowController: NSObject, NSWindowDelegate {
         return row
     }
 
-    func settingsSection(
+    func settingsRow(
         symbol: String,
         title: String,
         subtitle: String,
         values: [String],
         tint: NSColor,
-        initiallyExpanded: Bool = false
+        initiallyExpanded: Bool = true
     ) -> NSView {
-        let card = CardView()
-        let stack = paddedStack(in: card, inset: 12)
-        stack.spacing = 8
+        let rowContainer = NSView()
+        let stack = paddedStack(in: rowContainer, inset: 12)
+        stack.spacing = 7
 
         let header = NSStackView()
         header.orientation = .horizontal
         header.alignment = .centerY
-        header.spacing = 8
-        header.addArrangedSubview(symbolView(symbol, color: tint, size: 16))
+        header.spacing = 10
+
+        let icon = symbolView(symbol, color: tint, size: 17)
+        header.addArrangedSubview(icon)
 
         let labels = NSStackView()
         labels.orientation = .vertical
         labels.spacing = 1
+        labels.alignment = .leading
         labels.addArrangedSubview(label(title, size: 14, weight: .semibold))
         labels.addArrangedSubview(label(subtitle, size: 11, weight: .regular, color: .secondaryLabelColor))
         header.addArrangedSubview(labels)
@@ -401,15 +413,34 @@ final class LauncherWindowController: NSObject, NSWindowDelegate {
 
         stack.addArrangedSubview(header)
 
-        let shown = values.isEmpty ? ["None"] : Array(values.prefix(10))
+        let shown = values.isEmpty ? ["None"] : Array(values.prefix(6))
         for value in shown {
             details.addArrangedSubview(valueRow(value, muted: values.isEmpty))
         }
         if values.count > shown.count {
             details.addArrangedSubview(label("+ \(values.count - shown.count) more in the policy file", size: 11, weight: .regular, color: .tertiaryLabelColor))
         }
-        stack.addArrangedSubview(details)
-        return card
+
+        let detailsRow = NSStackView()
+        detailsRow.orientation = .horizontal
+        detailsRow.alignment = .top
+        detailsRow.spacing = 10
+        let indent = NSView()
+        indent.translatesAutoresizingMaskIntoConstraints = false
+        indent.widthAnchor.constraint(equalToConstant: 17).isActive = true
+        detailsRow.addArrangedSubview(indent)
+        detailsRow.addArrangedSubview(details)
+        stack.addArrangedSubview(detailsRow)
+        return rowContainer
+    }
+
+    func separator() -> NSView {
+        let view = NSView()
+        view.wantsLayer = true
+        view.layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.16).cgColor
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.heightAnchor.constraint(equalToConstant: 0.5).isActive = true
+        return view
     }
 
     func paddedStack(in view: NSView, inset: CGFloat) -> NSStackView {

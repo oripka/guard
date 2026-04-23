@@ -15,14 +15,14 @@ Requirements:
 Package-manager install from GitHub:
 
 ```sh
-pnpm add -g github:<owner>/guard
+pnpm add -g github:oripka/guard
 guard setup
 ```
 
 Or clone and link directly from the repo:
 
 ```sh
-git clone https://github.com/<owner>/guard.git ~/src/guard
+git clone https://github.com/oripka/guard.git ~/src/guard
 ~/src/guard/bin/guard setup
 ```
 
