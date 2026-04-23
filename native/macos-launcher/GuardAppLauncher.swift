@@ -113,14 +113,9 @@ func launchGuardedApp(config: GuardAppConfig) throws {
     let log = try logFileHandle(profile: config.profile)
     process.standardOutput = log
     process.standardError = log
-    process.terminationHandler = { _ in
-        try? log.close()
-        DispatchQueue.main.async {
-            NSApp.terminate(nil)
-        }
-    }
 
     try process.run()
+    try? log.close()
 }
 
 func showError(_ message: String) {
@@ -133,14 +128,14 @@ func showError(_ message: String) {
 }
 
 final class CardView: NSView {
-    init(fill: NSColor = NSColor.controlBackgroundColor.withAlphaComponent(0.42), border: NSColor = NSColor.separatorColor.withAlphaComponent(0.14)) {
+    init(fill: NSColor = NSColor.controlBackgroundColor.withAlphaComponent(0.46), border: NSColor = NSColor.clear) {
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.cornerRadius = 10
+        layer?.cornerRadius = 14
         layer?.cornerCurve = .continuous
         layer?.backgroundColor = fill.cgColor
         layer?.borderColor = border.cgColor
-        layer?.borderWidth = 0.5
+        layer?.borderWidth = 0
     }
 
     required init?(coder: NSCoder) {
@@ -148,11 +143,54 @@ final class CardView: NSView {
     }
 }
 
+final class DisclosureButton: NSButton {
+    weak var disclosureView: NSView?
+
+    init(expanded: Bool) {
+        super.init(frame: .zero)
+        title = expanded ? "⌄" : "›"
+        isBordered = false
+        bezelStyle = .regularSquare
+        font = NSFont.systemFont(ofSize: 20, weight: .semibold)
+        contentTintColor = .tertiaryLabelColor
+        setButtonType(.momentaryChange)
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: 18).isActive = true
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+}
+
+final class SettingsRowView: NSView {
+    weak var disclosureView: NSView?
+    weak var disclosureButton: DisclosureButton?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(handleClick(_:))))
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    @objc private func handleClick(_ recognizer: NSClickGestureRecognizer) {
+        toggleDisclosure()
+    }
+
+    @objc func toggleDisclosure() {
+        guard let detail = disclosureView else { return }
+        detail.isHidden.toggle()
+        disclosureButton?.title = detail.isHidden ? "›" : "⌄"
+    }
+}
+
 final class LauncherWindowController: NSObject, NSWindowDelegate {
     let config: GuardAppConfig
     let summary: GuardAppSummary
     var window: NSWindow?
-    var disclosureTargets: [NSUserInterfaceItemIdentifier: NSView] = [:]
 
     init(config: GuardAppConfig, summary: GuardAppSummary) {
         self.config = config
@@ -161,7 +199,7 @@ final class LauncherWindowController: NSObject, NSWindowDelegate {
 
     func show() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 540),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 500),
             styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -174,7 +212,7 @@ final class LauncherWindowController: NSObject, NSWindowDelegate {
         window.delegate = self
 
         let background = NSVisualEffectView()
-        background.material = .hudWindow
+        background.material = .contentBackground
         background.blendingMode = .behindWindow
         background.state = .active
         background.translatesAutoresizingMaskIntoConstraints = false
@@ -182,8 +220,8 @@ final class LauncherWindowController: NSObject, NSWindowDelegate {
 
         let root = NSStackView()
         root.orientation = .vertical
-        root.spacing = 10
-        root.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 16, right: 20)
+        root.spacing = 12
+        root.edgeInsets = NSEdgeInsets(top: 18, left: 34, bottom: 16, right: 34)
         root.translatesAutoresizingMaskIntoConstraints = false
         background.addSubview(root)
 
@@ -214,20 +252,16 @@ final class LauncherWindowController: NSObject, NSWindowDelegate {
     @objc func launchApp(_ sender: Any?) {
         do {
             try launchGuardedApp(config: config)
-            window?.orderOut(nil)
-            NSApp.run()
+            NSApp.terminate(nil)
         } catch {
             showError(error.localizedDescription)
         }
     }
 
-    @objc func toggleDisclosure(_ sender: NSButton) {
-        guard let identifier = sender.identifier, let target = disclosureTargets[identifier] else {
-            return
-        }
-        target.isHidden.toggle()
-        sender.title = target.isHidden ? "Show" : "Hide"
-        window?.layoutIfNeeded()
+    @objc func toggleDisclosure(_ sender: DisclosureButton) {
+        guard let detail = sender.disclosureView else { return }
+        detail.isHidden.toggle()
+        sender.title = detail.isHidden ? "›" : "⌄"
     }
 
     func makeHeader() -> NSView {
@@ -241,11 +275,11 @@ final class LauncherWindowController: NSObject, NSWindowDelegate {
         icon.imageScaling = .scaleProportionallyUpOrDown
         icon.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            icon.widthAnchor.constraint(equalToConstant: 48),
-            icon.heightAnchor.constraint(equalToConstant: 48)
+            icon.widthAnchor.constraint(equalToConstant: 44),
+            icon.heightAnchor.constraint(equalToConstant: 44)
         ])
 
-        let title = label("Launch \(config.displayName) with Guard", size: 22, weight: .bold)
+        let title = label("Launch \(config.displayName) with Guard", size: 20, weight: .bold)
         let subtitle = label(
             summary.description.isEmpty ? "Review the locked sandbox before opening the app." : summary.description,
             size: 13,
@@ -253,7 +287,7 @@ final class LauncherWindowController: NSObject, NSWindowDelegate {
             color: .secondaryLabelColor
         )
 
-        let titleStack = NSStackView(views: [title, subtitle, makeChipRow()])
+        let titleStack = NSStackView(views: [title, subtitle, makeMetaLine()])
         titleStack.orientation = .vertical
         titleStack.alignment = .leading
         titleStack.spacing = 5
@@ -263,19 +297,14 @@ final class LauncherWindowController: NSObject, NSWindowDelegate {
         return row
     }
 
-    func makeChipRow() -> NSView {
-        let row = NSStackView()
-        row.orientation = .horizontal
-        row.spacing = 6
-        row.addArrangedSubview(chip("Locked", color: statusColor()))
-        row.addArrangedSubview(chip(summary.risk.capitalized, color: riskColor()))
-        row.addArrangedSubview(chip(summary.network.mode.capitalized, color: .controlAccentColor))
-        if summary.findings.isEmpty {
-            row.addArrangedSubview(chip("No warnings", color: .systemGreen))
-        } else {
-            row.addArrangedSubview(chip("\(summary.findings.count) warning\(summary.findings.count == 1 ? "" : "s")", color: .systemOrange))
-        }
-        return row
+    func makeMetaLine() -> NSView {
+        let warningText = summary.findings.isEmpty ? "No warnings" : "\(summary.findings.count) warning\(summary.findings.count == 1 ? "" : "s")"
+        return label(
+            "\(summary.status.capitalized) profile • \(summary.risk.capitalized) risk • \(summary.network.mode.capitalized) network • \(warningText)",
+            size: 11,
+            weight: .regular,
+            color: .tertiaryLabelColor
+        )
     }
 
     func makePolicyList() -> NSView {
@@ -284,7 +313,7 @@ final class LauncherWindowController: NSObject, NSWindowDelegate {
         scroll.drawsBackground = false
         scroll.borderType = .noBorder
         scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.heightAnchor.constraint(equalToConstant: 330).isActive = true
+        scroll.heightAnchor.constraint(equalToConstant: 300).isActive = true
 
         let stack = NSStackView()
         stack.orientation = .vertical
@@ -300,25 +329,32 @@ final class LauncherWindowController: NSObject, NSWindowDelegate {
         groupStack.addArrangedSubview(settingsRow(
             symbol: "network",
             title: "Network Allowlist",
-            subtitle: "Only vendor domains are allowed through Guard.",
+            subtitle: "Allows \(exampleText(summary.network.allowedDomains, empty: "no domains")).",
             values: summary.network.allowedDomains,
-            tint: .systemGreen
+            tint: .systemGreen,
+            countText: "\(summary.network.allowedDomains.count)",
+            initiallyExpanded: true
         ))
         groupStack.addArrangedSubview(separator())
         groupStack.addArrangedSubview(settingsRow(
             symbol: "folder",
             title: "Read Access",
-            subtitle: "App bundle and minimal support paths.",
+            subtitle: "Allows \(exampleText(summary.filesystem.allowRead, empty: "no paths")).",
             values: summary.filesystem.allowRead,
-            tint: .systemBlue
+            tint: .systemBlue,
+            countText: "\(summary.filesystem.allowRead.count)",
+            initiallyExpanded: true
         ))
         groupStack.addArrangedSubview(separator())
+        let protectedPaths = summary.filesystem.denyRead + summary.filesystem.denyWrite
         groupStack.addArrangedSubview(settingsRow(
             symbol: "lock",
             title: "Protected Paths",
-            subtitle: "Critical roots and secret writes stay blocked.",
-            values: summary.filesystem.denyRead + summary.filesystem.denyWrite,
-            tint: .systemOrange
+            subtitle: "Denies \(exampleText(protectedPaths, empty: "no paths")).",
+            values: protectedPaths,
+            tint: .systemOrange,
+            countText: "\(protectedPaths.count)",
+            initiallyExpanded: true
         ))
         groupStack.addArrangedSubview(separator())
         groupStack.addArrangedSubview(settingsRow(
@@ -327,7 +363,8 @@ final class LauncherWindowController: NSObject, NSWindowDelegate {
             subtitle: reviewSubtitle(),
             values: reviewValues(),
             tint: summary.findings.isEmpty ? .systemGreen : .systemOrange,
-            initiallyExpanded: true
+            countText: summary.findings.isEmpty ? "0" : "\(summary.findings.count)",
+            initiallyExpanded: !summary.findings.isEmpty
         ))
         stack.addArrangedSubview(group)
 
@@ -370,67 +407,58 @@ final class LauncherWindowController: NSObject, NSWindowDelegate {
         subtitle: String,
         values: [String],
         tint: NSColor,
-        initiallyExpanded: Bool = true
+        countText: String,
+        initiallyExpanded: Bool
     ) -> NSView {
-        let rowContainer = NSView()
-        let stack = paddedStack(in: rowContainer, inset: 12)
-        stack.spacing = 7
+        let rowContainer = SettingsRowView()
+        let stack = paddedStack(in: rowContainer, inset: 10)
+        stack.spacing = 4
+        stack.alignment = .width
 
         let header = NSStackView()
         header.orientation = .horizontal
         header.alignment = .centerY
         header.spacing = 10
+        header.translatesAutoresizingMaskIntoConstraints = false
+        header.heightAnchor.constraint(greaterThanOrEqualToConstant: 36).isActive = true
 
-        let icon = symbolView(symbol, color: tint, size: 17)
-        header.addArrangedSubview(icon)
+        header.addArrangedSubview(symbolTile(symbol, color: tint))
 
         let labels = NSStackView()
         labels.orientation = .vertical
         labels.spacing = 1
         labels.alignment = .leading
         labels.addArrangedSubview(label(title, size: 14, weight: .semibold))
-        labels.addArrangedSubview(label(subtitle, size: 11, weight: .regular, color: .secondaryLabelColor))
+        let subtitleLabel = label(subtitle, size: 11, weight: .regular, color: .secondaryLabelColor)
+        subtitleLabel.maximumNumberOfLines = 2
+        subtitleLabel.lineBreakMode = .byTruncatingMiddle
+        labels.addArrangedSubview(subtitleLabel)
         header.addArrangedSubview(labels)
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         header.addArrangedSubview(spacer)
 
-        let details = NSStackView()
-        details.orientation = .vertical
-        details.alignment = .leading
-        details.spacing = 5
-        details.isHidden = !initiallyExpanded
+        let count = label(countText, size: 13, weight: .semibold, color: .secondaryLabelColor)
+        count.alignment = .right
+        count.translatesAutoresizingMaskIntoConstraints = false
+        count.widthAnchor.constraint(greaterThanOrEqualToConstant: 22).isActive = true
+        header.addArrangedSubview(count)
 
-        let button = NSButton(title: initiallyExpanded ? "Hide" : "Show", target: self, action: #selector(toggleDisclosure(_:)))
-        button.bezelStyle = .rounded
-        button.controlSize = .small
-        let identifier = NSUserInterfaceItemIdentifier(UUID().uuidString)
-        button.identifier = identifier
-        details.identifier = identifier
-        disclosureTargets[identifier] = details
-        header.addArrangedSubview(button)
+        let disclosure = DisclosureButton(expanded: initiallyExpanded)
+        disclosure.target = rowContainer
+        disclosure.action = #selector(SettingsRowView.toggleDisclosure)
+        header.addArrangedSubview(disclosure)
 
         stack.addArrangedSubview(header)
 
-        let shown = values.isEmpty ? ["None"] : Array(values.prefix(6))
-        for value in shown {
-            details.addArrangedSubview(valueRow(value, muted: values.isEmpty))
-        }
-        if values.count > shown.count {
-            details.addArrangedSubview(label("+ \(values.count - shown.count) more in the policy file", size: 11, weight: .regular, color: .tertiaryLabelColor))
-        }
+        let details = makeDetails(values: values)
+        details.isHidden = !initiallyExpanded
+        disclosure.disclosureView = details
+        rowContainer.disclosureView = details
+        rowContainer.disclosureButton = disclosure
+        stack.addArrangedSubview(details)
 
-        let detailsRow = NSStackView()
-        detailsRow.orientation = .horizontal
-        detailsRow.alignment = .top
-        detailsRow.spacing = 10
-        let indent = NSView()
-        indent.translatesAutoresizingMaskIntoConstraints = false
-        indent.widthAnchor.constraint(equalToConstant: 17).isActive = true
-        detailsRow.addArrangedSubview(indent)
-        detailsRow.addArrangedSubview(details)
-        stack.addArrangedSubview(detailsRow)
         return rowContainer
     }
 
@@ -459,32 +487,6 @@ final class LauncherWindowController: NSObject, NSWindowDelegate {
         return stack
     }
 
-    func valueRow(_ text: String, muted: Bool) -> NSView {
-        let row = NSStackView()
-        row.orientation = .horizontal
-        row.alignment = .firstBaseline
-        row.spacing = 6
-        row.addArrangedSubview(label("•", size: 11, weight: .regular, color: muted ? .tertiaryLabelColor : .secondaryLabelColor))
-        let textLabel = label(text, size: 11, weight: .regular, color: muted ? .tertiaryLabelColor : .labelColor)
-        textLabel.lineBreakMode = .byTruncatingMiddle
-        row.addArrangedSubview(textLabel)
-        return row
-    }
-
-    func chip(_ text: String, color: NSColor) -> NSView {
-        let view = CardView(fill: color.withAlphaComponent(0.14), border: color.withAlphaComponent(0.30))
-        let textLabel = label(text, size: 11, weight: .semibold, color: color)
-        textLabel.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(textLabel)
-        NSLayoutConstraint.activate([
-            textLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
-            textLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
-            textLabel.topAnchor.constraint(equalTo: view.topAnchor, constant: 4),
-            textLabel.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -4)
-        ])
-        return view
-    }
-
     func symbolView(_ name: String, color: NSColor, size: CGFloat = 18) -> NSView {
         let imageView = NSImageView()
         if #available(macOS 11.0, *) {
@@ -502,6 +504,26 @@ final class LauncherWindowController: NSObject, NSWindowDelegate {
         return imageView
     }
 
+    func symbolTile(_ name: String, color: NSColor) -> NSView {
+        let tile = CardView(fill: NSColor.controlBackgroundColor.withAlphaComponent(0.64), border: NSColor.separatorColor.withAlphaComponent(0.16))
+        tile.layer?.cornerRadius = 7
+        tile.layer?.borderWidth = 0.5
+        tile.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            tile.widthAnchor.constraint(equalToConstant: 26),
+            tile.heightAnchor.constraint(equalToConstant: 26)
+        ])
+
+        let symbol = symbolView(name, color: color, size: 15)
+        symbol.translatesAutoresizingMaskIntoConstraints = false
+        tile.addSubview(symbol)
+        NSLayoutConstraint.activate([
+            symbol.centerXAnchor.constraint(equalTo: tile.centerXAnchor),
+            symbol.centerYAnchor.constraint(equalTo: tile.centerYAnchor)
+        ])
+        return tile
+    }
+
     func label(_ text: String, size: CGFloat, weight: NSFont.Weight, color: NSColor = .labelColor) -> NSTextField {
         let field = NSTextField(labelWithString: text)
         field.font = NSFont.systemFont(ofSize: size, weight: weight)
@@ -509,6 +531,38 @@ final class LauncherWindowController: NSObject, NSWindowDelegate {
         field.maximumNumberOfLines = 0
         field.lineBreakMode = .byWordWrapping
         return field
+    }
+
+    func makeDetails(values: [String]) -> NSView {
+        let container = NSView()
+        let list = NSStackView()
+        list.orientation = .vertical
+        list.alignment = .leading
+        list.spacing = 3
+        list.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(list)
+
+        if values.isEmpty {
+            list.addArrangedSubview(label("None", size: 11, weight: .regular, color: .tertiaryLabelColor))
+        } else {
+            for value in values.prefix(5) {
+                let line = label(value, size: 11, weight: .regular, color: .secondaryLabelColor)
+                line.lineBreakMode = .byTruncatingMiddle
+                line.maximumNumberOfLines = 1
+                list.addArrangedSubview(line)
+            }
+            if values.count > 5 {
+                list.addArrangedSubview(label("+ \(values.count - 5) more in the policy file", size: 11, weight: .regular, color: .tertiaryLabelColor))
+            }
+        }
+
+        NSLayoutConstraint.activate([
+            list.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 36),
+            list.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -28),
+            list.topAnchor.constraint(equalTo: container.topAnchor),
+            list.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -4)
+        ])
+        return container
     }
 
     func statusColor() -> NSColor {
@@ -528,16 +582,23 @@ final class LauncherWindowController: NSObject, NSWindowDelegate {
         if summary.findings.isEmpty {
             return "No risky policy choices were found."
         }
-        return "\(summary.findings.count) policy warning\(summary.findings.count == 1 ? "" : "s") needs review."
+        return summary.findings.first?.message ?? "\(summary.findings.count) policy warning\(summary.findings.count == 1 ? "" : "s") needs review."
     }
 
     func reviewValues() -> [String] {
         if summary.findings.isEmpty {
-            return ["Ready to launch with the locked profile."]
+            return []
         }
-        return summary.findings.map { finding in
-            "[\(finding.severity)] \(finding.message)"
+        return summary.findings.map { "[\($0.severity)] \($0.message)" }
+    }
+
+    func exampleText(_ values: [String], empty: String) -> String {
+        if values.isEmpty {
+            return empty
         }
+        let shown = values.prefix(2).joined(separator: ", ")
+        let suffix = values.count > 2 ? ", +\(values.count - 2) more" : ""
+        return "\(shown)\(suffix)"
     }
 
 }

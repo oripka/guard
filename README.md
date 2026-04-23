@@ -1,7 +1,47 @@
 # guard
 
-This repo contains the local `guard` runtime, installer, and reference
-policies for running risky developer commands under a native macOS sandbox.
+`guard` runs developer tools and selected native macOS UI apps inside a local
+macOS sandbox.
+
+The goal is simple: when you open an unfamiliar repo, install dependencies, run
+a dev server, or launch a high-risk app profile, the process should not get
+implicit access to your whole home directory, mounted volumes, secrets, or
+arbitrary network destinations. `guard` makes that access explicit and
+reviewable through project and app profiles.
+
+It supports two main workflows:
+
+- **Developer commands**: run `node`, `pnpm`, `npm`, `python`, `pip`, and other
+  project tools under a fail-closed filesystem and network policy.
+- **Native UI apps**: launch built-in app profiles for Zoom, Microsoft Teams,
+  and Webex, or install optional `Guard <App>.app` wrappers that show the
+  effective permissions before opening the app.
+
+Under the hood, `guard` generates local `sandbox-exec` profiles, provides
+PATH-based shims for risky toolchains, creates per-run fake home/temp
+directories, and can proxy network traffic through an allowlist/ask flow. It is
+macOS-focused and does not depend on a remote service.
+
+## What It Protects
+
+Default project profiles are intentionally narrow:
+
+- deny reads from user homes, mounted volumes, `/Applications`, `/cores`, and
+  `/home`
+- reopen only the current project and guard's per-run directory
+- allow writes only to the project and per-run directory
+- block common secret writes such as `.env`, `*.pem`, `*.key`, and `secrets/`
+- allow localhost dev-server binding without granting broad outbound network
+  access
+
+App profiles use the same idea for native UI apps: deny broad local filesystem
+access, reopen only the app bundle and required app data paths, and constrain
+network egress to the vendor domains that profile needs.
+
+`guard` is not a VM and is not a replacement for a separate macOS user account
+or full virtualization. It is a practical local containment layer for everyday
+developer workflows and selected UI apps where running unsandboxed would be too
+permissive.
 
 ## Install
 
@@ -61,14 +101,17 @@ a single shell or CI job.
 
 ## Usage
 
-From a project that contains `.guard/guard.json`:
+### Guard Developer Commands
+
+From a project that contains `.guard/guard.json`, prefix commands with `guard`:
 
 ```sh
 guard pnpm run dev
 guard --ask-network pnpm run dev
 ```
 
-Bootstrap a default project profile:
+Bootstrap a default project profile for a Node, Vite, Nuxt, Slidev, Wrangler,
+or similar UI/dev-server app:
 
 ```sh
 guard init
@@ -85,29 +128,46 @@ guard diff-profile zoom teams
 guard network-log /tmp/guard-network.jsonl
 ```
 
-Built-in app profiles can be launched from any directory:
+### Guard Native UI Apps
+
+Built-in UI app profiles can be launched from any directory:
 
 ```sh
 guard run zoom
 guard run teams
 guard run webex
-guard help
-guard install-app webex
-guard install-app teams
-guard install-app zoom
-guard install-apps
+```
+
+You can also run the vendor binary explicitly with a built-in profile:
+
+```sh
 guard --profile zoom -- /Applications/zoom.us.app/Contents/MacOS/zoom.us
 guard --profile teams -- "/Applications/Microsoft Teams.app/Contents/MacOS/MSTeams"
 guard --profile webex -- /Applications/Webex.app/Contents/MacOS/Webex
 ```
 
-Or:
+After installing app launchers, you can also start the guarded UI apps through
+PATH commands:
 
 ```sh
 guard-zoom
 guard-teams
 guard-webex
 ```
+
+Or install native macOS wrappers in `~/Applications`:
+
+```sh
+guard install-app webex
+guard install-app teams
+guard install-app zoom
+guard install-apps
+```
+
+Those wrappers appear as `Guard Zoom.app`, `Guard Teams.app`, and
+`Guard Webex.app`. Each wrapper shows a native preflight summary of the profile,
+including filesystem, network, and warning status, before launching the real
+app through `guard`.
 
 The local setup can install PATH shims in `~/.local/bin` so common dependency
 and script runners are guarded in both interactive terminals and non-interactive

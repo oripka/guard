@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { createServer as createHttpServer } from 'node:http'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import test from 'node:test'
@@ -383,6 +383,62 @@ test('allowLoopbackHighPorts emits the macOS ephemeral range only', () => {
   assert.match(profile, /\(allow network-outbound \(remote ip "localhost:65535"\)\)/)
   assert.doesNotMatch(profile, /\(allow network-outbound \(remote ip "localhost:49151"\)\)/)
   assert.doesNotMatch(profile, /\(allow network-outbound \(remote ip "localhost:\*"\)\)/)
+})
+
+test('version probes keep filesystem sandbox while skipping expensive high-port network rules', () => {
+  const profilePath = writeGuardProfile('version-probe-high-ports', {
+    ...networkProfileConfig({
+      allowedDomains: ['example.com'],
+    }),
+    network: {
+      ...networkProfileConfig({ allowedDomains: ['example.com'] }).network,
+      allowLoopbackHighPorts: true,
+      allowLoopbackPorts: [3000],
+    },
+  })
+  const tempDir = mkdtempSync(join(tmpdir(), 'guard-version-probe-'))
+  const pnpmLikeNode = join(tempDir, 'pnpm.cjs')
+
+  try {
+    symlinkSync(process.execPath, pnpmLikeNode)
+
+    for (const command of [
+      ['node', '--version'],
+      [pnpmLikeNode, '--version'],
+    ]) {
+      const result = spawnSync(
+        guard,
+        ['--profile', 'version-probe-high-ports', ...command],
+        {
+          cwd: appRoot,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            GUARD_BANNER: 'compact',
+            GUARD_QUIET: '',
+          },
+        },
+      )
+
+      expectOk(result)
+      assert.match(result.stdout.trim(), /^v\d+\./)
+
+      const runMatch = result.stderr.match(/run=([^\s]+)/)
+      assert.ok(runMatch, result.stderr)
+      const generatedProfile = readFileSync(
+        join(runMatch[1], 'tmp/profile.sb'),
+        'utf8',
+      )
+
+      assert.match(generatedProfile, /\(deny file-read\*[\s\S]*\(subpath "\/Users"\)/)
+      assert.doesNotMatch(generatedProfile, /localhost:49152/)
+      assert.doesNotMatch(generatedProfile, /localhost:3000/)
+      assert.doesNotMatch(generatedProfile, /example\.com/)
+    }
+  } finally {
+    rmSync(profilePath, { force: true })
+    rmSync(tempDir, { force: true, recursive: true })
+  }
 })
 
 test('allowLoopbackPorts rejects invalid ports', () => {
