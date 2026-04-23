@@ -420,10 +420,24 @@ Direct raw TCP remains controlled by the native sandbox profile.
 `network.allowLocalBinding` is intentionally loopback-only. It permits local dev
 servers to listen on localhost without allowing direct outbound TCP, DNS, or
 ICMP egress. For dev tools that need to call back into localhost helper
-services, prefer exact `network.allowLoopbackPorts`. If a tool chooses random
-local callback ports, `network.allowLoopbackHighPorts` permits only the macOS
-ephemeral range `49152-65535`. `network.allowLoopbackConnections` permits all
-localhost TCP ports and should be treated as an escape hatch.
+services, prefer exact `network.allowLoopbackPorts`.
+
+Note: `network.allowLoopbackPorts` authorizes a localhost port number, not a
+specific process. Only list ports that are stable and expected for the project;
+if a different local service later binds the same port, the sandbox cannot
+distinguish it from the intended helper.
+
+Warning: `network.allowLoopbackHighPorts` is a compatibility fallback, not the
+default recommendation. macOS sandbox profiles do not support compact port
+ranges, so Guard must emit one rule per ephemeral port for `49152-65535`. That
+keeps the boundary narrower than all localhost access, but it can make guarded
+command startup noticeably slower and grants access to any loopback service in
+that high-port range. Prefer exact `network.allowLoopbackPorts`, or use
+`network.allowLoopbackListeningHighPorts` when the helper service is already
+listening before the guarded command starts.
+
+`network.allowLoopbackConnections` permits all localhost TCP ports and should be
+treated as an escape hatch.
 
 `guard` no longer depends on the external `srt` package. The current native
 runtime uses macOS `sandbox-exec` directly and keeps the policy generation local

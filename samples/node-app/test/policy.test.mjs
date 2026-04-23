@@ -939,6 +939,48 @@ test('allowLoopbackPorts policy allows exact loopback TCP connections', async ()
   }
 })
 
+test('allowLoopbackListeningHighPorts allows already-listening high loopback ports', async () => {
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('listening-high-ok\n')
+  })
+  const port = await listenLoopback(server)
+  assert.ok(port >= 49152, `expected an ephemeral port, got ${port}`)
+
+  const cfg = networkProfileConfig({ allowedDomains: [] })
+  cfg.network.allowLoopbackListeningHighPorts = ['node']
+  cfg.network.allowLoopbackPorts = []
+  const profilePath = writeGuardProfile('network-loopback-listening-high', cfg)
+
+  try {
+    const configResult = runGuardCommand([
+      '--profile',
+      'network-loopback-listening-high',
+      'node',
+      'scripts/probe.mjs',
+      'runtime-config-json',
+    ])
+    expectOk(configResult)
+    const runtimeCfg = JSON.parse(configResult.stdout)
+    assert.equal(runtimeCfg.network.allowLoopbackHighPorts, false)
+    assert.ok(runtimeCfg.network.allowLoopbackPorts.includes(port))
+
+    const connectResult = await runGuardCommandAsync([
+      '--profile',
+      'network-loopback-listening-high',
+      'node',
+      'scripts/probe.mjs',
+      'direct-tcp',
+      `tcp://127.0.0.1:${port}`,
+    ])
+    expectOk(connectResult)
+    assert.match(connectResult.stdout, /direct-ok/)
+  } finally {
+    rmSync(profilePath, { force: true })
+    await closeServer(server)
+  }
+})
+
 test('default local binding policy allows IPv6 loopback TCP listeners', () => {
   const result = runGuard(['tcp-listen', '::1'])
   expectOk(result)
