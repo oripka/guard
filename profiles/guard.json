@@ -1,0 +1,47 @@
+{
+  "metadata": {
+    "description": "Ephemeral fallback profile for ad-hoc guarded commands without a project config.",
+    "risk": "low",
+    "status": "locked"
+  },
+  "allowPty": true,
+  "workingDirectory": "${GUARD_RUN_DIR}",
+  "network": {
+    "allowedDomains": [],
+    "deniedDomains": [],
+    "allowLocalBinding": false,
+    "allowLoopbackConnections": false,
+    "allowLoopbackHighPorts": false,
+    "allowLoopbackPorts": [],
+    "allowUnixSockets": [
+      "${GUARD_RUN_DIR}"
+    ],
+    "allowMachLookup": [
+      "com.apple.FSEvents",
+      "com.apple.fseventsd",
+      "com.apple.FileCoordination"
+    ]
+  },
+  "filesystem": {
+    "denyRead": [
+      "/Users",
+      "/Volumes",
+      "/Applications",
+      "/cores",
+      "/home"
+    ],
+    "allowRead": [
+      "${GUARD_RUN_DIR}"
+    ],
+    "allowWrite": [
+      "${GUARD_RUN_DIR}"
+    ],
+    "denyWrite": [
+      ".env",
+      ".env.*",
+      "secrets/",
+      "*.key",
+      "*.pem"
+    ]
+  }
+}

@@ -269,6 +269,35 @@ test('resolves project root placeholders when invoked from a subdirectory', () =
   assert.match(env.guardRunDir, /\/guard\/run-/)
 })
 
+test('default built-in profile runs without exposing the invoking home tree', () => {
+  const result = spawnSync(
+    guard,
+    [
+      'node',
+      '-e',
+      [
+        "const fs = require('node:fs')",
+        "console.log(`cwd=${process.cwd()}`)",
+        "console.log(`project=${process.env.GUARD_PROJECT_DIR}`)",
+        `fs.readFileSync(${JSON.stringify(resolve(repoRoot, 'package.json'))})`,
+      ].join(';'),
+    ],
+    {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        GUARD_QUIET: '1',
+      },
+    },
+  )
+
+  assert.notEqual(result.status, 0, 'home-backed package.json read unexpectedly succeeded')
+  assert.match(result.stdout, /cwd=\/private\/tmp\/guard\/run-/)
+  assert.match(result.stdout, /project=\s*$/m)
+  assert.match(`${result.stderr}\n${result.stdout}`, /EPERM|operation not permitted|permission/i)
+})
+
 test('generates the expected effective sandbox config', () => {
   const result = runGuard(['runtime-config-json'])
   expectOk(result)
@@ -1271,7 +1300,7 @@ test('list profile can emit machine-readable JSON', () => {
   expectOk(result)
   const listed = JSON.parse(result.stdout)
   const names = listed.profiles.map((profile) => profile.name)
-  assert.deepEqual(names, ['teams', 'webex', 'zoom'])
+  assert.deepEqual(names, ['guard', 'teams', 'webex', 'zoom'])
   assert.equal(
     listed.profiles.find((profile) => profile.name === 'teams').launcher,
     'guard-teams',
@@ -1505,7 +1534,7 @@ test('GUARD_BANNER controls policy banner rendering', () => {
     },
   })
   expectOk(compact)
-  assert.match(compact.stderr, /^guard ok  net allowlist active  secrets protected  run=/)
+  assert.match(compact.stderr, /^guard ok  net none  secrets protected  run=/)
   assert.doesNotMatch(compact.stderr, /guard policy/)
   assert.doesNotMatch(compact.stderr, /✓ read/)
 
