@@ -1,0 +1,73 @@
+#!/bin/sh
+set -eu
+
+resolve_script() {
+  target=$1
+  while [ -L "$target" ]; do
+    target_dir=$(CDPATH= cd -P -- "$(dirname -- "$target")" && pwd)
+    link=$(readlink "$target")
+    case "$link" in
+      /*) target=$link ;;
+      *) target=$target_dir/$link ;;
+    esac
+  done
+  target_dir=$(CDPATH= cd -P -- "$(dirname -- "$target")" && pwd)
+  printf '%s/%s\n' "$target_dir" "$(basename -- "$target")"
+}
+
+find_real_node() {
+  if [ -n "${GUARD_REAL_NODE:-}" ]; then
+    printf '%s\n' "$GUARD_REAL_NODE"
+    return 0
+  fi
+
+  invoked_dir=$(CDPATH= cd -P -- "$(dirname -- "$0")" 2>/dev/null && pwd || true)
+  script_dir=$(dirname -- "$script_path")
+
+  old_ifs=$IFS
+  IFS=:
+  for path_dir in ${PATH:-}; do
+    [ -n "$path_dir" ] || continue
+    real_dir=$(CDPATH= cd -P -- "$path_dir" 2>/dev/null && pwd || true)
+    [ -n "$real_dir" ] || continue
+    [ "$real_dir" = "$invoked_dir" ] && continue
+    [ "$real_dir" = "$script_dir" ] && continue
+    if [ -n "${HOME:-}" ]; then
+      home_shim_dir=$(CDPATH= cd -P -- "$HOME/.local/bin" 2>/dev/null && pwd || true)
+      [ -n "$home_shim_dir" ] && [ "$real_dir" = "$home_shim_dir" ] && continue
+    fi
+    if [ -n "${GUARD_SHIM_DIR:-}" ]; then
+      configured_shim_dir=$(CDPATH= cd -P -- "$GUARD_SHIM_DIR" 2>/dev/null && pwd || true)
+      [ -n "$configured_shim_dir" ] && [ "$real_dir" = "$configured_shim_dir" ] && continue
+    fi
+    candidate=$real_dir/node
+    if [ -x "$candidate" ] && [ ! -d "$candidate" ]; then
+      candidate_script=$(resolve_script "$candidate" 2>/dev/null || true)
+      [ "$candidate_script" = "$script_path" ] && continue
+      IFS=$old_ifs
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  IFS=$old_ifs
+
+  for candidate in /opt/homebrew/bin/node /usr/local/bin/node; do
+    if [ -x "$candidate" ] && [ ! -d "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+script_path=$(resolve_script "$0")
+repo_root=$(dirname -- "$(dirname -- "$script_path")")
+
+node_bin=$(find_real_node) || {
+  printf '%s\n' 'guard: could not find a real node executable outside guard shim directories' >&2
+  printf '%s\n' 'Set GUARD_REAL_NODE=/absolute/path/to/node and retry.' >&2
+  exit 127
+}
+
+GUARD_INVOKED_PATH=$0 exec "$node_bin" "$repo_root/lib/guard-cli.mjs" "$@"

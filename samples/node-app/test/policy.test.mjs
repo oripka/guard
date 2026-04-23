@@ -1,0 +1,1841 @@
+import assert from 'node:assert/strict'
+import { spawn, spawnSync } from 'node:child_process'
+import { createServer as createHttpServer } from 'node:http'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
+import { tmpdir } from 'node:os'
+import test from 'node:test'
+import { fileURLToPath } from 'node:url'
+
+import { generateProfile } from '../../../lib/guard-manager.mjs'
+import { createDomainFilter } from '../../../lib/guard-network.mjs'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const appRoot = resolve(__dirname, '..')
+const repoRoot = resolve(appRoot, '../..')
+const guard = resolve(repoRoot, 'bin/guard')
+const shim = resolve(repoRoot, 'bin/guard-shim')
+
+const runGuard = (args, extraEnv = {}) => {
+  return spawnSync(guard, ['node', 'scripts/probe.mjs', ...args], {
+    cwd: appRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      ...extraEnv,
+      GUARD_QUIET: '1',
+    },
+  })
+}
+
+const runGuardFrom = (cwd, args, extraEnv = {}) => {
+  return spawnSync(guard, ['node', resolve(appRoot, 'scripts/probe.mjs'), ...args], {
+    cwd,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      ...extraEnv,
+      GUARD_QUIET: '1',
+    },
+  })
+}
+
+const runGuardCommand = (args, extraEnv = {}) => {
+  return spawnSync(guard, args, {
+    cwd: appRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      ...extraEnv,
+      GUARD_QUIET: '1',
+    },
+  })
+}
+
+const runGuardCommandAsync = (args, extraEnv = {}) =>
+  new Promise((resolve, reject) => {
+    const child = spawn(guard, args, {
+      cwd: appRoot,
+      env: {
+        ...process.env,
+        ...extraEnv,
+        GUARD_QUIET: '1',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk
+    })
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk
+    })
+    child.on('error', reject)
+    child.on('close', (status, signal) => {
+      resolve({ status, signal, stdout, stderr })
+    })
+  })
+
+const expectOk = (result) => {
+  assert.equal(result.status, 0, result.stderr || result.stdout)
+}
+
+const expectDenied = (result) => {
+  assert.notEqual(result.status, 0, 'command unexpectedly succeeded')
+  assert.match(`${result.stderr}\n${result.stdout}`, /EPERM|operation not permitted|permission/i)
+}
+
+const networkProfileConfig = ({
+  allowedDomains = ['localhost'],
+  deniedDomains = [],
+} = {}) => ({
+  allowPty: true,
+  network: {
+    allowedDomains,
+    deniedDomains,
+    allowLocalBinding: false,
+    allowLoopbackConnections: false,
+    allowLoopbackHighPorts: false,
+    allowLoopbackPorts: [],
+    allowUnixSockets: ['${GUARD_RUN_DIR}'],
+    allowMachLookup: [
+      'com.apple.FSEvents',
+      'com.apple.fseventsd',
+      'com.apple.FileCoordination',
+    ],
+  },
+  filesystem: {
+    denyRead: ['/Users', '/Volumes', '/Applications', '/cores', '/home'],
+    allowRead: ['${GUARD_PROJECT_DIR}', '${GUARD_RUN_DIR}'],
+    allowWrite: ['${GUARD_PROJECT_DIR}', '${GUARD_RUN_DIR}'],
+    denyWrite: ['.env', '.env.*', 'secrets/', '*.key', '*.pem'],
+  },
+})
+
+const writeGuardProfile = (name, cfg) => {
+  const profilePath = resolve(appRoot, `.guard/${name}.json`)
+  writeFileSync(profilePath, `${JSON.stringify(cfg, null, 2)}\n`)
+  return profilePath
+}
+
+const closeServer = (server) =>
+  new Promise((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  )
+
+const listenLoopback = async (server) => {
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  return server.address().port
+}
+
+const firstExisting = (candidates) =>
+  candidates.find((candidate) => candidate && existsSync(candidate)) || null
+
+const expectNoDirectNetwork = (result) => {
+  assert.notEqual(result.status, 0, 'direct network unexpectedly succeeded')
+  assert.match(
+    `${result.stderr}\n${result.stdout}`,
+    /EPERM|operation not permitted|permission|not permitted|denied/i,
+  )
+}
+
+for (const [tool, pattern] of [
+  ['node', /^v\d+\./],
+  ['python', /^Python \d+\./],
+  ['python3', /^Python \d+\./],
+  ['pip', /^pip \d+\./],
+  ['pip3', /^pip \d+\./],
+]) {
+  test(`${tool} shim wraps configured projects without recursion`, () => {
+    const result = spawnSync(shim, ['--version'], {
+      cwd: appRoot,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        GUARD_QUIET: '1',
+        GUARD_BIN: guard,
+        GUARD_SHIM_TOOL: tool,
+        GUARD_SHIM_BYPASS: '',
+        NODE_GUARD_BYPASS: '',
+        PNPM_GUARD_BYPASS: '',
+        NPM_GUARD_BYPASS: '',
+        PYTHON_GUARD_BYPASS: '',
+        PYTHON3_GUARD_BYPASS: '',
+        PIP_GUARD_BYPASS: '',
+        PIP3_GUARD_BYPASS: '',
+        DENO_GUARD_BYPASS: '',
+      },
+    })
+
+    expectOk(result)
+    assert.match(result.stdout.trim(), pattern)
+  })
+}
+
+for (const [tool, pattern] of [
+  ['pnpm', /^\d+\./],
+  ['npm', /^\d+\./],
+]) {
+  test(`${tool} shim has an explicit bypass for tool self-hosting paths`, () => {
+    const result = spawnSync(shim, ['--version'], {
+      cwd: appRoot,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        GUARD_BIN: guard,
+        GUARD_SHIM_TOOL: tool,
+        GUARD_SHIM_BYPASS: '1',
+      },
+    })
+
+    expectOk(result)
+    assert.match(result.stdout.trim(), pattern)
+  })
+}
+
+test('node shim refuses unconfigured code directories in non-interactive shells', () => {
+  const result = spawnSync(shim, ['--version'], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GUARD_BIN: guard,
+      GUARD_SHIM_TOOL: 'node',
+      NODE_GUARD_BYPASS: '',
+    },
+  })
+
+  assert.equal(result.status, 130)
+  assert.match(result.stderr, /refusing unsandboxed node/)
+})
+
+for (const tool of ['npx', 'corepack']) {
+  test(`${tool} shim is disabled`, () => {
+    const result = spawnSync(shim, ['--version'], {
+      cwd: appRoot,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        GUARD_BIN: guard,
+        GUARD_SHIM_TOOL: tool,
+        GUARD_SHIM_BYPASS: '',
+      },
+    })
+
+    assert.equal(result.status, 1)
+    assert.match(result.stderr, new RegExp(`${tool} is disabled by guard`))
+  })
+}
+
+test('deno shim is disabled until the native macOS runtime supports it', () => {
+  const result = spawnSync(shim, ['--version'], {
+    cwd: appRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GUARD_BIN: guard,
+      GUARD_SHIM_TOOL: 'deno',
+      GUARD_SHIM_BYPASS: '',
+    },
+  })
+
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /deno is not supported by guard's native macOS runtime yet/)
+})
+
+test('can read files inside the allowed project root', () => {
+  expectOk(runGuard(['read-file', 'package.json']))
+})
+
+test('can start the macOS Node file watcher inside the allowed project root', () => {
+  const result = runGuard(['fs-watch', '.'])
+  expectOk(result)
+  assert.match(result.stdout, /watch-ok/)
+})
+
+test('resolves project root placeholders when invoked from a subdirectory', () => {
+  const nestedDir = resolve(appRoot, 'nested/invocation')
+  mkdirSync(nestedDir, { recursive: true })
+
+  expectOk(runGuardFrom(nestedDir, ['read-file', resolve(appRoot, 'package.json')]))
+
+  const result = runGuardFrom(nestedDir, ['env-json'])
+  expectOk(result)
+  const env = JSON.parse(result.stdout)
+  assert.equal(env.guardProjectDir, appRoot)
+  assert.equal(env.guardCwd, nestedDir)
+  assert.match(env.guardRunDir, /\/guard\/run-/)
+})
+
+test('generates the expected effective sandbox config', () => {
+  const result = runGuard(['runtime-config-json'])
+  expectOk(result)
+  const cfg = JSON.parse(result.stdout)
+
+  assert.equal(cfg.allowPty, true)
+  assert.deepEqual(cfg.filesystem.denyRead, [
+    '/Users',
+    '/Volumes',
+    '/Applications',
+    '/cores',
+    '/home',
+  ])
+  assert.equal(cfg.filesystem.allowRead[0], appRoot)
+  assert.match(cfg.filesystem.allowRead[1], /\/guard\/run-/)
+  assert.equal(cfg.filesystem.allowWrite[0], appRoot)
+  assert.match(cfg.filesystem.allowWrite[1], /\/guard\/run-/)
+  assert.deepEqual(cfg.filesystem.denyWrite, ['.env', '.env.*', 'secrets/', '*.key', '*.pem'])
+  assert.deepEqual(cfg.network.allowedDomains, [])
+  assert.equal(cfg.network.allowLocalBinding, true)
+  assert.equal(cfg.network.allowLoopbackConnections, false)
+  assert.equal(cfg.network.allowLoopbackHighPorts, false)
+  assert.deepEqual(cfg.network.allowLoopbackPorts, [3000, 3001, 4983])
+  assert.match(cfg.network.allowUnixSockets[0], /\/guard\/run-/)
+})
+
+test('allowLocalBinding emits loopback bind rules without direct outbound access', () => {
+  const profile = generateProfile(
+    {
+      network: {
+        allowLocalBinding: true,
+      },
+    },
+    { cwd: appRoot },
+  )
+
+  assert.match(profile, /\(allow network-bind \(local ip "localhost:\*"\)\)/)
+  assert.match(profile, /\(allow network-inbound \(local ip "localhost:\*"\)\)/)
+  assert.doesNotMatch(profile, /\(allow network-outbound \(local ip "\*:\*"\)\)/)
+  assert.doesNotMatch(profile, /\(allow network-outbound \(remote ip "localhost:\*"\)\)/)
+})
+
+test('allowLoopbackConnections emits loopback outbound without broad egress', () => {
+  const profile = generateProfile(
+    {
+      network: {
+        allowLoopbackConnections: true,
+      },
+    },
+    { cwd: appRoot },
+  )
+
+  assert.match(profile, /\(allow network-outbound \(remote ip "localhost:\*"\)\)/)
+  assert.doesNotMatch(profile, /\(allow network-outbound \(remote ip "\*:\*"\)\)/)
+})
+
+test('allowLoopbackPorts emits exact loopback outbound ports only', () => {
+  const profile = generateProfile(
+    {
+      network: {
+        allowLoopbackPorts: [3001, '4983', 3001],
+      },
+    },
+    { cwd: appRoot },
+  )
+
+  assert.match(profile, /\(allow network-outbound \(remote ip "localhost:3001"\)\)/)
+  assert.match(profile, /\(allow network-outbound \(remote ip "localhost:4983"\)\)/)
+  assert.doesNotMatch(profile, /\(allow network-outbound \(remote ip "localhost:\*"\)\)/)
+})
+
+test('allowLoopbackHighPorts emits the macOS ephemeral range only', () => {
+  const profile = generateProfile(
+    {
+      network: {
+        allowLoopbackHighPorts: true,
+      },
+    },
+    { cwd: appRoot },
+  )
+
+  assert.match(profile, /\(allow network-outbound \(remote ip "localhost:49152"\)\)/)
+  assert.match(profile, /\(allow network-outbound \(remote ip "localhost:65535"\)\)/)
+  assert.doesNotMatch(profile, /\(allow network-outbound \(remote ip "localhost:49151"\)\)/)
+  assert.doesNotMatch(profile, /\(allow network-outbound \(remote ip "localhost:\*"\)\)/)
+})
+
+test('allowLoopbackPorts rejects invalid ports', () => {
+  assert.throws(
+    () =>
+      generateProfile(
+        {
+          network: {
+            allowLoopbackPorts: [0],
+          },
+        },
+        { cwd: appRoot },
+      ),
+    /invalid network\.allowLoopbackPorts entry/,
+  )
+})
+
+test('native manager does not emit extension rules by default', () => {
+  const profile = generateProfile(
+    {
+      networkUnrestricted: true,
+      network: {
+        allowMachLookup: ['com.apple.webinspector'],
+      },
+      filesystem: {
+        denyRead: ['/Users'],
+        allowRead: ['/tmp/zoom-read'],
+        allowWrite: ['/tmp/zoom-write'],
+        denyWrite: [],
+      },
+    },
+    { cwd: appRoot },
+  )
+
+  assert.doesNotMatch(profile, /file-issue-extension/)
+  assert.doesNotMatch(profile, /mach-issue-extension/)
+})
+
+test('native manager defaults denyRead to critical roots and reopens project root plus guard run dir', () => {
+  const nestedDir = resolve(appRoot, 'nested/invocation')
+  const profile = generateProfile(
+    {
+      networkUnrestricted: true,
+    },
+    {
+      cwd: nestedDir,
+      projectDir: appRoot,
+      guardRunDir: '/private/tmp/guard/default-run',
+    },
+  )
+
+  assert.match(profile, /\(deny file-read\*[\s\S]*\(subpath "\/Users"\)/)
+  assert.match(profile, /\(deny file-read\*[\s\S]*\(subpath "\/Volumes"\)/)
+  assert.match(
+    profile,
+    new RegExp(
+      `\\(allow file-read\\*[\\s\\S]*\\(subpath "${appRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"\\)`,
+    ),
+  )
+  assert.doesNotMatch(
+    profile,
+    new RegExp(
+      `\\(allow file-read\\*[\\s\\S]*\\(subpath "${nestedDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"\\)`,
+    ),
+  )
+  assert.match(
+    profile,
+    /\(allow file-read\*[\s\S]*\(subpath "\/private\/tmp\/guard\/default-run"\)/,
+  )
+})
+
+test('missing filesystem config defaults allowRead to project root from nested invocations', () => {
+  const profilePath = resolve(appRoot, '.guard/defaults.json')
+  try {
+    writeFileSync(
+      profilePath,
+      JSON.stringify(
+        {
+          allowPty: true,
+          network: {
+            allowedDomains: [],
+            deniedDomains: [],
+            allowLocalBinding: true,
+            allowUnixSockets: ['${GUARD_RUN_DIR}'],
+          },
+        },
+        null,
+        2,
+      ) + '\n',
+    )
+
+    const nestedDir = resolve(appRoot, 'nested/invocation')
+    mkdirSync(nestedDir, { recursive: true })
+    const result = spawnSync(
+      guard,
+      [
+        '--profile',
+        'defaults',
+        'node',
+        resolve(appRoot, 'scripts/probe.mjs'),
+        'runtime-config-json',
+      ],
+      {
+        cwd: nestedDir,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GUARD_QUIET: '1',
+        },
+      },
+    )
+
+    expectOk(result)
+    const cfg = JSON.parse(result.stdout)
+    assert.equal(cfg.filesystem.allowRead[0], appRoot)
+    assert.match(cfg.filesystem.allowRead[1], /\/guard\/run-/)
+    assert.deepEqual(cfg.filesystem.denyRead, [
+      '/Users',
+      '/Volumes',
+      '/Applications',
+      '/cores',
+      '/home',
+    ])
+  } finally {
+    rmSync(profilePath, { force: true })
+  }
+})
+
+test('native manager emits extension rules only when explicitly enabled', () => {
+  const profile = generateProfile(
+    {
+      networkUnrestricted: true,
+      network: {
+        allowMachLookup: ['com.apple.webinspector', 'us.zoom.aom.globalmgr.*'],
+      },
+      filesystem: {
+        denyRead: ['/Users'],
+        allowRead: ['/tmp/zoom-read', '/tmp/zoom-read-glob/*'],
+        allowWrite: ['/tmp/zoom-write', '/tmp/zoom-write-glob/*'],
+        denyWrite: [],
+      },
+      system: {
+        allowFileIssueExtension: true,
+        allowMachIssueExtension: true,
+        allowSysctlRead: ['hw.model', 'kern.proc.*'],
+        allowIokitUserClientClass: ['AGXDeviceUserClient'],
+      },
+    },
+    { cwd: appRoot },
+  )
+
+  assert.match(
+    profile,
+    /\(allow mach-issue-extension \(global-name "com\.apple\.webinspector"\)\)/,
+  )
+  assert.match(
+    profile,
+    /\(allow mach-issue-extension \(global-name-prefix "us\.zoom\.aom\.globalmgr\."\)\)/,
+  )
+  assert.match(
+    profile,
+    /\(allow file-issue-extension[\s\S]*\(subpath "\/tmp\/zoom-read"\)/,
+  )
+  assert.match(
+    profile,
+    /\(allow file-issue-extension[\s\S]*\(subpath "\/tmp\/zoom-write"\)/,
+  )
+  assert.match(profile, /\(allow sysctl-read \(sysctl-name "hw\.model"\)\)/)
+  assert.match(
+    profile,
+    /\(allow sysctl-read \(sysctl-name-prefix "kern\.proc\."\)\)/,
+  )
+  assert.match(
+    profile,
+    /\(iokit-user-client-class "AGXDeviceUserClient"\)/,
+  )
+})
+
+test('accepts -- as a command separator', () => {
+  const result = spawnSync(guard, ['--', 'node', 'scripts/probe.mjs', 'env-json'], {
+    cwd: appRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GUARD_QUIET: '1',
+    },
+  })
+
+  expectOk(result)
+  const env = JSON.parse(result.stdout)
+  assert.equal(env.guardProjectDir, appRoot)
+})
+
+test('allowedDomains permits allowlisted HTTP traffic through the local proxy runtime', async () => {
+  const profilePath = resolve(appRoot, '.guard/network-allow.json')
+  writeFileSync(
+    profilePath,
+    JSON.stringify(
+      {
+        allowPty: true,
+        network: {
+          allowedDomains: ['localhost'],
+          deniedDomains: [],
+          allowLocalBinding: false,
+          allowUnixSockets: ['${GUARD_RUN_DIR}'],
+          allowMachLookup: [
+            'com.apple.FSEvents',
+            'com.apple.fseventsd',
+            'com.apple.FileCoordination',
+          ],
+        },
+        filesystem: {
+          denyRead: ['/Users', '/Volumes', '/Applications', '/cores', '/home'],
+          allowRead: ['${GUARD_PROJECT_DIR}', '${GUARD_RUN_DIR}'],
+          allowWrite: ['${GUARD_PROJECT_DIR}', '${GUARD_RUN_DIR}'],
+          denyWrite: ['.env', '.env.*', 'secrets/', '*.key', '*.pem'],
+        },
+      },
+      null,
+      2,
+    ) + '\n',
+  )
+
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('network-ok\n')
+  })
+
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  const url = `http://localhost:${address.port}/`
+
+  try {
+    const result = await runGuardCommandAsync([
+      '--profile',
+      'network-allow',
+      '/usr/bin/curl',
+      '--noproxy',
+      '',
+      '-fsS',
+      url,
+    ])
+    expectOk(result)
+    assert.match(result.stdout, /network-ok/)
+  } finally {
+    rmSync(profilePath, { force: true })
+    await new Promise((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    )
+  }
+})
+
+test('allowedDomains blocks non-allowlisted HTTP traffic through the local proxy runtime', async () => {
+  const profilePath = resolve(appRoot, '.guard/network-block.json')
+  writeFileSync(
+    profilePath,
+    JSON.stringify(
+      {
+        allowPty: true,
+        network: {
+          allowedDomains: ['example.com'],
+          deniedDomains: [],
+          allowLocalBinding: false,
+          allowUnixSockets: ['${GUARD_RUN_DIR}'],
+          allowMachLookup: [
+            'com.apple.FSEvents',
+            'com.apple.fseventsd',
+            'com.apple.FileCoordination',
+          ],
+        },
+        filesystem: {
+          denyRead: ['/Users', '/Volumes', '/Applications', '/cores', '/home'],
+          allowRead: ['${GUARD_PROJECT_DIR}', '${GUARD_RUN_DIR}'],
+          allowWrite: ['${GUARD_PROJECT_DIR}', '${GUARD_RUN_DIR}'],
+          denyWrite: ['.env', '.env.*', 'secrets/', '*.key', '*.pem'],
+        },
+      },
+      null,
+      2,
+    ) + '\n',
+  )
+
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('should-not-pass\n')
+  })
+
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  const url = `http://localhost:${address.port}/`
+
+  try {
+    const result = await runGuardCommandAsync([
+      '--profile',
+      'network-block',
+      '/usr/bin/curl',
+      '--noproxy',
+      '',
+      '-fsS',
+      url,
+    ])
+    assert.notEqual(result.status, 0)
+    assert.match(`${result.stderr}\n${result.stdout}`, /403|blocked/i)
+  } finally {
+    rmSync(profilePath, { force: true })
+    await new Promise((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    )
+  }
+})
+
+test('deniedDomains overrides allowedDomains in the proxy runtime', async () => {
+  const profilePath = writeGuardProfile(
+    'network-denied-overrides',
+    networkProfileConfig({
+      allowedDomains: ['localhost'],
+      deniedDomains: ['localhost'],
+    }),
+  )
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('should-not-pass\n')
+  })
+  const port = await listenLoopback(server)
+
+  try {
+    const result = await runGuardCommandAsync([
+      '--profile',
+      'network-denied-overrides',
+      '/usr/bin/curl',
+      '--noproxy',
+      '',
+      '-fsS',
+      `http://localhost:${port}/`,
+    ])
+    assert.notEqual(result.status, 0)
+    assert.match(`${result.stderr}\n${result.stdout}`, /403|blocked/i)
+  } finally {
+    rmSync(profilePath, { force: true })
+    await closeServer(server)
+  }
+})
+
+test('network ask filter prompts once and caches allowed hosts for the run', async () => {
+  const prompts = []
+  const filter = createDomainFilter(
+    {
+      allowedDomains: [],
+      deniedDomains: [],
+    },
+    {
+      ask: async (host, port) => {
+        prompts.push({ host, port })
+        return true
+      },
+    },
+  )
+
+  assert.equal(await filter('LOCALHOST', 8080), true)
+  assert.equal(await filter('localhost', 9090), true)
+  assert.deepEqual(prompts, [{ host: 'localhost', port: 8080 }])
+})
+
+test('network ask does not prompt for denied domains', async () => {
+  let prompted = false
+  const filter = createDomainFilter(
+    {
+      allowedDomains: [],
+      deniedDomains: ['localhost'],
+    },
+    {
+      ask: async () => {
+        prompted = true
+        return true
+      },
+    },
+  )
+
+  assert.equal(await filter('localhost', 8080), false)
+  assert.equal(prompted, false)
+})
+
+test('network ask blocks unknown hosts in non-interactive shells', async () => {
+  const profilePath = writeGuardProfile(
+    'network-ask-noninteractive',
+    networkProfileConfig({ allowedDomains: [] }),
+  )
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('should-not-pass\n')
+  })
+  const port = await listenLoopback(server)
+
+  try {
+    const result = await runGuardCommandAsync([
+      '--ask-network',
+      '--profile',
+      'network-ask-noninteractive',
+      '/usr/bin/curl',
+      '--noproxy',
+      '',
+      '-fsS',
+      `http://localhost:${port}/`,
+    ])
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /--ask-network requires an interactive terminal/)
+    assert.match(`${result.stderr}\n${result.stdout}`, /403|blocked/i)
+  } finally {
+    rmSync(profilePath, { force: true })
+    await closeServer(server)
+  }
+})
+
+test('HTTPS CONNECT tunnels are filtered by allowedDomains', async () => {
+  const profilePath = writeGuardProfile('network-connect', networkProfileConfig())
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('connect-ok\n')
+  })
+  const port = await listenLoopback(server)
+
+  try {
+    const result = await runGuardCommandAsync([
+      '--profile',
+      'network-connect',
+      'node',
+      'scripts/probe.mjs',
+      'http-connect',
+      `http://localhost:${port}/connect`,
+    ])
+    expectOk(result)
+    assert.match(result.stdout, /connect-ok/)
+  } finally {
+    rmSync(profilePath, { force: true })
+    await closeServer(server)
+  }
+})
+
+test('SOCKS proxy tunnels are filtered by allowedDomains', async () => {
+  const profilePath = writeGuardProfile('network-socks', networkProfileConfig())
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('socks-ok\n')
+  })
+  const port = await listenLoopback(server)
+
+  try {
+    const result = await runGuardCommandAsync([
+      '--profile',
+      'network-socks',
+      'node',
+      'scripts/probe.mjs',
+      'socks-http',
+      `http://localhost:${port}/socks`,
+    ])
+    expectOk(result)
+    assert.match(result.stdout, /socks-ok/)
+  } finally {
+    rmSync(profilePath, { force: true })
+    await closeServer(server)
+  }
+})
+
+test('default local binding policy allows loopback TCP listeners', () => {
+  const result = runGuard(['tcp-listen', '127.0.0.1'])
+  expectOk(result)
+  assert.match(result.stdout, /listen-ok/)
+})
+
+test('allowLoopbackPorts policy allows exact loopback TCP connections', async () => {
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('loopback-ok\n')
+  })
+  const port = await listenLoopback(server)
+  const profilePath = writeGuardProfile('network-loopback-port', {
+    ...networkProfileConfig({ allowedDomains: [] }),
+    network: {
+      ...networkProfileConfig({ allowedDomains: [] }).network,
+      allowLoopbackPorts: [port],
+    },
+  })
+
+  try {
+    const result = await runGuardCommandAsync([
+      '--profile',
+      'network-loopback-port',
+      'node',
+      'scripts/probe.mjs',
+      'direct-tcp',
+      `tcp://127.0.0.1:${port}`,
+    ])
+    expectOk(result)
+    assert.match(result.stdout, /direct-ok/)
+  } finally {
+    rmSync(profilePath, { force: true })
+    await closeServer(server)
+  }
+})
+
+test('default local binding policy allows IPv6 loopback TCP listeners', () => {
+  const result = runGuard(['tcp-listen', '::1'])
+  expectOk(result)
+  assert.match(result.stdout, /listen-ok/)
+})
+
+test('default local binding policy denies direct external TCP egress', () => {
+  const result = runGuard(['direct-tcp', 'tcp://1.1.1.1:80'])
+  expectNoDirectNetwork(result)
+})
+
+test('default local binding policy denies direct external IPv6 TCP egress', () => {
+  const result = runGuard(['direct-tcp', 'tcp://[2606:4700:4700::1111]:80'])
+  expectNoDirectNetwork(result)
+})
+
+test('default local binding policy denies direct TCP DNS egress', () => {
+  const result = runGuard(['direct-tcp', 'tcp://8.8.8.8:53'])
+  expectNoDirectNetwork(result)
+})
+
+test('default local binding policy denies direct IPv6 TCP DNS egress', () => {
+  const result = runGuard(['direct-tcp', 'tcp://[2001:4860:4860::8888]:53'])
+  expectNoDirectNetwork(result)
+})
+
+test('default local binding policy denies ICMP egress', () => {
+  const ping = firstExisting(['/sbin/ping', '/bin/ping'])
+  if (!ping) return
+
+  const result = runGuardCommand([ping, '-c', '1', '-t', '1', '1.1.1.1'])
+  expectNoDirectNetwork(result)
+})
+
+test('default local binding policy denies ICMPv6 egress', () => {
+  const ping6 = firstExisting(['/sbin/ping6', '/bin/ping6'])
+  if (!ping6) return
+
+  const result = runGuardCommand([ping6, '-c', '1', '2606:4700:4700::1111'])
+  expectNoDirectNetwork(result)
+})
+
+test('raw TCP egress is denied when allowedDomains requires the guard proxy', async () => {
+  const profilePath = writeGuardProfile('network-direct-deny', networkProfileConfig())
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('direct-should-not-pass\n')
+  })
+  const port = await listenLoopback(server)
+
+  try {
+    const result = await runGuardCommandAsync([
+      '--profile',
+      'network-direct-deny',
+      'node',
+      'scripts/probe.mjs',
+      'direct-tcp',
+      `tcp://localhost:${port}`,
+    ])
+    expectDenied(result)
+  } finally {
+    rmSync(profilePath, { force: true })
+    await closeServer(server)
+  }
+})
+
+test('direct TCP DNS egress is denied when allowedDomains requires the guard proxy', () => {
+  const profilePath = writeGuardProfile('network-direct-dns-deny', networkProfileConfig())
+
+  try {
+    const result = runGuardCommand([
+      '--profile',
+      'network-direct-dns-deny',
+      'node',
+      'scripts/probe.mjs',
+      'direct-tcp',
+      'tcp://8.8.8.8:53',
+    ])
+    expectNoDirectNetwork(result)
+  } finally {
+    rmSync(profilePath, { force: true })
+  }
+})
+
+test('direct IPv6 TCP DNS egress is denied when allowedDomains requires the guard proxy', () => {
+  const profilePath = writeGuardProfile('network-direct-ipv6-dns-deny', networkProfileConfig())
+
+  try {
+    const result = runGuardCommand([
+      '--profile',
+      'network-direct-ipv6-dns-deny',
+      'node',
+      'scripts/probe.mjs',
+      'direct-tcp',
+      'tcp://[2001:4860:4860::8888]:53',
+    ])
+    expectNoDirectNetwork(result)
+  } finally {
+    rmSync(profilePath, { force: true })
+  }
+})
+
+test('ICMP egress is denied when allowedDomains requires the guard proxy', () => {
+  const ping = firstExisting(['/sbin/ping', '/bin/ping'])
+  if (!ping) return
+
+  const profilePath = writeGuardProfile('network-icmp-deny', networkProfileConfig())
+
+  try {
+    const result = runGuardCommand([
+      '--profile',
+      'network-icmp-deny',
+      ping,
+      '-c',
+      '1',
+      '-t',
+      '1',
+      '1.1.1.1',
+    ])
+    expectNoDirectNetwork(result)
+  } finally {
+    rmSync(profilePath, { force: true })
+  }
+})
+
+test('ICMPv6 egress is denied when allowedDomains requires the guard proxy', () => {
+  const ping6 = firstExisting(['/sbin/ping6', '/bin/ping6'])
+  if (!ping6) return
+
+  const profilePath = writeGuardProfile('network-icmpv6-deny', networkProfileConfig())
+
+  try {
+    const result = runGuardCommand([
+      '--profile',
+      'network-icmpv6-deny',
+      ping6,
+      '-c',
+      '1',
+      '2606:4700:4700::1111',
+    ])
+    expectNoDirectNetwork(result)
+  } finally {
+    rmSync(profilePath, { force: true })
+  }
+})
+
+test('Node fetch uses guard proxy support without a project undici dependency', async () => {
+  const profilePath = writeGuardProfile('network-fetch', networkProfileConfig())
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('fetch-ok\n')
+  })
+  const port = await listenLoopback(server)
+
+  try {
+    const result = await runGuardCommandAsync([
+      '--profile',
+      'network-fetch',
+      '/usr/bin/env',
+      'NO_PROXY=',
+      'no_proxy=',
+      'node',
+      'scripts/probe.mjs',
+      'node-fetch',
+      `http://localhost:${port}/fetch`,
+    ])
+    expectOk(result)
+    assert.match(result.stdout, /fetch-ok/)
+  } finally {
+    rmSync(profilePath, { force: true })
+    await closeServer(server)
+  }
+})
+
+test('WebSocket clients can connect through the guard HTTP proxy', async () => {
+  const profilePath = writeGuardProfile('network-websocket', networkProfileConfig())
+  const server = createHttpServer()
+  server.on('upgrade', (req, socket) => {
+    socket.write(
+      'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n',
+    )
+    socket.end()
+  })
+  const port = await listenLoopback(server)
+
+  try {
+    const result = await runGuardCommandAsync([
+      '--profile',
+      'network-websocket',
+      '/usr/bin/env',
+      'NO_PROXY=',
+      'no_proxy=',
+      'node',
+      'scripts/probe.mjs',
+      'websocket',
+      `ws://localhost:${port}/socket`,
+    ])
+    expectOk(result)
+    assert.match(result.stdout, /websocket-ok/)
+  } finally {
+    rmSync(profilePath, { force: true })
+    await closeServer(server)
+  }
+})
+
+test('npm, pnpm, git, and curl clients use the guard proxy environment', async () => {
+  const npmBin = firstExisting([
+    process.env.GUARD_REAL_NPM,
+    '/opt/homebrew/bin/npm',
+    '/usr/local/bin/npm',
+    process.env.HOME ? join(process.env.HOME, '.local/bin/npm') : null,
+  ])
+  const pnpmBin = firstExisting([
+    process.env.GUARD_REAL_PNPM,
+    '/opt/homebrew/bin/pnpm',
+    '/usr/local/bin/pnpm',
+    process.env.HOME ? join(process.env.HOME, '.local/bin/pnpm') : null,
+  ])
+  if (!npmBin || !pnpmBin) {
+    return
+  }
+
+  const profilePath = writeGuardProfile('network-cli-clients', networkProfileConfig())
+  const seen = new Set()
+  const server = createHttpServer((req, res) => {
+    seen.add(req.url || '/')
+    if ((req.url || '').startsWith('/guard-proxy-test')) {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        name: 'guard-proxy-test',
+        'dist-tags': { latest: '1.0.0' },
+        versions: {
+          '1.0.0': {
+            name: 'guard-proxy-test',
+            version: '1.0.0',
+            dist: {
+              tarball: 'http://localhost/guard-proxy-test/-/guard-proxy-test-1.0.0.tgz',
+              shasum: '0000000000000000000000000000000000000000',
+            },
+          },
+        },
+      }))
+      return
+    }
+    if ((req.url || '').startsWith('/repo.git/info/refs')) {
+      res.writeHead(200, {
+        'content-type': 'application/x-git-upload-pack-advertisement',
+      })
+      res.end('001e# service=git-upload-pack\n00000000')
+      return
+    }
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('cli-ok\n')
+  })
+  const port = await listenLoopback(server)
+  const registry = `http://localhost:${port}`
+
+  try {
+    const npm = await runGuardCommandAsync([
+      '--profile',
+      'network-cli-clients',
+      '/usr/bin/env',
+      'NO_PROXY=',
+      'no_proxy=',
+      npmBin,
+      'view',
+      'guard-proxy-test',
+      'version',
+      '--registry',
+      registry,
+      '--fetch-retries',
+      '0',
+      '--fetch-timeout',
+      '5000',
+    ])
+    expectOk(npm)
+    assert.match(npm.stdout, /1\.0\.0/)
+
+    const pnpm = await runGuardCommandAsync([
+      '--profile',
+      'network-cli-clients',
+      '/usr/bin/env',
+      'NO_PROXY=',
+      'no_proxy=',
+      pnpmBin,
+      'view',
+      'guard-proxy-test',
+      'version',
+      '--registry',
+      registry,
+    ])
+    expectOk(pnpm)
+    assert.match(pnpm.stdout, /1\.0\.0/)
+
+    const git = await runGuardCommandAsync([
+      '--profile',
+      'network-cli-clients',
+      '/bin/sh',
+      '-c',
+      'NO_PROXY= no_proxy= TMPDIR="$GUARD_TMP_DIR" /usr/bin/git ls-remote "$1"',
+      'guard-git-test',
+      `${registry}/repo.git`,
+    ])
+    assert.equal(seen.has('/repo.git/info/refs?service=git-upload-pack'), true)
+    assert.doesNotMatch(`${git.stderr}\n${git.stdout}`, /Connection refused|network allowlist|blocked/i)
+
+    const curl = await runGuardCommandAsync([
+      '--profile',
+      'network-cli-clients',
+      '/usr/bin/curl',
+      '--noproxy',
+      '',
+      '-fsS',
+      `${registry}/curl`,
+    ])
+    expectOk(curl)
+    assert.match(curl.stdout, /cli-ok/)
+  } finally {
+    rmSync(profilePath, { force: true })
+    await closeServer(server)
+  }
+})
+
+for (const [profile, appPattern] of [
+  ['zoom', /\/Applications\/zoom\.us\.app/],
+  ['teams', /\/Applications\/Microsoft Teams\.app/],
+  ['webex', /\/Applications\/Webex\.app/],
+]) {
+  test(`loads built-in ${profile} app profile without a project .guard directory`, () => {
+    const result = spawnSync(guard, ['--profile', profile], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        GUARD_COLOR: 'never',
+      },
+    })
+
+    expectOk(result)
+    assert.match(result.stderr, new RegExp(`guard:${profile}`))
+    assert.doesNotMatch(result.stderr, /unrestricted/)
+    assert.match(result.stderr, /× write\s+.*\/Applications/)
+
+    const cfg = JSON.parse(readFileSync(resolve(repoRoot, `profiles/${profile}.json`), 'utf8'))
+    assert.match(cfg.filesystem.allowRead.join('\n'), appPattern)
+    assert.match(cfg.network.allowedDomains.join('\n'), /\*/)
+  })
+}
+
+for (const profile of ['zoom', 'teams', 'webex']) {
+  test(`guard run ${profile} launches the built-in app profile`, () => {
+    const envName = `GUARD_${profile.toUpperCase()}_BIN`
+    const result = spawnSync(guard, ['run', profile, `guard-run-${profile}`], {
+      cwd: appRoot,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        [envName]: '/bin/echo',
+        GUARD_QUIET: '1',
+      },
+    })
+
+    expectOk(result)
+    assert.equal(result.stdout.trim(), `guard-run-${profile}`)
+  })
+}
+
+test('built-in app profiles are locked to vendor allowlists', () => {
+  for (const profile of ['zoom', 'teams', 'webex']) {
+    const cfg = JSON.parse(readFileSync(resolve(repoRoot, `profiles/${profile}.json`), 'utf8'))
+    assert.notEqual(cfg.networkUnrestricted, true)
+    assert.ok(cfg.network.allowedDomains.length > 0)
+    assert.deepEqual(cfg.filesystem.denyRead, [
+      '/Users',
+      '/Volumes',
+      '/Applications',
+      '/cores',
+      '/home',
+    ])
+    assert.ok(cfg.filesystem.allowRead.some((entry) => entry.startsWith('/Applications/')))
+    assert.equal(cfg.network.allowLocalBinding, false)
+  }
+})
+
+test('list profiles reports built-in profiles', () => {
+  const result = spawnSync(guard, ['list', 'profiles'], {
+    cwd: appRoot,
+    encoding: 'utf8',
+  })
+
+  expectOk(result)
+  assert.match(result.stdout, /^Built-in Guard Profiles/m)
+  assert.match(result.stdout, /\bzoom\b.*network=allowlist/)
+  assert.match(result.stdout, /\bteams\b.*launcher=guard-teams/)
+  assert.match(result.stdout, /\bwebex\b.*launcher=guard-webex/)
+})
+
+test('guard help prints command usage', () => {
+  const result = spawnSync(guard, ['help'], {
+    cwd: appRoot,
+    encoding: 'utf8',
+  })
+
+  expectOk(result)
+  assert.match(result.stdout, /^Usage:/)
+  assert.match(result.stdout, /guard install-apps \[--dir DIR\] \[--force\]/)
+})
+
+test('list profile can emit machine-readable JSON', () => {
+  const result = spawnSync(guard, ['list', 'profile', '--json'], {
+    cwd: appRoot,
+    encoding: 'utf8',
+  })
+
+  expectOk(result)
+  const listed = JSON.parse(result.stdout)
+  const names = listed.profiles.map((profile) => profile.name)
+  assert.deepEqual(names, ['teams', 'webex', 'zoom'])
+  assert.equal(
+    listed.profiles.find((profile) => profile.name === 'teams').launcher,
+    'guard-teams',
+  )
+  assert.equal(
+    listed.profiles.find((profile) => profile.name === 'zoom').network,
+    'allowlist',
+  )
+})
+
+test('app-summary emits native launcher policy JSON', () => {
+  const result = spawnSync(guard, ['app-summary', '--profile', 'webex', '--json'], {
+    cwd: appRoot,
+    encoding: 'utf8',
+  })
+
+  expectOk(result)
+  const summary = JSON.parse(result.stdout)
+  assert.equal(summary.profile, 'webex')
+  assert.equal(summary.launcher, 'guard-webex')
+  assert.equal(summary.appBundle, '/Applications/Webex.app')
+  assert.equal(summary.network.mode, 'allowlist')
+  assert.ok(summary.network.allowedDomains.includes('*.webex.com'))
+  assert.ok(summary.filesystem.denyRead.includes('/Users'))
+  assert.ok(summary.filesystem.allowRead.includes('/Applications/Webex.app'))
+  assert.ok(Array.isArray(summary.findings))
+})
+
+test('install-app creates a native macOS wrapper bundle', () => {
+  const targetDir = mkdtempSync(join(tmpdir(), 'guard-native-app-'))
+  try {
+    const result = spawnSync(
+      guard,
+      ['install-app', 'webex', '--dir', targetDir, '--force'],
+      {
+        cwd: appRoot,
+        encoding: 'utf8',
+      },
+    )
+
+    expectOk(result)
+    const appPath = join(targetDir, 'Guard Webex.app')
+    const contentsPath = join(appPath, 'Contents')
+    const executablePath = join(contentsPath, 'MacOS/GuardAppLauncher')
+    const configPath = join(contentsPath, 'Resources/GuardAppConfig.json')
+    const iconPath = join(contentsPath, 'Resources/GuardAppIcon.icns')
+    const sourceIconPath = '/Applications/Webex.app/Contents/Resources/app_publishing_logo.icns'
+
+    assert.ok(existsSync(appPath))
+    assert.ok(existsSync(join(contentsPath, 'Info.plist')))
+    assert.ok(existsSync(executablePath))
+    assert.ok(existsSync(configPath))
+    assert.equal(existsSync(iconPath), existsSync(sourceIconPath))
+    assert.match(readFileSync(join(contentsPath, 'Info.plist'), 'utf8'), /dev\.guard\.webex/)
+
+    const config = JSON.parse(readFileSync(configPath, 'utf8'))
+    assert.equal(config.profile, 'webex')
+    assert.equal(config.displayName, 'Webex')
+    assert.equal(config.guardPath, guard)
+    assert.equal(config.bundleIdentifier, 'dev.guard.webex')
+  } finally {
+    rmSync(targetDir, { recursive: true, force: true })
+  }
+})
+
+test('install-app all creates every native macOS wrapper bundle', () => {
+  const targetDir = mkdtempSync(join(tmpdir(), 'guard-native-apps-'))
+  try {
+    const result = spawnSync(
+      guard,
+      ['install-app', 'all', '--dir', targetDir, '--force'],
+      {
+        cwd: appRoot,
+        encoding: 'utf8',
+      },
+    )
+
+    expectOk(result)
+    assert.match(result.stdout, /Installed 3 Guard native apps/)
+    for (const [appName, label] of [
+      ['webex', 'Webex'],
+      ['teams', 'Teams'],
+      ['zoom', 'Zoom'],
+    ]) {
+      const appPath = join(targetDir, `Guard ${label}.app`)
+      const configPath = join(appPath, 'Contents/Resources/GuardAppConfig.json')
+
+      assert.ok(existsSync(appPath))
+      assert.ok(existsSync(join(appPath, 'Contents/Info.plist')))
+      assert.ok(existsSync(join(appPath, 'Contents/MacOS/GuardAppLauncher')))
+      const config = JSON.parse(readFileSync(configPath, 'utf8'))
+      assert.equal(config.profile, appName)
+      assert.equal(config.displayName, label)
+      assert.equal(config.guardPath, guard)
+    }
+  } finally {
+    rmSync(targetDir, { recursive: true, force: true })
+  }
+})
+
+test('list domain-presets reports denied domain presets', () => {
+  const result = spawnSync(guard, ['list', 'domain-presets', '--json'], {
+    cwd: appRoot,
+    encoding: 'utf8',
+  })
+
+  expectOk(result)
+  const listed = JSON.parse(result.stdout)
+  assert.ok(listed.presets.telemetry.includes('*.sentry.io'))
+  assert.ok(listed.presets['microsoft-telemetry'].includes('vortex.data.microsoft.com'))
+})
+
+test('deniedDomainPresets expand into the runtime config', () => {
+  const base = networkProfileConfig()
+  const profilePath = writeGuardProfile('preset-deny', {
+    ...base,
+    network: {
+      ...base.network,
+      deniedDomainPresets: ['telemetry'],
+    },
+  })
+
+  try {
+    const result = runGuardCommand([
+      '--profile',
+      'preset-deny',
+      'node',
+      'scripts/probe.mjs',
+      'runtime-config-json',
+    ])
+    expectOk(result)
+    const cfg = JSON.parse(result.stdout)
+    assert.ok(cfg.network.deniedDomains.includes('*.sentry.io'))
+  } finally {
+    rmSync(profilePath, { force: true })
+  }
+})
+
+test('profile doctor reports profile quality findings', () => {
+  const result = spawnSync(guard, ['--profile', 'teams', 'profile', 'doctor', '--json'], {
+    cwd: appRoot,
+    encoding: 'utf8',
+  })
+
+  expectOk(result)
+  const doctor = JSON.parse(result.stdout)
+  assert.equal(doctor.profile, 'teams')
+  assert.equal(doctor.status, 'warn')
+  assert.ok(doctor.findings.some((finding) => finding.id === 'broad-mach-lookup'))
+})
+
+test('diff-profile compares built-in profile policy fields', () => {
+  const result = spawnSync(guard, ['diff-profile', 'zoom', 'teams', '--json'], {
+    cwd: appRoot,
+    encoding: 'utf8',
+  })
+
+  expectOk(result)
+  const diff = JSON.parse(result.stdout)
+  assert.equal(diff.left.ref, 'zoom')
+  assert.equal(diff.right.ref, 'teams')
+  assert.ok(diff.changes.some((change) => change.path === 'network.allowedDomains'))
+})
+
+test('network-log summarizes guard network decision JSONL', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-network-log-'))
+  const logPath = resolve(tempRoot, 'network.jsonl')
+  writeFileSync(
+    logPath,
+    [
+      JSON.stringify({ host: 'example.com', port: 443, allowed: true, reason: 'allowedDomains' }),
+      JSON.stringify({ host: 'tracker.test', port: 443, allowed: false, reason: 'deniedDomains' }),
+    ].join('\n') + '\n',
+  )
+
+  const result = spawnSync(guard, ['network-log', logPath], {
+    cwd: appRoot,
+    encoding: 'utf8',
+  })
+
+  expectOk(result)
+  assert.match(result.stdout, /^Guard Network Log/m)
+  assert.match(result.stdout, /example\.com:443 allowed=1 denied=0/)
+  assert.match(result.stdout, /tracker\.test:443 allowed=0 denied=1/)
+})
+
+test('discover runs with temporary discovery reporting', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-discover-'))
+  const reportPath = resolve(tempRoot, 'report.md')
+  const result = spawnSync(
+    guard,
+    [
+      'discover',
+      '--profile',
+      'guard',
+      '--report',
+      reportPath,
+      '--',
+      'node',
+      'scripts/probe.mjs',
+      'env-json',
+    ],
+    {
+      cwd: appRoot,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        GUARD_QUIET: '1',
+      },
+    },
+  )
+
+  expectOk(result)
+  assert.equal(existsSync(reportPath), true)
+  assert.match(readFileSync(reportPath, 'utf8'), /^# Guard Discovery Report/m)
+})
+
+test('GUARD_BANNER controls policy banner rendering', () => {
+  const command = ['node', 'scripts/probe.mjs', 'env-json']
+  const baseEnv = {
+    ...process.env,
+    GUARD_COLOR: 'never',
+  }
+
+  const compact = spawnSync(guard, command, {
+    cwd: appRoot,
+    encoding: 'utf8',
+    env: {
+      ...baseEnv,
+      GUARD_BANNER: 'compact',
+    },
+  })
+  expectOk(compact)
+  assert.match(compact.stderr, /^guard ok  net allowlist active  secrets protected  run=/)
+  assert.doesNotMatch(compact.stderr, /guard policy/)
+  assert.doesNotMatch(compact.stderr, /✓ read/)
+
+  const full = spawnSync(guard, command, {
+    cwd: appRoot,
+    encoding: 'utf8',
+    env: {
+      ...baseEnv,
+      GUARD_BANNER: 'full',
+    },
+  })
+  expectOk(full)
+  assert.match(full.stderr, /guard policy/)
+  assert.match(full.stderr, /✓ read/)
+
+  const off = spawnSync(guard, command, {
+    cwd: appRoot,
+    encoding: 'utf8',
+    env: {
+      ...baseEnv,
+      GUARD_BANNER: 'off',
+    },
+  })
+  expectOk(off)
+  assert.equal(off.stderr, '')
+})
+
+test('doctor reports the effective profile and runtime resolution', () => {
+  const result = spawnSync(guard, ['doctor'], {
+    cwd: appRoot,
+    encoding: 'utf8',
+  })
+
+  expectOk(result)
+  assert.match(result.stdout, /^Guard Doctor/m)
+  assert.match(result.stdout, new RegExp(`cwd: ${appRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
+  assert.match(result.stdout, /effective profile source: project/)
+  assert.match(result.stdout, /resolved tools:/)
+  assert.match(result.stdout, /runtime node: .* \((path|fallback|override)\)/)
+})
+
+test('doctor can emit machine-readable JSON for a specific tool', () => {
+  const result = spawnSync(guard, ['doctor', 'pnpm', '--json'], {
+    cwd: appRoot,
+    encoding: 'utf8',
+  })
+
+  expectOk(result)
+  const info = JSON.parse(result.stdout)
+  assert.equal(info.cwd, appRoot)
+  assert.equal(info.profile, 'guard')
+  assert.equal(info.effectiveProfileSource, 'project')
+  assert.deepEqual(Object.keys(info.tools), ['pnpm'])
+  assert.equal(info.tools.pnpm.status, 'resolved')
+})
+
+test('audit reports risky policy choices', () => {
+  const profilePath = writeGuardProfile('audit-risk', {
+    networkUnrestricted: true,
+    network: {
+      allowUnixSockets: ['/', '/var/run/docker.sock'],
+      allowMachLookup: ['com.apple.*'],
+    },
+    filesystem: {
+      allowRead: ['/Users', '/Volumes'],
+      allowWrite: ['/Users'],
+    },
+  })
+
+  try {
+    const result = spawnSync(guard, ['--profile', 'audit-risk', 'audit'], {
+      cwd: appRoot,
+      encoding: 'utf8',
+    })
+    expectOk(result)
+    assert.match(result.stdout, /^Guard Audit/m)
+    assert.match(result.stdout, /broad-users-access/)
+    assert.match(result.stdout, /volumes-access/)
+    assert.match(result.stdout, /docker-socket-access/)
+    assert.match(result.stdout, /network-unrestricted/)
+    assert.match(result.stdout, /broad-unix-socket-access/)
+    assert.match(result.stdout, /broad-mach-lookup/)
+  } finally {
+    rmSync(profilePath, { force: true })
+  }
+})
+
+test('install creates guard and shim links in the requested bin directory', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-install-'))
+  const binDir = resolve(tempRoot, 'bin')
+  const configDir = resolve(tempRoot, 'config')
+  const codeRoot = resolve(tempRoot, 'managed-code')
+  const escapedCodeRoot = codeRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const result = spawnSync(guard, ['install', '--bin-dir', binDir, '--code-root', codeRoot], {
+    cwd: appRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GUARD_CONFIG_DIR: configDir,
+    },
+  })
+
+  expectOk(result)
+  assert.match(result.stdout, new RegExp(`Configured managed root: ${escapedCodeRoot}`))
+  assert.equal(realpathSync(resolve(binDir, 'guard')), guard)
+  assert.equal(realpathSync(resolve(binDir, 'node')), guard)
+  assert.equal(realpathSync(resolve(binDir, 'pnpm')), guard)
+  assert.equal(realpathSync(resolve(binDir, 'guard-zoom')), guard)
+  assert.equal(realpathSync(resolve(binDir, 'guard-teams')), guard)
+  assert.equal(realpathSync(resolve(binDir, 'guard-webex')), guard)
+  assert.equal(
+    JSON.parse(readFileSync(resolve(configDir, 'config.json'), 'utf8')).codeRoot,
+    codeRoot,
+  )
+
+  const doctor = spawnSync(resolve(binDir, 'guard'), ['doctor', 'pnpm', '--json'], {
+    cwd: appRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PATH: `${binDir}:${process.env.PATH || ''}`,
+      GUARD_CONFIG_DIR: configDir,
+    },
+  })
+  expectOk(doctor)
+  assert.equal(JSON.parse(doctor.stdout).codeRoot, codeRoot)
+
+  const shimResult = spawnSync(resolve(binDir, 'node'), ['--version'], {
+    cwd: appRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PATH: `${binDir}:${process.env.PATH || ''}`,
+      GUARD_CONFIG_DIR: configDir,
+      NODE_GUARD_BYPASS: '',
+      GUARD_SHIM_BYPASS: '',
+    },
+  })
+  expectOk(shimResult)
+  assert.match(shimResult.stdout.trim(), /^v\d+\./)
+})
+
+test('setup configures managed root and install links non-interactively', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-setup-'))
+  const binDir = resolve(tempRoot, 'bin')
+  const configDir = resolve(tempRoot, 'config')
+  const codeRoot = resolve(tempRoot, 'managed-code')
+  const result = spawnSync(
+    guard,
+    ['setup', '--yes', '--bin-dir', binDir, '--code-root', codeRoot, '--no-shims'],
+    {
+      cwd: appRoot,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        GUARD_CONFIG_DIR: configDir,
+      },
+    },
+  )
+
+  expectOk(result)
+  assert.match(result.stdout, /Guard setup complete/)
+  assert.equal(realpathSync(resolve(binDir, 'guard')), guard)
+  assert.equal(existsSync(resolve(binDir, 'node')), false)
+  const config = JSON.parse(readFileSync(resolve(configDir, 'config.json'), 'utf8'))
+  assert.equal(config.codeRoot, codeRoot)
+  assert.equal(config.installBinDir, binDir)
+  assert.equal(config.includeShims, false)
+})
+
+test('setup can be rerun after install and reports current values', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-setup-current-'))
+  const binDir = resolve(tempRoot, 'bin')
+  const configDir = resolve(tempRoot, 'config')
+  const codeRoot = resolve(tempRoot, 'managed-code')
+  const env = {
+    ...process.env,
+    GUARD_CONFIG_DIR: configDir,
+  }
+
+  const install = spawnSync(guard, ['install', '--bin-dir', binDir, '--code-root', codeRoot, '--force'], {
+    cwd: appRoot,
+    encoding: 'utf8',
+    env,
+  })
+  expectOk(install)
+
+  const setup = spawnSync(guard, ['setup', '--yes'], {
+    cwd: appRoot,
+    encoding: 'utf8',
+    env,
+  })
+
+  expectOk(setup)
+  assert.match(setup.stdout, /Current Guard Setup/)
+  assert.match(setup.stdout, new RegExp(`managed root: ${codeRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
+  assert.match(setup.stdout, new RegExp(`install dir: ${binDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
+  assert.match(setup.stdout, /installed entrypoints: .*guard.*guard-zoom.*guard-teams.*guard-webex/)
+  assert.match(setup.stdout, /installed shims: .*node.*pnpm.*npm.*python.*python3.*pip.*pip3/)
+  assert.match(setup.stdout, /Guard setup complete/)
+  assert.equal(realpathSync(resolve(binDir, 'guard')), guard)
+  const config = JSON.parse(readFileSync(resolve(configDir, 'config.json'), 'utf8'))
+  assert.equal(config.codeRoot, codeRoot)
+  assert.equal(config.installBinDir, binDir)
+  assert.equal(config.includeShims, true)
+})
+
+test('init creates a project config from the bundled template', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-init-'))
+  const result = spawnSync(guard, ['init'], {
+    cwd: tempRoot,
+    encoding: 'utf8',
+  })
+
+  expectOk(result)
+  const created = resolve(tempRoot, '.guard/guard.json')
+  assert.equal(existsSync(created), true)
+  const cfg = JSON.parse(readFileSync(created, 'utf8'))
+  assert.deepEqual(cfg.filesystem.denyRead, [
+    '/Users',
+    '/Volumes',
+    '/Applications',
+    '/cores',
+    '/home',
+  ])
+})
+
+test('shim resolves the real tool from sanitized PATH instead of fixed package-manager paths', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-path-'))
+  const fakeBin = resolve(tempRoot, 'bin')
+  mkdirSync(fakeBin, { recursive: true })
+  const marker = resolve(tempRoot, 'python3-marker.txt')
+  const fakePython = resolve(fakeBin, 'python3')
+
+  writeFileSync(
+    fakePython,
+    `#!/bin/sh\nprintf 'fake-python3\\n'\nprintf '%s\\n' "$0" > "${marker}"\n`,
+    { mode: 0o755 },
+  )
+
+  const result = spawnSync(shim, ['--version'], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PATH: `${dirname(shim)}:${fakeBin}:${process.env.PATH || ''}`,
+      GUARD_BIN: guard,
+      GUARD_SHIM_TOOL: 'python3',
+      GUARD_CODE_ROOT: appRoot,
+      PYTHON3_GUARD_BYPASS: '1',
+      GUARD_SHIM_BYPASS: '',
+    },
+  })
+
+  expectOk(result)
+  assert.equal(result.stdout.trim(), 'fake-python3')
+  assert.equal(readFileSync(marker, 'utf8').trim(), realpathSync(fakePython))
+})
+
+test('can write files inside the allowed project root', () => {
+  const outDir = resolve(appRoot, '.guard-test')
+  rmSync(outDir, { recursive: true, force: true })
+  expectOk(runGuard(['write-project']))
+  assert.equal(existsSync(resolve(outDir, 'out.txt')), true)
+})
+
+test('cannot read the real home directory', () => {
+  const realHome = process.env.HOME
+  assert.ok(realHome, 'HOME must be set for this test')
+  expectDenied(runGuard(['read-dir', realHome]))
+})
+
+test('cannot read /Users except explicit allowRead carve-outs', () => {
+  if (!existsSync('/Users')) {
+    return
+  }
+  expectDenied(runGuard(['read-dir', '/Users']))
+})
+
+test('cannot read the parent repo outside the project root carve-out', () => {
+  expectDenied(runGuard(['read-dir', repoRoot]))
+})
+
+test('cannot write to the real home directory', () => {
+  const realHome = process.env.HOME
+  assert.ok(realHome, 'HOME must be set for this test')
+  expectDenied(runGuard(['write-file', `${realHome}/.guard-denied-write-test`]))
+})
+
+test('cannot write to the parent repo outside the project root carve-out', () => {
+  expectDenied(runGuard(['write-file', resolve(repoRoot, '.guard-denied-write-test')]))
+})
+
+test('cannot read mounted volumes when /Volumes exists', () => {
+  if (!existsSync('/Volumes')) {
+    return
+  }
+  expectDenied(runGuard(['read-dir', '/Volumes']))
+})
+
+for (const deniedPath of ['/Applications']) {
+  test(`cannot read ${deniedPath}`, () => {
+    if (!existsSync(deniedPath)) {
+      return
+    }
+    expectDenied(runGuard(['read-dir', deniedPath]))
+  })
+}
+
+for (const deniedPath of ['/cores', '/home']) {
+  test(`cannot read ${deniedPath} when it exists`, () => {
+    if (!existsSync(deniedPath)) {
+      return
+    }
+    expectDenied(runGuard(['read-dir', deniedPath]))
+  })
+}
+
+test('can use the controlled temporary directory', () => {
+  expectOk(runGuard(['write-tmp']))
+})
+
+test('can bind Unix sockets inside the controlled temporary directory', () => {
+  expectOk(runGuard(['unix-socket', 'tmpdir']))
+})
+
+test('cannot bind Unix sockets outside the controlled temporary directory', () => {
+  expectDenied(runGuard(['unix-socket', '/tmp/guard-denied.sock']))
+})
+
+test('cannot write protected env-style files in the project', () => {
+  expectDenied(runGuard(['write-file', '.env']))
+})
