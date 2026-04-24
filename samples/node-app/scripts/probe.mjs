@@ -197,6 +197,10 @@ switch (action) {
       guardProjectDir: process.env.GUARD_PROJECT_DIR,
       guardCwd: process.env.GUARD_CWD,
       guardRunDir: process.env.GUARD_RUN_DIR,
+      guardSocksProxy: process.env.GUARD_SOCKS_PROXY,
+      guardSshProxyCommand: process.env.GUARD_SSH_PROXY_COMMAND,
+      allProxy: process.env.ALL_PROXY,
+      gitSshCommand: process.env.GIT_SSH_COMMAND,
     }))
     break
   case 'runtime-config-json':

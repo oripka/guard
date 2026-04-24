@@ -12,10 +12,12 @@
   },
   "files": [
     "bin",
+    "daemon",
     "docs",
     "lib",
     "native/macos-launcher/GuardAppLauncher.swift",
     "native/macos-launcher/README.md",
+    "native/network-extension",
     "profiles",
     "templates",
     "LICENSE",

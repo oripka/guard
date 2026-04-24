@@ -8,7 +8,7 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 import { generateProfile } from '../../../lib/guard-manager.mjs'
-import { createDomainFilter } from '../../../lib/guard-network.mjs'
+import { createDomainFilter, buildProxyEnv } from '../../../lib/guard-network.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const appRoot = resolve(__dirname, '..')
@@ -149,6 +149,66 @@ const expectNoDirectNetwork = (result) => {
     `${result.stderr}\n${result.stdout}`,
     /EPERM|operation not permitted|permission|not permitted|denied/i,
   )
+}
+
+const startGuarddForTest = async ({ policyRoot, eventLog, token = 'test-token', extraArgs = [] }) => {
+  let child = null
+  const ready = new Promise((resolveReady, rejectReady) => {
+    child = spawn(process.execPath, [
+      resolve(repoRoot, 'daemon/guardd.mjs'),
+      '--port',
+      '0',
+      '--policy-root',
+      policyRoot,
+      '--event-log',
+      eventLog,
+      '--api-token',
+      token,
+      '--poll-ms',
+      '100',
+      ...extraArgs,
+    ], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        GUARD_QUIET: '1',
+      },
+    })
+    let stderr = ''
+    const timer = setTimeout(() => rejectReady(new Error(`guardd did not start: ${stderr}`)), 5000)
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk
+      const match = stderr.match(/http:\/\/127\.0\.0\.1:(\d+)/)
+      if (match) {
+        clearTimeout(timer)
+        resolveReady(Number(match[1]))
+      }
+    })
+    child.on('error', rejectReady)
+    child.on('exit', (code) => {
+      if (!stderr.match(/http:\/\/127\.0\.0\.1:(\d+)/)) {
+        clearTimeout(timer)
+        rejectReady(new Error(`guardd exited before ready: ${code} ${stderr}`))
+      }
+    })
+  })
+
+  const port = await ready
+  return {
+    child,
+    base: `http://127.0.0.1:${port}`,
+    token,
+    async stop() {
+      if (!child) return
+      child.kill('SIGTERM')
+      await Promise.race([
+        new Promise((resolveDone) => child.once('exit', resolveDone)),
+        new Promise((resolveDone) => setTimeout(resolveDone, 1000)),
+      ])
+      child = null
+    },
+  }
 }
 
 for (const [tool, pattern] of [
@@ -464,6 +524,50 @@ test('allowLoopbackPorts emits exact loopback outbound ports only', () => {
   assert.match(profile, /\(allow network-outbound \(remote ip "localhost:3001"\)\)/)
   assert.match(profile, /\(allow network-outbound \(remote ip "localhost:4983"\)\)/)
   assert.doesNotMatch(profile, /\(allow network-outbound \(remote ip "localhost:\*"\)\)/)
+})
+
+test('allowedRawTcp resolved loopback rules emit exact localhost port only', () => {
+  const profile = generateProfile(
+    {
+      network: {},
+    },
+    {
+      cwd: appRoot,
+      resolvedRawTcpRules: [
+        { ip: '127.0.0.1', port: '2222' },
+        { ip: '::1', port: 2223 },
+      ],
+    },
+  )
+
+  assert.match(profile, /\(allow network-outbound \(remote ip "localhost:2222"\)\)/)
+  assert.match(profile, /\(allow network-outbound \(remote ip "localhost:2223"\)\)/)
+  assert.doesNotMatch(profile, /\(allow network-outbound \(remote ip "localhost:\*"\)\)/)
+  assert.doesNotMatch(profile, /\(allow network-outbound \(remote ip "\*:\*"\)\)/)
+})
+
+test('allowedRawTcp rejects exact external raw TCP under sandbox-exec', () => {
+  assert.throws(
+    () =>
+      generateProfile(
+        {
+          network: {},
+        },
+        {
+          cwd: appRoot,
+          resolvedRawTcpRules: [{ ip: '16.16.87.224', port: 22 }],
+        },
+      ),
+    /exact external IP rules are not supported/,
+  )
+})
+
+test('buildProxyEnv exposes reusable SOCKS and SSH proxy environment', () => {
+  const env = buildProxyEnv({ httpPort: 18080, socksPort: 19090 })
+
+  assert.ok(env.includes('GUARD_SOCKS_PROXY=localhost:19090'))
+  assert.ok(env.includes('GUARD_SSH_PROXY_COMMAND=nc -X 5 -x localhost:19090 %h %p'))
+  assert.ok(env.includes("GIT_SSH_COMMAND=ssh -o ProxyCommand='nc -X 5 -x localhost:19090 %h %p'"))
 })
 
 test('allowLoopbackHighPorts emits the macOS ephemeral range only', () => {
@@ -1454,6 +1558,76 @@ test('raw TCP egress is denied when allowedDomains requires the guard proxy', as
   }
 })
 
+test('allowedRawTcp resolveAtLaunch permits only exact direct TCP destinations', async () => {
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('raw-ok\n')
+  })
+  const port = await listenLoopback(server)
+  const profilePath = writeGuardProfile('network-raw-tcp-allow', {
+    ...networkProfileConfig({ allowedDomains: [] }),
+    network: {
+      ...networkProfileConfig({ allowedDomains: [] }).network,
+      allowedRawTcp: [
+        {
+          host: 'localhost',
+          resolveAtLaunch: true,
+          port,
+          reason: 'test exact raw tcp escape hatch',
+        },
+      ],
+    },
+  })
+
+  try {
+    const allowed = await runGuardCommandAsync([
+      '--profile',
+      'network-raw-tcp-allow',
+      'node',
+      'scripts/probe.mjs',
+      'direct-tcp',
+      `tcp://127.0.0.1:${port}`,
+    ])
+    expectOk(allowed)
+    assert.match(allowed.stdout, /direct-ok/)
+
+    const denied = await runGuardCommandAsync([
+      '--profile',
+      'network-raw-tcp-allow',
+      'node',
+      'scripts/probe.mjs',
+      'direct-tcp',
+      `tcp://127.0.0.1:${port + 1}`,
+    ])
+    expectNoDirectNetwork(denied)
+  } finally {
+    rmSync(profilePath, { force: true })
+    await closeServer(server)
+  }
+})
+
+test('allowedRawTcp host rules require explicit launch-time resolution', () => {
+  const profilePath = writeGuardProfile('network-raw-tcp-host-requires-resolution', {
+    ...networkProfileConfig({ allowedDomains: [] }),
+    network: {
+      ...networkProfileConfig({ allowedDomains: [] }).network,
+      allowedRawTcp: [{ host: 'localhost', port: 22 }],
+    },
+  })
+
+  try {
+    const result = runGuardCommand([
+      '--profile',
+      'network-raw-tcp-host-requires-resolution',
+      '/usr/bin/true',
+    ])
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /resolveAtLaunch: true/)
+  } finally {
+    rmSync(profilePath, { force: true })
+  }
+})
+
 test('direct TCP DNS egress is denied when allowedDomains requires the guard proxy', () => {
   const profilePath = writeGuardProfile('network-direct-dns-deny', networkProfileConfig())
 
@@ -1711,6 +1885,61 @@ test('npm, pnpm, git, and curl clients use the guard proxy environment', async (
   }
 })
 
+test('guard backend exposes reusable SOCKS and SSH proxy environment', async () => {
+  const profilePath = writeGuardProfile('network-guard-proxy-env', networkProfileConfig())
+
+  try {
+    const result = await runGuardCommandAsync([
+      '--profile',
+      'network-guard-proxy-env',
+      'node',
+      'scripts/probe.mjs',
+      'env-json',
+    ])
+    expectOk(result)
+    const env = JSON.parse(result.stdout)
+    assert.match(env.guardSocksProxy, /^localhost:\d+$/)
+    assert.match(env.guardSshProxyCommand, /^nc -X 5 -x localhost:\d+ %h %p$/)
+    assert.equal(env.allProxy, `socks5h://${env.guardSocksProxy}`)
+    assert.equal(
+      env.gitSshCommand,
+      `ssh -o ProxyCommand='${env.guardSshProxyCommand}'`,
+    )
+  } finally {
+    rmSync(profilePath, { force: true })
+  }
+})
+
+test('iron-proxy backend exposes the same reusable SOCKS and SSH proxy environment', async () => {
+  const profilePath = writeGuardProfile(
+    'network-iron-proxy-env',
+    ironProxyNetworkProfileConfig({
+      httpRules: [{ host: 'localhost' }],
+    }),
+  )
+
+  try {
+    const result = await runGuardCommandAsync([
+      '--profile',
+      'network-iron-proxy-env',
+      'node',
+      'scripts/probe.mjs',
+      'env-json',
+    ])
+    expectOk(result)
+    const env = JSON.parse(result.stdout)
+    assert.match(env.guardSocksProxy, /^localhost:\d+$/)
+    assert.match(env.guardSshProxyCommand, /^nc -X 5 -x localhost:\d+ %h %p$/)
+    assert.equal(env.allProxy, `socks5h://${env.guardSocksProxy}`)
+    assert.equal(
+      env.gitSshCommand,
+      `ssh -o ProxyCommand='${env.guardSshProxyCommand}'`,
+    )
+  } finally {
+    rmSync(profilePath, { force: true })
+  }
+})
+
 for (const [profile, appPattern] of [
   ['zoom', /\/Applications\/zoom\.us\.app/],
   ['teams', /\/Applications\/Microsoft Teams\.app/],
@@ -1816,6 +2045,32 @@ test('list profile can emit machine-readable JSON', () => {
     listed.profiles.find((profile) => profile.name === 'zoom').network,
     'allowlist',
   )
+})
+
+test('list templates can emit machine-readable JSON', () => {
+  const result = spawnSync(guard, ['list', 'templates', '--json'], {
+    cwd: appRoot,
+    encoding: 'utf8',
+  })
+
+  expectOk(result)
+  const listed = JSON.parse(result.stdout)
+  assert.deepEqual(
+    listed.templates.map((template) => template.name),
+    ['cloudflare-wrangler', 'node-app'],
+  )
+
+  const wrangler = listed.templates.find((template) => template.name === 'cloudflare-wrangler')
+  assert.equal(wrangler.source, 'template')
+  assert.equal(wrangler.status, 'template')
+  assert.equal(wrangler.risk, 'medium')
+  assert.deepEqual(wrangler.imports, ['node-app-defaults', 'cloudflare-wrangler'])
+  assert.equal(wrangler.path, resolve(repoRoot, 'templates/cloudflare-wrangler/guard.json'))
+
+  const nodeApp = listed.templates.find((template) => template.name === 'node-app')
+  assert.equal(nodeApp.source, 'template')
+  assert.deepEqual(nodeApp.imports, ['node-app-defaults'])
+  assert.equal(nodeApp.path, resolve(repoRoot, 'templates/node-app/guard.json'))
 })
 
 test('app-summary emits native launcher policy JSON', () => {
@@ -1958,6 +2213,589 @@ test('list domain-presets reports denied domain presets', () => {
   const listed = JSON.parse(result.stdout)
   assert.ok(listed.presets.telemetry.includes('*.sentry.io'))
   assert.ok(listed.presets['microsoft-telemetry'].includes('vortex.data.microsoft.com'))
+})
+
+test('profile mutations persist stable rule metadata sidecars', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-profile-metadata-'))
+  const guardDir = resolve(tempRoot, '.guard')
+  const profilePath = resolve(guardDir, 'guard.json')
+
+  try {
+    mkdirSync(guardDir, { recursive: true })
+    writeFileSync(profilePath, JSON.stringify({ network: {}, filesystem: {} }, null, 2) + '\n')
+
+    const domain = spawnSync(
+      guard,
+      ['profile', 'add', 'network.allowedDomains', 'api.example.com', '--json'],
+      {
+        cwd: tempRoot,
+        encoding: 'utf8',
+      },
+    )
+    expectOk(domain)
+    const domainResult = JSON.parse(domain.stdout)
+    assert.equal(domainResult.changed, true)
+    assert.equal(domainResult.field, 'network.allowedDomains')
+    assert.equal(domainResult.value, 'api.example.com')
+    assert.match(domainResult.ruleId, /^rule_[0-9a-f]{16}$/)
+    assert.match(domainResult.metadataKey, /^network\.allowedDomains:[0-9a-f]{16}$/)
+
+    let cfg = JSON.parse(readFileSync(profilePath, 'utf8'))
+    assert.deepEqual(cfg.network.allowedDomains, ['api.example.com'])
+    assert.equal(cfg.ruleMetadata[domainResult.metadataKey].id, domainResult.ruleId)
+    assert.equal(cfg.ruleMetadata[domainResult.metadataKey].field, 'network.allowedDomains')
+    assert.match(cfg.ruleMetadata[domainResult.metadataKey].valueHash, /^sha256:[0-9a-f]{64}$/)
+    assert.equal(cfg.ruleMetadata[domainResult.metadataKey].source, 'cli')
+
+    const httpRule = spawnSync(
+      guard,
+      [
+        'profile',
+        'add-http-rule',
+        '--host',
+        'api.openai.com',
+        '--method',
+        'POST',
+        '--path',
+        '/v1/responses',
+        '--json',
+      ],
+      {
+        cwd: tempRoot,
+        encoding: 'utf8',
+      },
+    )
+    expectOk(httpRule)
+    const httpResult = JSON.parse(httpRule.stdout)
+    assert.equal(httpResult.changed, true)
+    assert.equal(httpResult.field, 'network.httpRules')
+    assert.deepEqual(httpResult.value, {
+      host: 'api.openai.com',
+      methods: ['POST'],
+      paths: ['/v1/responses'],
+    })
+    assert.match(httpResult.ruleId, /^rule_[0-9a-f]{16}$/)
+    assert.match(httpResult.metadataKey, /^network\.httpRules:[0-9a-f]{16}$/)
+
+    cfg = JSON.parse(readFileSync(profilePath, 'utf8'))
+    assert.deepEqual(cfg.network.httpRules, [httpResult.value])
+    assert.equal(cfg.ruleMetadata[httpResult.metadataKey].id, httpResult.ruleId)
+    assert.equal(cfg.ruleMetadata[httpResult.metadataKey].field, 'network.httpRules')
+    assert.match(cfg.ruleMetadata[httpResult.metadataKey].valueHash, /^sha256:[0-9a-f]{64}$/)
+    assert.equal(cfg.ruleMetadata[httpResult.metadataKey].source, 'cli')
+
+    const rawTcpRule = spawnSync(
+      guard,
+      [
+        'profile',
+        'add-raw-tcp',
+        '--host',
+        'localhost',
+        '--resolve-at-launch',
+        '--port',
+        '8976',
+        '--reason',
+        'local OAuth callback',
+        '--json',
+      ],
+      {
+        cwd: tempRoot,
+        encoding: 'utf8',
+      },
+    )
+    expectOk(rawTcpRule)
+    const rawTcpResult = JSON.parse(rawTcpRule.stdout)
+    assert.equal(rawTcpResult.changed, true)
+    assert.equal(rawTcpResult.field, 'network.allowedRawTcp')
+    assert.deepEqual(rawTcpResult.value, {
+      host: 'localhost',
+      resolveAtLaunch: true,
+      port: 8976,
+      reason: 'local OAuth callback',
+    })
+    assert.match(rawTcpResult.ruleId, /^rule_[0-9a-f]{16}$/)
+    assert.match(rawTcpResult.metadataKey, /^network\.allowedRawTcp:[0-9a-f]{16}$/)
+
+    cfg = JSON.parse(readFileSync(profilePath, 'utf8'))
+    assert.deepEqual(cfg.network.allowedRawTcp, [rawTcpResult.value])
+    assert.equal(cfg.ruleMetadata[rawTcpResult.metadataKey].id, rawTcpResult.ruleId)
+    assert.equal(cfg.ruleMetadata[rawTcpResult.metadataKey].field, 'network.allowedRawTcp')
+    assert.match(cfg.ruleMetadata[rawTcpResult.metadataKey].valueHash, /^sha256:[0-9a-f]{64}$/)
+    assert.equal(cfg.ruleMetadata[rawTcpResult.metadataKey].source, 'cli')
+
+    const removeRawTcpRule = spawnSync(
+      guard,
+      [
+        'profile',
+        'remove-raw-tcp',
+        '--host',
+        'localhost',
+        '--resolve-at-launch',
+        '--port',
+        '8976',
+        '--reason',
+        'local OAuth callback',
+        '--json',
+      ],
+      {
+        cwd: tempRoot,
+        encoding: 'utf8',
+      },
+    )
+    expectOk(removeRawTcpRule)
+    const removeRawTcpResult = JSON.parse(removeRawTcpRule.stdout)
+    assert.equal(removeRawTcpResult.changed, true)
+    assert.deepEqual(removeRawTcpResult.after, [])
+
+    cfg = JSON.parse(readFileSync(profilePath, 'utf8'))
+    assert.deepEqual(cfg.network.allowedRawTcp, [])
+    assert.equal(cfg.ruleMetadata[rawTcpResult.metadataKey], undefined)
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('settings and tls status expose explicit TLS inspection policy', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-tls-policy-'))
+  const guardDir = resolve(tempRoot, '.guard')
+  const profilePath = resolve(guardDir, 'guard.json')
+
+  try {
+    mkdirSync(guardDir, { recursive: true })
+    writeFileSync(profilePath, JSON.stringify({
+      network: {
+        backend: 'iron-proxy',
+        httpRules: [{ host: 'api.example.com', methods: ['POST'], paths: ['/v1/*'] }],
+      },
+      filesystem: {},
+    }, null, 2) + '\n')
+
+    const initial = spawnSync(guard, ['tls', 'status', '--json'], {
+      cwd: tempRoot,
+      encoding: 'utf8',
+    })
+    expectOk(initial)
+    const initialStatus = JSON.parse(initial.stdout)
+    assert.equal(initialStatus.networkBackend, 'iron-proxy')
+    assert.equal(initialStatus.tlsInspection.enabled, true)
+    assert.equal(initialStatus.tlsInspection.explicit, false)
+    assert.equal(initialStatus.tlsInspection.caScope, 'guarded-process-env')
+
+    const disabled = spawnSync(guard, ['profile', 'tls', 'disable', '--json'], {
+      cwd: tempRoot,
+      encoding: 'utf8',
+    })
+    expectOk(disabled)
+    const disabledStatus = JSON.parse(disabled.stdout)
+    assert.equal(disabledStatus.changed, true)
+    assert.equal(disabledStatus.after.enabled, false)
+    assert.equal(disabledStatus.after.explicit, true)
+
+    const settings = spawnSync(guard, ['settings', '--json'], {
+      cwd: tempRoot,
+      encoding: 'utf8',
+    })
+    expectOk(settings)
+    const settingsJson = JSON.parse(settings.stdout)
+    assert.equal(settingsJson.tlsInspection.enabled, false)
+    assert.match(settingsJson.eventLogPath, /events\.jsonl$/)
+    assert.equal(settingsJson.daemon.url, 'http://127.0.0.1:8765')
+
+    const enabled = spawnSync(guard, ['profile', 'tls', 'enable', '--json'], {
+      cwd: tempRoot,
+      encoding: 'utf8',
+    })
+    expectOk(enabled)
+    const enabledStatus = JSON.parse(enabled.stdout)
+    assert.equal(enabledStatus.after.enabled, true)
+    assert.equal(enabledStatus.after.mode, 'ephemeral-run-ca')
+
+    const cfg = JSON.parse(readFileSync(profilePath, 'utf8'))
+    assert.equal(cfg.network.tlsInspection.enabled, true)
+    assert.equal(cfg.network.tlsInspection.caScope, 'guarded-process-env')
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('guardd authenticated write APIs mutate project policy and audit events', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guardd-write-api-'))
+  const guardDir = resolve(tempRoot, '.guard')
+  const eventLog = resolve(tempRoot, 'events.jsonl')
+  const token = 'test-token'
+  let child = null
+
+  try {
+    mkdirSync(guardDir, { recursive: true })
+    writeFileSync(
+      resolve(guardDir, 'guard.json'),
+      JSON.stringify({ network: { allowedDomains: [] }, filesystem: {} }, null, 2) + '\n',
+    )
+
+    const ready = new Promise((resolveReady, rejectReady) => {
+      child = spawn(process.execPath, [
+        resolve(repoRoot, 'daemon/guardd.mjs'),
+        '--port',
+        '0',
+        '--policy-root',
+        tempRoot,
+        '--event-log',
+        eventLog,
+        '--api-token',
+        token,
+        '--poll-ms',
+        '100',
+      ], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GUARD_QUIET: '1',
+        },
+      })
+      let stderr = ''
+      const timer = setTimeout(() => rejectReady(new Error(`guardd did not start: ${stderr}`)), 5000)
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk
+        const match = stderr.match(/http:\/\/127\.0\.0\.1:(\d+)/)
+        if (match) {
+          clearTimeout(timer)
+          resolveReady(Number(match[1]))
+        }
+      })
+      child.on('error', rejectReady)
+      child.on('exit', (code) => {
+        if (!stderr.match(/http:\/\/127\.0\.0\.1:(\d+)/)) {
+          clearTimeout(timer)
+          rejectReady(new Error(`guardd exited before ready: ${code} ${stderr}`))
+        }
+      })
+    })
+
+    const port = await ready
+    const base = `http://127.0.0.1:${port}`
+    const unauthorized = await fetch(`${base}/profiles/guard/rules`, {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'add',
+        field: 'network.allowedDomains',
+        value: 'api.example.com',
+      }),
+    })
+    assert.equal(unauthorized.status, 401)
+
+    const initialProfile = await fetch(`${base}/profiles/guard`, {
+      headers: { authorization: `Bearer ${token}` },
+    })
+    assert.equal(initialProfile.status, 200)
+    const initialProfileJson = await initialProfile.json()
+    assert.match(initialProfileJson.version, /^sha256:[0-9a-f]{64}$/)
+    assert.equal(initialProfile.headers.get('etag'), `"${initialProfileJson.version}"`)
+
+    const staleWrite = await fetch(`${base}/profiles/guard/rules`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+        'if-match': 'sha256:0000000000000000000000000000000000000000000000000000000000000000',
+      },
+      body: JSON.stringify({
+        action: 'add',
+        field: 'network.allowedDomains',
+        value: 'stale.example.com',
+      }),
+    })
+    assert.equal(staleWrite.status, 412)
+    const staleJson = await staleWrite.json()
+    assert.equal(staleJson.error, 'version_mismatch')
+    assert.equal(staleJson.currentVersion, initialProfileJson.version)
+
+    const addDomain = await fetch(`${base}/profiles/guard/rules`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+        'if-match': initialProfileJson.version,
+      },
+      body: JSON.stringify({
+        action: 'add',
+        field: 'network.allowedDomains',
+        value: 'api.example.com',
+      }),
+    })
+    assert.equal(addDomain.status, 200)
+    const domainResult = await addDomain.json()
+    assert.equal(domainResult.changed, true)
+    assert.equal(domainResult.field, 'network.allowedDomains')
+    assert.match(domainResult.ruleId, /^rule_[0-9a-f]{16}$/)
+    assert.match(domainResult.version, /^sha256:[0-9a-f]{64}$/)
+
+    const addHttp = await fetch(`${base}/profiles/guard/rules`, {
+      method: 'POST',
+      headers: {
+        'x-guard-token': token,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        action: 'add',
+        field: 'network.httpRules',
+        rule: { host: 'api.openai.com', methods: ['post'], paths: ['/v1/*'] },
+      }),
+    })
+    assert.equal(addHttp.status, 200)
+    const httpResult = await addHttp.json()
+    assert.deepEqual(httpResult.value, {
+      host: 'api.openai.com',
+      methods: ['POST'],
+      paths: ['/v1/*'],
+    })
+
+    const disabledDomain = await fetch(`${base}/profiles/guard/rules`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        action: 'disable',
+        field: 'network.deniedDomains',
+        value: 'disabled.example.com',
+      }),
+    })
+    assert.equal(disabledDomain.status, 200)
+    const disabledResult = await disabledDomain.json()
+    assert.equal(disabledResult.disabled, true)
+    assert.match(disabledResult.metadataKey, /^network\.deniedDomains:[0-9a-f]{16}$/)
+
+    const tls = await fetch(`${base}/profiles/guard/tls`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ enabled: true }),
+    })
+    assert.equal(tls.status, 200)
+    const tlsResult = await tls.json()
+    assert.equal(tlsResult.after.enabled, true)
+
+    const applyTemplate = await fetch(`${base}/templates/node-app/apply`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ profile: 'from-template', force: false }),
+    })
+    assert.equal(applyTemplate.status, 200)
+    assert.ok(existsSync(resolve(guardDir, 'from-template.json')))
+
+    const cfg = JSON.parse(readFileSync(resolve(guardDir, 'guard.json'), 'utf8'))
+    assert.deepEqual(cfg.network.allowedDomains, ['api.example.com'])
+    assert.deepEqual(cfg.network.httpRules, [httpResult.value])
+    assert.equal(cfg.network.tlsInspection.enabled, true)
+    assert.equal(cfg.ruleMetadata[disabledResult.metadataKey].disabled, true)
+    assert.equal((cfg.network.deniedDomains ?? []).includes('disabled.example.com'), false)
+
+    const events = await fetch(`${base}/events?type=policy.changed&limit=10`, {
+      headers: { authorization: `Bearer ${token}` },
+    })
+    assert.equal(events.status, 200)
+    const eventJson = await events.json()
+    assert.ok(eventJson.events.length >= 4)
+    assert.ok(eventJson.events.every((event) => event.type === 'policy.changed'))
+  } finally {
+    if (child) {
+      child.kill('SIGTERM')
+      await Promise.race([
+        new Promise((resolveDone) => child.once('exit', resolveDone)),
+        new Promise((resolveDone) => setTimeout(resolveDone, 1000)),
+      ])
+    }
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('guardd health and mutation events expose versioned API contracts', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guardd-version-contract-'))
+  const guardDir = resolve(tempRoot, '.guard')
+  const eventLog = resolve(tempRoot, 'events.jsonl')
+  let daemon = null
+
+  try {
+    mkdirSync(guardDir, { recursive: true })
+    writeFileSync(
+      resolve(guardDir, 'guard.json'),
+      JSON.stringify({ network: { allowedDomains: [] }, filesystem: {} }, null, 2) + '\n',
+    )
+
+    daemon = await startGuarddForTest({ policyRoot: tempRoot, eventLog })
+    const headers = {
+      authorization: `Bearer ${daemon.token}`,
+      'content-type': 'application/json',
+    }
+
+    const health = await fetch(`${daemon.base}/health`, { headers })
+    assert.equal(health.status, 200)
+    const healthJson = await health.json()
+    assert.equal(healthJson.ok, true)
+    assert.equal(healthJson.service, 'guardd')
+    assert.equal(healthJson.authRequired, true)
+    assert.equal(healthJson.policyRoot, tempRoot)
+    assert.equal(healthJson.eventLogPath, eventLog)
+
+    const mutation = await fetch(`${daemon.base}/profiles/guard/rules`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        action: 'add',
+        field: 'network.allowedDomains',
+        value: 'api.versioned.example',
+      }),
+    })
+    assert.equal(mutation.status, 200)
+    const mutationJson = await mutation.json()
+    assert.equal(mutationJson.changed, true)
+
+    const events = await fetch(`${daemon.base}/events?type=policy.changed&limit=1`, { headers })
+    assert.equal(events.status, 200)
+    const eventJson = await events.json()
+    assert.equal(eventJson.events.length, 1)
+    assert.equal(eventJson.events[0].schemaVersion, 1)
+    assert.equal(eventJson.events[0].backend, 'guardd')
+    assert.equal(eventJson.events[0].operation, 'add')
+    assert.equal(eventJson.events[0].field, 'network.allowedDomains')
+  } finally {
+    await daemon?.stop()
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('guardd handles concurrent project rule writes without native app dependencies', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guardd-concurrent-writes-'))
+  const guardDir = resolve(tempRoot, '.guard')
+  const eventLog = resolve(tempRoot, 'events.jsonl')
+  let daemon = null
+
+  try {
+    mkdirSync(guardDir, { recursive: true })
+    writeFileSync(
+      resolve(guardDir, 'guard.json'),
+      JSON.stringify({ network: { allowedDomains: [] }, filesystem: {} }, null, 2) + '\n',
+    )
+
+    daemon = await startGuarddForTest({ policyRoot: tempRoot, eventLog })
+    const headers = {
+      authorization: `Bearer ${daemon.token}`,
+      'content-type': 'application/json',
+    }
+    const domains = [
+      'api.concurrent-1.example',
+      'api.concurrent-2.example',
+      'api.concurrent-3.example',
+      'api.concurrent-4.example',
+      'api.concurrent-5.example',
+    ]
+
+    const responses = await Promise.all(domains.map((value) =>
+      fetch(`${daemon.base}/profiles/guard/rules`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          action: 'add',
+          field: 'network.allowedDomains',
+          value,
+        }),
+      }),
+    ))
+
+    assert.deepEqual(responses.map((response) => response.status), [200, 200, 200, 200, 200])
+    const results = await Promise.all(responses.map((response) => response.json()))
+    assert.ok(results.every((result) => result.changed === true))
+    assert.ok(results.every((result) => /^rule_[0-9a-f]{16}$/.test(result.ruleId)))
+
+    const cfg = JSON.parse(readFileSync(resolve(guardDir, 'guard.json'), 'utf8'))
+    assert.deepEqual([...cfg.network.allowedDomains].sort(), [...domains].sort())
+    for (const result of results) {
+      assert.equal(cfg.ruleMetadata[result.metadataKey].id, result.ruleId)
+      assert.equal(cfg.ruleMetadata[result.metadataKey].source, 'guardd')
+    }
+
+    const events = await fetch(`${daemon.base}/events?type=policy.changed&limit=10`, { headers })
+    assert.equal(events.status, 200)
+    const eventJson = await events.json()
+    assert.equal(eventJson.events.length, domains.length)
+    assert.ok(eventJson.events.every((event) => event.schemaVersion === 1))
+    assert.ok(eventJson.events.every((event) => event.backend === 'guardd'))
+    assert.ok(eventJson.events.every((event) => event.profile === 'guard'))
+    assert.ok(eventJson.events.every((event) => event.field === 'network.allowedDomains'))
+    assert.ok(eventJson.events.every((event) => event.changed === true))
+  } finally {
+    await daemon?.stop()
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('guardd template preview reads bundled templates without mutating project profiles', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guardd-template-preview-'))
+  const guardDir = resolve(tempRoot, '.guard')
+  const eventLog = resolve(tempRoot, 'events.jsonl')
+  let daemon = null
+
+  try {
+    mkdirSync(guardDir, { recursive: true })
+    daemon = await startGuarddForTest({ policyRoot: tempRoot, eventLog })
+    const headers = { authorization: `Bearer ${daemon.token}` }
+
+    const templateRead = await fetch(`${daemon.base}/templates/cloudflare-wrangler`, { headers })
+    assert.equal(templateRead.status, 200)
+    const templateJson = await templateRead.json()
+    assert.equal(templateJson.name, 'cloudflare-wrangler')
+    assert.equal(templateJson.source, 'template')
+    assert.equal(templateJson.path, resolve(repoRoot, 'templates/cloudflare-wrangler/guard.json'))
+    assert.deepEqual(templateJson.config.imports, ['node-app-defaults', 'cloudflare-wrangler'])
+
+    const preview = await fetch(`${daemon.base}/templates/cloudflare-wrangler/preview?profile=previewed`, { headers })
+    assert.equal(preview.status, 200)
+    const previewJson = await preview.json()
+    assert.equal(previewJson.action, 'preview-template')
+    assert.equal(previewJson.template, 'cloudflare-wrangler')
+    assert.equal(previewJson.profile, 'previewed')
+    assert.equal(previewJson.existing, false)
+    assert.match(previewJson.templateVersion, /^sha256:[0-9a-f]{64}$/)
+    assert.equal(previewJson.path, resolve(guardDir, 'previewed.json'))
+    assert.equal(previewJson.effective.summary.network.allowedDomainsCount > 0, true)
+    assert.equal(previewJson.effective.summary.filesystem.denyReadCount > 0, true)
+    assert.equal(existsSync(resolve(guardDir, 'guard.json')), false)
+    assert.equal(existsSync(resolve(guardDir, 'previewed.json')), false)
+
+    const apply = await fetch(`${daemon.base}/templates/cloudflare-wrangler/apply`, {
+      method: 'POST',
+      headers: {
+        ...headers,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ profile: 'guard', force: false }),
+    })
+    assert.equal(apply.status, 200)
+    assert.ok(existsSync(resolve(guardDir, 'guard.json')))
+
+    const collision = await fetch(`${daemon.base}/templates/cloudflare-wrangler/apply`, {
+      method: 'POST',
+      headers: {
+        ...headers,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ profile: 'guard', force: false }),
+    })
+    assert.equal(collision.status, 400)
+    const collisionJson = await collision.json()
+    assert.equal(collisionJson.error, 'mutation_failed')
+    assert.match(collisionJson.message, /project profile exists: guard/)
+  } finally {
+    await daemon?.stop()
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
 })
 
 test('deniedDomainPresets expand into the runtime config', () => {

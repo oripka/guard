@@ -131,8 +131,57 @@ the sandboxed process limited to the local proxy.
 }
 ```
 
+Both the default Guard proxy backend and the `iron-proxy` backend expose an
+HTTP proxy and a SOCKS proxy to the guarded process. Guard sets common proxy
+environment variables, plus `GUARD_SOCKS_PROXY` and
+`GUARD_SSH_PROXY_COMMAND`, so helper scripts can route SSH through the per-run
+SOCKS listener without learning backend-specific details.
+
+Use `network.allowedRawTcp` only for narrow loopback tools that cannot use proxy
+environment variables. Host rules must opt into launch-time DNS resolution, and
+Guard renders supported loopback results as exact sandbox egress rules for the
+current run:
+
+```json
+{
+  "network": {
+    "allowedRawTcp": [
+      {
+        "host": "localhost",
+        "resolveAtLaunch": true,
+        "port": 8976,
+        "reason": "local OAuth callback helper"
+      }
+    ]
+  }
+}
+```
+
+Prefer the proxy path when possible. `allowedRawTcp` is intentionally separate
+from `allowedDomains`: domain rules constrain traffic through Guard's proxy
+policy, while raw TCP rules are exact sandbox exceptions for non-proxyable
+clients and should stay host/IP plus port scoped. Current macOS
+`sandbox-exec` profiles do not support exact external `IP:port` egress rules;
+for SSH to hosts such as `ec2.packetsafari.com`, use the injected
+`GUARD_SSH_PROXY_COMMAND` or `GIT_SSH_COMMAND` so the traffic goes through
+Guard's SOCKS proxy. A future Network Extension backend is the right place for
+exact external raw TCP rules.
+
 When `ask` is enabled, unknown requests trigger an interactive prompt that can
 allow an exact API path or a generated wildcard path for the current run.
+Set `GUARD_ASK_NETWORK_UI=dialog` to use native macOS dialogs for ask decisions
+even when a guarded app was launched from a native wrapper.
+Set `GUARD_ASK_NETWORK_UI=native` to opt into the Swift helper panels; the
+launcher builds and wires `GUARD_ASK_NETWORK_HELPER` automatically when needed.
+
+You can persist reviewed rules back into the current project profile:
+
+```sh
+guard profile add network.allowedDomains registry.npmjs.org
+guard profile add filesystem.denyRead ~/.ssh
+guard profile add-http-rule --host api.openai.com --method POST --path /v1/responses
+guard profile add-raw-tcp --host localhost --resolve-at-launch --port 8976 --reason "local OAuth callback"
+```
 
 Bootstrap a default project profile for a Node, Vite, Nuxt, Slidev, Wrangler,
 or similar UI/dev-server app:
@@ -147,6 +196,8 @@ Inspect the current resolution state:
 guard doctor
 guard doctor pnpm --json
 guard list profiles
+guard list templates
+guard daemon --port 8765
 guard profile doctor --profile teams
 guard diff-profile zoom teams
 guard network-log /tmp/guard-network.jsonl
@@ -252,8 +303,20 @@ guard help
 guard run <webex|teams|zoom> [args...]
 guard doctor [tool] [--json]
 guard audit [--json]
+guard settings [--json]
+guard tls status [--json]
 guard app-summary --profile NAME [--json]
+guard daemon [guardd options...]
+guard monitor-log [--json] [--limit N] [PATH]
+guard profile add FIELD VALUE [--json]
+guard profile remove FIELD VALUE [--json]
+guard profile add-http-rule (--host HOST|--cidr CIDR) [--method METHOD] [--path PATH] [--json]
+guard profile remove-http-rule (--host HOST|--cidr CIDR) [--method METHOD] [--path PATH] [--json]
+guard profile add-raw-tcp (--host HOST [--resolve-at-launch]|--ip IP) --port PORT [--reason TEXT] [--json]
+guard profile remove-raw-tcp (--host HOST [--resolve-at-launch]|--ip IP) --port PORT [--reason TEXT] [--json]
+guard profile tls <enable|disable|status> [--json]
 guard profile doctor [--json]
+guard install-monitor [--dir DIR] [--force]
 guard install-app <webex|teams|zoom> [--dir DIR] [--force]
 guard install-app all [--dir DIR] [--force]
 guard install-apps [--dir DIR] [--force]
@@ -261,6 +324,7 @@ guard discover [--profile NAME] [--report PATH] -- <command> [args...]
 guard diff-profile OLD NEW [--json]
 guard network-log PATH [--json]
 guard list profiles [--json]
+guard list templates [--json]
 guard list domain-presets [--json]
 guard setup [--bin-dir DIR] [--code-root DIR] [--shims|--no-shims] [--force] [--yes]
 guard install [--bin-dir DIR] [--code-root DIR] [--no-shims] [--force]
@@ -275,8 +339,25 @@ guard init [template] [--force]
 - `guard run`: launch a built-in app profile by name
 - `guard doctor`: inspect current resolution and profile state
 - `guard audit`: print risky policy choices for the selected profile
+- `guard settings`: print monitor, prompt, daemon, and TLS inspection settings
+- `guard tls status`: print the effective TLS inspection policy for a profile
 - `guard app-summary`: print the permission summary used by native launchers
+- `guard daemon`: run the local `guardd` prototype for health and recent event
+  APIs
+- `guard monitor-log`: summarize the persistent Guard event stream used by the
+  native monitor
+- `guard profile add` / `guard profile remove`: edit project-local profile
+  array rules such as `network.allowedDomains` and `filesystem.denyRead`
+- `guard profile add-http-rule` / `guard profile remove-http-rule`: edit
+  `iron-proxy` HTTP method/path rules in the project profile
+  JSON output includes stable rule IDs and metadata keys; project profiles store
+  this in a backward-compatible top-level `ruleMetadata` sidecar.
+- `guard profile add-raw-tcp` / `guard profile remove-raw-tcp`: edit structured
+  `network.allowedRawTcp` rules for exact supported raw TCP exceptions
+- `guard profile tls`: enable, disable, or inspect explicit project-local TLS
+  inspection settings
 - `guard profile doctor`: validate profile quality for CI/review
+- `guard install-monitor`: build the native macOS monitor app
 - `guard install-app`: build one native macOS `.app` launcher wrapper, or all
   wrappers with `guard install-app all`
 - `guard install-apps`: build all native macOS launcher wrappers
@@ -286,6 +367,7 @@ guard init [template] [--force]
 - `guard network-log`: summarize guard proxy allow/deny decisions
 - `guard list profiles`: list built-in profiles such as `zoom`, `teams`, and
   `webex`
+- `guard list templates`: list project bootstrap templates for `guard init`
 - `guard list domain-presets`: show denied-domain preset names and patterns
 - `guard setup`: guided first-run or rerunnable install and managed-root
   configuration, including the current configured values
@@ -293,6 +375,46 @@ guard init [template] [--force]
 - `guard init`: create `.guard/guard.json` from a bundled template
 
 ## Native App Launchers
+
+Install the local monitor app:
+
+```sh
+guard install-monitor
+```
+
+`Guard Monitor.app` reads the persistent event log at
+`~/Library/Application Support/guard/events.jsonl` by default. Guard writes
+process lifecycle, sandbox profile, proxy startup, and network decision events
+there as JSON lines. Override the location with `GUARD_STATE_DIR` or
+`GUARD_EVENT_LOG` before launching guarded commands or installing the monitor.
+
+The same data is available without opening the app:
+
+```sh
+guard monitor-log
+guard monitor-log --json --limit 100
+```
+
+The daemon prototype exposes recent events over localhost:
+
+```sh
+guard daemon --port 8765
+curl http://127.0.0.1:8765/health
+curl 'http://127.0.0.1:8765/events?limit=20&type=network.decision'
+```
+
+Review TLS inspection explicitly:
+
+```sh
+guard settings
+guard tls status
+guard profile tls enable --json
+guard profile tls disable --json
+```
+
+TLS inspection uses the `iron-proxy` backend with a per-run CA scoped to the
+guarded process environment. Guard does not install a global trusted CA as part
+of these commands.
 
 `guard install-app webex`, `guard install-app teams`, and `guard install-app zoom`
 are optional. They create native macOS wrapper apps in `~/Applications` by
@@ -355,6 +477,8 @@ Relevant environment variables:
 - `GUARD_REAL_PYTHON3`
 - `GUARD_REAL_PIP`
 - `GUARD_REAL_PIP3`
+- `GUARD_SOCKS_PROXY` (injected into guarded processes when a SOCKS backend is active)
+- `GUARD_SSH_PROXY_COMMAND` (injected into guarded processes for SSH helpers)
 
 ## Doctor
 
@@ -445,7 +569,8 @@ closed instead of waiting for input.
 When the guarded command is an interactive shell such as `bash` or `zsh`, guard
 uses a macOS dialog for the prompt so the parent proxy process does not fight the
 child shell for terminal control. Set `GUARD_ASK_NETWORK_UI=tty` to force the
-terminal prompt, or `GUARD_ASK_NETWORK_UI=dialog` to force the dialog.
+terminal prompt, `GUARD_ASK_NETWORK_UI=dialog` to force AppleScript dialogs, or
+`GUARD_ASK_NETWORK_UI=native` to use the bundled Swift helper panels.
 
 The same mode can be enabled in a profile:
 
