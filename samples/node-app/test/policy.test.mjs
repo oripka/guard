@@ -114,6 +114,16 @@ const networkProfileConfig = ({
   },
 })
 
+const ironProxyNetworkProfileConfig = ({ ask = false, httpRules = [] } = {}) => ({
+  ...networkProfileConfig({ allowedDomains: [] }),
+  network: {
+    ...networkProfileConfig({ allowedDomains: [] }).network,
+    backend: 'iron-proxy',
+    ask,
+    httpRules,
+  },
+})
+
 const writeGuardProfile = (name, cfg) => {
   const profilePath = resolve(appRoot, `.guard/${name}.json`)
   writeFileSync(profilePath, `${JSON.stringify(cfg, null, 2)}\n`)
@@ -869,6 +879,270 @@ test('deniedDomains overrides allowedDomains in the proxy runtime', async () => 
   }
 })
 
+test('iron-proxy backend permits matching HTTP method and path rules', async () => {
+  const profilePath = writeGuardProfile(
+    'network-iron-allow',
+    ironProxyNetworkProfileConfig({
+      httpRules: [
+        {
+          host: 'localhost',
+          methods: ['GET'],
+          paths: ['/allowed'],
+        },
+      ],
+    }),
+  )
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end(`iron-ok ${req.method} ${req.url}\n`)
+  })
+  const port = await listenLoopback(server)
+
+  try {
+    const result = await runGuardCommandAsync([
+      '--profile',
+      'network-iron-allow',
+      '/usr/bin/curl',
+      '--noproxy',
+      '',
+      '-fsS',
+      `http://localhost:${port}/allowed`,
+    ])
+    expectOk(result)
+    assert.equal(result.stdout, 'iron-ok GET /allowed\n')
+  } finally {
+    rmSync(profilePath, { force: true })
+    await closeServer(server)
+  }
+})
+
+test('iron-proxy backend blocks non-matching HTTP paths', async () => {
+  const profilePath = writeGuardProfile(
+    'network-iron-block-path',
+    ironProxyNetworkProfileConfig({
+      httpRules: [
+        {
+          host: 'localhost',
+          methods: ['GET'],
+          paths: ['/allowed'],
+        },
+      ],
+    }),
+  )
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('should-not-pass\n')
+  })
+  const port = await listenLoopback(server)
+
+  try {
+    const result = await runGuardCommandAsync([
+      '--profile',
+      'network-iron-block-path',
+      '/usr/bin/curl',
+      '--noproxy',
+      '',
+      '-fsS',
+      `http://localhost:${port}/blocked`,
+    ])
+    assert.notEqual(result.status, 0)
+    assert.match(`${result.stderr}\n${result.stdout}`, /403|Forbidden/i)
+  } finally {
+    rmSync(profilePath, { force: true })
+    await closeServer(server)
+  }
+})
+
+test('iron-proxy backend blocks non-matching HTTP methods', async () => {
+  const profilePath = writeGuardProfile(
+    'network-iron-block-method',
+    ironProxyNetworkProfileConfig({
+      httpRules: [
+        {
+          host: 'localhost',
+          methods: ['GET'],
+          paths: ['/allowed'],
+        },
+      ],
+    }),
+  )
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('should-not-pass\n')
+  })
+  const port = await listenLoopback(server)
+
+  try {
+    const result = await runGuardCommandAsync([
+      '--profile',
+      'network-iron-block-method',
+      '/usr/bin/curl',
+      '--noproxy',
+      '',
+      '-fsS',
+      '-X',
+      'POST',
+      `http://localhost:${port}/allowed`,
+    ])
+    assert.notEqual(result.status, 0)
+    assert.match(`${result.stderr}\n${result.stdout}`, /403|Forbidden/i)
+  } finally {
+    rmSync(profilePath, { force: true })
+    await closeServer(server)
+  }
+})
+
+test('iron-proxy interactive backend denies unknown requests in non-interactive shells', async () => {
+  const profilePath = writeGuardProfile(
+    'network-iron-ask-noninteractive',
+    ironProxyNetworkProfileConfig({ ask: true }),
+  )
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('should-not-pass\n')
+  })
+  const port = await listenLoopback(server)
+
+  try {
+    const result = await runGuardCommandAsync([
+      '--profile',
+      'network-iron-ask-noninteractive',
+      '/usr/bin/curl',
+      '--noproxy',
+      '',
+      '-fsS',
+      `http://localhost:${port}/unknown`,
+    ])
+    assert.notEqual(result.status, 0)
+    assert.match(`${result.stderr}\n${result.stdout}`, /403|Forbidden/i)
+  } finally {
+    rmSync(profilePath, { force: true })
+    await closeServer(server)
+  }
+})
+
+test('iron-proxy backend supports fetch, curl, npm, and pnpm clients', async () => {
+  const npmBin = firstExisting([
+    process.env.GUARD_REAL_NPM,
+    '/opt/homebrew/bin/npm',
+    '/usr/local/bin/npm',
+    process.env.HOME ? join(process.env.HOME, '.local/bin/npm') : null,
+  ])
+  const pnpmBin = firstExisting([
+    process.env.GUARD_REAL_PNPM,
+    '/opt/homebrew/bin/pnpm',
+    '/usr/local/bin/pnpm',
+    process.env.HOME ? join(process.env.HOME, '.local/bin/pnpm') : null,
+  ])
+  if (!npmBin || !pnpmBin) {
+    return
+  }
+
+  const profilePath = writeGuardProfile(
+    'network-iron-clients',
+    ironProxyNetworkProfileConfig({
+      httpRules: [
+        {
+          host: 'localhost',
+          methods: ['GET'],
+          paths: ['/fetch', '/curl', '/guard-proxy-test', '/guard-proxy-test/*'],
+        },
+      ],
+    }),
+  )
+  const server = createHttpServer((req, res) => {
+    if ((req.url || '').startsWith('/guard-proxy-test')) {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        name: 'guard-proxy-test',
+        'dist-tags': { latest: '1.0.0' },
+        versions: {
+          '1.0.0': {
+            name: 'guard-proxy-test',
+            version: '1.0.0',
+            dist: {
+              tarball: 'http://localhost/guard-proxy-test/-/guard-proxy-test-1.0.0.tgz',
+              shasum: '0000000000000000000000000000000000000000',
+            },
+          },
+        },
+      }))
+      return
+    }
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end(`iron-client-ok ${req.url}\n`)
+  })
+  const port = await listenLoopback(server)
+  const registry = `http://localhost:${port}`
+
+  try {
+    const fetchResult = await runGuardCommandAsync([
+      '--profile',
+      'network-iron-clients',
+      '/usr/bin/env',
+      'NO_PROXY=',
+      'no_proxy=',
+      'node',
+      'scripts/probe.mjs',
+      'node-fetch',
+      `${registry}/fetch`,
+    ])
+    expectOk(fetchResult)
+    assert.equal(fetchResult.stdout, 'iron-client-ok /fetch\n')
+
+    const curl = await runGuardCommandAsync([
+      '--profile',
+      'network-iron-clients',
+      '/usr/bin/curl',
+      '--noproxy',
+      '',
+      '-fsS',
+      `${registry}/curl`,
+    ])
+    expectOk(curl)
+    assert.equal(curl.stdout, 'iron-client-ok /curl\n')
+
+    const npm = await runGuardCommandAsync([
+      '--profile',
+      'network-iron-clients',
+      '/usr/bin/env',
+      'NO_PROXY=',
+      'no_proxy=',
+      npmBin,
+      'view',
+      'guard-proxy-test',
+      'version',
+      '--registry',
+      registry,
+      '--fetch-retries',
+      '0',
+      '--fetch-timeout',
+      '5000',
+    ])
+    expectOk(npm)
+    assert.match(npm.stdout, /1\.0\.0/)
+
+    const pnpm = await runGuardCommandAsync([
+      '--profile',
+      'network-iron-clients',
+      '/usr/bin/env',
+      'NO_PROXY=',
+      'no_proxy=',
+      pnpmBin,
+      'view',
+      'guard-proxy-test',
+      'version',
+      '--registry',
+      registry,
+    ])
+    expectOk(pnpm)
+    assert.match(pnpm.stdout, /1\.0\.0/)
+  } finally {
+    rmSync(profilePath, { force: true })
+    await closeServer(server)
+  }
+})
+
 test('network ask filter prompts once and caches allowed hosts for the run', async () => {
   const prompts = []
   const filter = createDomainFilter(
@@ -1474,6 +1748,8 @@ test('guard help prints command usage', () => {
   expectOk(result)
   assert.match(result.stdout, /^Usage:/)
   assert.match(result.stdout, /guard install-apps \[--dir DIR\] \[--force\]/)
+  assert.match(result.stdout, /guard monitor-log \[--json\] \[--limit N\] \[PATH\]/)
+  assert.match(result.stdout, /guard install-monitor \[--dir DIR\] \[--force\]/)
 })
 
 test('list profile can emit machine-readable JSON', () => {
@@ -1548,6 +1824,46 @@ test('install-app creates a native macOS wrapper bundle', () => {
     assert.equal(config.bundleIdentifier, 'dev.guard.webex')
   } finally {
     rmSync(targetDir, { recursive: true, force: true })
+  }
+})
+
+test('install-monitor creates a native macOS monitor bundle', () => {
+  const targetDir = mkdtempSync(join(tmpdir(), 'guard-monitor-app-'))
+  const stateDir = mkdtempSync(join(tmpdir(), 'guard-monitor-state-'))
+  try {
+    const result = spawnSync(
+      guard,
+      ['install-monitor', '--dir', targetDir, '--force'],
+      {
+        cwd: appRoot,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GUARD_STATE_DIR: stateDir,
+        },
+      },
+    )
+
+    expectOk(result)
+    const appPath = join(targetDir, 'Guard Monitor.app')
+    const contentsPath = join(appPath, 'Contents')
+    const configPath = join(contentsPath, 'Resources/GuardAppConfig.json')
+
+    assert.ok(existsSync(appPath))
+    assert.ok(existsSync(join(contentsPath, 'Info.plist')))
+    assert.ok(existsSync(join(contentsPath, 'MacOS/GuardMonitor')))
+    assert.match(readFileSync(join(contentsPath, 'Info.plist'), 'utf8'), /dev\.guard\.monitor/)
+
+    const config = JSON.parse(readFileSync(configPath, 'utf8'))
+    assert.equal(config.mode, 'monitor')
+    assert.equal(config.profile, 'guard')
+    assert.equal(config.displayName, 'Monitor')
+    assert.equal(config.guardPath, guard)
+    assert.equal(config.bundleIdentifier, 'dev.guard.monitor')
+    assert.equal(config.eventLogPath, join(stateDir, 'events.jsonl'))
+  } finally {
+    rmSync(targetDir, { recursive: true, force: true })
+    rmSync(stateDir, { recursive: true, force: true })
   }
 })
 
@@ -1670,6 +1986,50 @@ test('network-log summarizes guard network decision JSONL', () => {
   assert.match(result.stdout, /^Guard Network Log/m)
   assert.match(result.stdout, /example\.com:443 allowed=1 denied=0/)
   assert.match(result.stdout, /tracker\.test:443 allowed=0 denied=1/)
+})
+
+test('monitor-log summarizes persistent guard events', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-monitor-log-'))
+  const logPath = resolve(tempRoot, 'events.jsonl')
+  writeFileSync(
+    logPath,
+    [
+      JSON.stringify({
+        at: '2026-04-24T00:00:00.000Z',
+        type: 'process.started',
+        profile: 'guard',
+        command: 'node server.mjs',
+      }),
+      JSON.stringify({
+        at: '2026-04-24T00:00:01.000Z',
+        type: 'network.decision',
+        profile: 'guard',
+        host: 'api.example.com',
+        port: 443,
+        allowed: true,
+        reason: 'matched-rule',
+      }),
+    ].join('\n') + '\n',
+  )
+
+  const text = spawnSync(guard, ['monitor-log', '--limit', '2', logPath], {
+    cwd: appRoot,
+    encoding: 'utf8',
+  })
+  expectOk(text)
+  assert.match(text.stdout, /^Guard Monitor Log/m)
+  assert.match(text.stdout, /guard: events=2 allowed=1 denied=0/)
+  assert.match(text.stdout, /network\.decision api\.example\.com:443 allow/)
+
+  const json = spawnSync(guard, ['monitor-log', '--json', '--limit', '1', logPath], {
+    cwd: appRoot,
+    encoding: 'utf8',
+  })
+  expectOk(json)
+  const summary = JSON.parse(json.stdout)
+  assert.equal(summary.eventCount, 2)
+  assert.equal(summary.recent.length, 1)
+  assert.equal(summary.recent[0].type, 'network.decision')
 })
 
 test('discover runs with temporary discovery reporting', () => {
