@@ -108,6 +108,7 @@ From a project that contains `.guard/guard.json`, prefix commands with `guard`:
 ```sh
 guard pnpm run dev
 guard --ask-network pnpm run dev
+guard --daemon-policy pnpm run dev
 ```
 
 For deep HTTP egress rules, use the optional `iron-proxy` backend. Guard starts
@@ -159,6 +160,14 @@ HTTP proxy and a SOCKS proxy to the guarded process. Guard sets common proxy
 environment variables, plus `GUARD_SOCKS_PROXY` and
 `GUARD_SSH_PROXY_COMMAND`, so helper scripts can route SSH through the per-run
 SOCKS listener without learning backend-specific details.
+
+Use `--daemon-policy` to keep the per-run sandbox/proxy launcher but delegate
+unknown network decisions to `guardd` pending alerts instead of prompting in the
+current terminal. This is opt-in and fail-closed: set `GUARD_DAEMON_URL` or
+`GUARDD_URL`, plus `GUARD_DAEMON_TOKEN` or `GUARDD_API_TOKEN` when the daemon is
+authenticated. Guard enqueues `guard.alert.pending`, waits for Guard.app or a
+daemon client to resolve it, then allows or denies the current proxied request.
+The default `guard` and `guard --ask-network` paths remain daemon-free.
 
 Use `network.allowedRawTcp` only for narrow loopback tools that cannot use proxy
 environment variables. Host rules must opt into launch-time DNS resolution, and
@@ -319,9 +328,9 @@ aliases or tool-specific wrapper scripts.
 ## Commands
 
 ```text
-guard [--profile NAME] [--ask-network] <command> [args...]
-guard [--profile NAME] [--ask-network] -- <command> [args...]
-guard [--profile NAME] [--ask-network]
+guard [--profile NAME] [--ask-network] [--deep-egress] [--daemon-policy] <command> [args...]
+guard [--profile NAME] [--ask-network] [--deep-egress] [--daemon-policy] -- <command> [args...]
+guard [--profile NAME] [--ask-network] [--deep-egress] [--daemon-policy]
 guard help
 guard run <webex|teams|zoom> [args...]
 guard doctor [tool] [--json]
@@ -359,6 +368,10 @@ guard init [template] [--force]
 - `guard help`: print CLI usage
 - `--ask-network`: prompt before allowing unknown proxied network hosts for
   the current run
+- `--deep-egress`: force the optional `iron-proxy` backend for this run
+- `--daemon-policy`: route unknown proxied network decisions through `guardd`
+  pending alerts for this run. Alias flags are `--guardd-policy` and
+  `--use-guardd`
 - `guard` with no command: show the resolved policy banner
 - `guard run`: launch a built-in app profile by name
 - `guard doctor`: inspect current resolution and profile state
@@ -677,6 +690,14 @@ The same mode can be enabled in a profile:
 
 This applies to traffic that goes through guard's HTTP/SOCKS proxy support.
 Direct raw TCP remains controlled by the native sandbox profile.
+
+`guard --daemon-policy <command>` is the daemon-backed variant. It forces
+ask-style proxy decisions, writes `network.decisionMode: "guardd"` into the
+temporary runtime config, and posts unknown destinations to `POST
+/alerts/pending`. The guarded process waits until the alert is resolved through
+`POST /alerts/:id/resolve` or `POST /alerts/decision`; unresolved or unreachable
+daemon decisions are denied. This works with both the normal Guard proxy and
+`guard --deep-egress` / `network.backend: "iron-proxy"`.
 
 `network.allowLocalBinding` is intentionally loopback-only. It permits local dev
 servers to listen on localhost without allowing direct outbound TCP, DNS, or

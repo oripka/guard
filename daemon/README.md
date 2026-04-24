@@ -155,6 +155,11 @@ Authenticated write API:
   The response includes an alert `id`, `status`, `createdAt`, `expiresAt`, and
   `timeoutMs`; expired alerts emit `guard.alert.expired` when the queue is next
   read or resolved.
+- `guard --daemon-policy <command>` uses this endpoint as an opt-in CLI bridge:
+  the per-run proxy enqueues unknown destinations, waits for the alert to be
+  resolved by Guard.app or another daemon client, and denies the request if
+  `guardd` is unreachable or the alert times out. This does not change the
+  default daemon-free `guard` and `guard --ask-network` behavior.
 - `POST /alerts/:id/resolve` resolves a pending alert through the same decision
   path as `/alerts/decision`. Body: `{"action":"allow","duration":"session"}`.
   Successful resolution emits both `guard.alert.decision` and

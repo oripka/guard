@@ -270,6 +270,33 @@ const startGuarddForTest = async ({ policyRoot, eventLog, token = 'test-token', 
   }
 }
 
+const waitForGuarddPendingAlert = async (daemon, predicate = () => true, timeoutMs = 5000) => {
+  const deadline = Date.now() + timeoutMs
+  const headers = { authorization: `Bearer ${daemon.token}` }
+  while (Date.now() < deadline) {
+    const response = await fetch(`${daemon.base}/alerts/pending?limit=50`, { headers })
+    assert.equal(response.status, 200)
+    const json = await response.json()
+    const alert = json.alerts.find(predicate)
+    if (alert) return alert
+    await new Promise((resolveDone) => setTimeout(resolveDone, 100))
+  }
+  throw new Error('timed out waiting for guardd pending alert')
+}
+
+const resolveGuarddPendingAlert = async (daemon, alert, decision) => {
+  const response = await fetch(`${daemon.base}/alerts/${alert.id}/resolve`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${daemon.token}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(decision),
+  })
+  assert.equal(response.status, 200)
+  return await response.json()
+}
+
 for (const [tool, pattern] of [
   ['node', /^v\d+\./],
   ['python', /^Python \d+\./],
@@ -917,6 +944,43 @@ test('--deep-egress forces the iron-proxy backend for a run', () => {
   }
 })
 
+test('--daemon-policy opts a run into guardd-backed network decisions', () => {
+  const profilePath = writeGuardProfile(
+    'daemon-policy-flag',
+    networkProfileConfig({ allowedDomains: [] }),
+  )
+
+  try {
+    const result = runGuardCommand([
+      '--daemon-policy',
+      '--profile',
+      'daemon-policy-flag',
+      'node',
+      'scripts/probe.mjs',
+      'runtime-config-json',
+    ])
+    expectOk(result)
+    const cfg = JSON.parse(result.stdout)
+    assert.equal(cfg.network.ask, true)
+    assert.equal(cfg.network.decisionMode, 'guardd')
+
+    const localAsk = runGuardCommand([
+      '--ask-network',
+      '--profile',
+      'daemon-policy-flag',
+      'node',
+      'scripts/probe.mjs',
+      'runtime-config-json',
+    ])
+    expectOk(localAsk)
+    const localCfg = JSON.parse(localAsk.stdout)
+    assert.equal(localCfg.network.ask, true)
+    assert.equal(localCfg.network.decisionMode, undefined)
+  } finally {
+    rmSync(profilePath, { force: true })
+  }
+})
+
 test('--deep-egress can run with the built-in guard profile outside a project config', () => {
   const tempRoot = mkdtempSync(join(tmpdir(), 'guard-deep-egress-'))
   try {
@@ -1324,6 +1388,62 @@ test('iron-proxy interactive backend denies unknown requests in non-interactive 
   }
 })
 
+test('--deep-egress --daemon-policy routes iron-proxy decisions through guardd alerts', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-iron-daemon-policy-'))
+  const eventLog = resolve(tempRoot, 'events.jsonl')
+  const profilePath = writeGuardProfile(
+    'network-iron-daemon-policy',
+    ironProxyNetworkProfileConfig({ ask: false }),
+  )
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end(`iron-daemon-ok ${req.method} ${req.url}\n`)
+  })
+  const port = await listenLoopback(server)
+  let daemon = null
+
+  try {
+    daemon = await startGuarddForTest({
+      policyRoot: appRoot,
+      eventLog,
+      extraEnv: { GUARD_STATE_DIR: resolve(tempRoot, 'state') },
+    })
+    const run = runGuardCommandAsync([
+      '--deep-egress',
+      '--daemon-policy',
+      '--profile',
+      'network-iron-daemon-policy',
+      '/usr/bin/curl',
+      '--noproxy',
+      '',
+      '-fsS',
+      `http://localhost:${port}/guardd-path`,
+    ], {
+      GUARD_DAEMON_URL: daemon.base,
+      GUARD_DAEMON_TOKEN: daemon.token,
+      GUARD_DAEMON_DECISION_TIMEOUT_MS: '10000',
+    })
+
+    const alert = await waitForGuarddPendingAlert(
+      daemon,
+      (candidate) => candidate.host === 'localhost' && candidate.reason === 'daemon-http-policy',
+      10000,
+    )
+    assert.equal(alert.method, 'GET')
+    assert.equal(alert.path, '/guardd-path')
+    await resolveGuarddPendingAlert(daemon, alert, { action: 'allow', duration: 'session' })
+
+    const result = await run
+    expectOk(result)
+    assert.equal(result.stdout, 'iron-daemon-ok GET /guardd-path\n')
+  } finally {
+    await daemon?.stop()
+    rmSync(profilePath, { force: true })
+    rmSync(tempRoot, { recursive: true, force: true })
+    await closeServer(server)
+  }
+})
+
 test('iron-proxy backend supports fetch, curl, npm, and pnpm clients', async () => {
   const npmBin = firstExisting([
     process.env.GUARD_REAL_NPM,
@@ -1509,6 +1629,94 @@ test('network ask blocks unknown hosts in non-interactive shells', async () => {
     ])
     assert.notEqual(result.status, 0)
     assert.match(result.stderr, /--ask-network requires an interactive terminal/)
+    assert.match(`${result.stderr}\n${result.stdout}`, /403|blocked/i)
+  } finally {
+    rmSync(profilePath, { force: true })
+    await closeServer(server)
+  }
+})
+
+test('--daemon-policy sends normal proxy decisions through guardd pending alerts', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-daemon-policy-'))
+  const eventLog = resolve(tempRoot, 'events.jsonl')
+  const profilePath = writeGuardProfile(
+    'network-daemon-policy',
+    networkProfileConfig({ allowedDomains: [] }),
+  )
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end(`daemon-policy-ok ${req.url}\n`)
+  })
+  const port = await listenLoopback(server)
+  let daemon = null
+
+  try {
+    daemon = await startGuarddForTest({
+      policyRoot: appRoot,
+      eventLog,
+      extraEnv: { GUARD_STATE_DIR: resolve(tempRoot, 'state') },
+    })
+    const run = runGuardCommandAsync([
+      '--daemon-policy',
+      '--profile',
+      'network-daemon-policy',
+      '/usr/bin/curl',
+      '--noproxy',
+      '',
+      '-fsS',
+      `http://localhost:${port}/allowed-by-daemon`,
+    ], {
+      GUARD_DAEMON_URL: daemon.base,
+      GUARD_DAEMON_TOKEN: daemon.token,
+      GUARD_DAEMON_DECISION_TIMEOUT_MS: '10000',
+    })
+
+    const alert = await waitForGuarddPendingAlert(
+      daemon,
+      (candidate) => candidate.host === 'localhost' && candidate.reason === 'daemon-network-policy',
+    )
+    assert.equal(alert.command.includes('/usr/bin/curl'), true)
+    await resolveGuarddPendingAlert(daemon, alert, { action: 'allow', duration: 'session' })
+
+    const result = await run
+    expectOk(result)
+    assert.equal(result.stdout, 'daemon-policy-ok /allowed-by-daemon\n')
+  } finally {
+    await daemon?.stop()
+    rmSync(profilePath, { force: true })
+    rmSync(tempRoot, { recursive: true, force: true })
+    await closeServer(server)
+  }
+})
+
+test('--daemon-policy fails closed when guardd is unavailable', async () => {
+  const profilePath = writeGuardProfile(
+    'network-daemon-policy-unavailable',
+    networkProfileConfig({ allowedDomains: [] }),
+  )
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('should-not-pass\n')
+  })
+  const port = await listenLoopback(server)
+
+  try {
+    const result = await runGuardCommandAsync([
+      '--daemon-policy',
+      '--profile',
+      'network-daemon-policy-unavailable',
+      '/usr/bin/curl',
+      '--noproxy',
+      '',
+      '-fsS',
+      `http://localhost:${port}/`,
+    ], {
+      GUARD_DAEMON_URL: 'http://127.0.0.1:9',
+      GUARD_DAEMON_TOKEN: 'test-token',
+      GUARD_DAEMON_DECISION_TIMEOUT_MS: '1000',
+    })
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /guardd policy unavailable/)
     assert.match(`${result.stderr}\n${result.stdout}`, /403|blocked/i)
   } finally {
     rmSync(profilePath, { force: true })
