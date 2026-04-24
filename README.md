@@ -126,10 +126,33 @@ the sandboxed process limited to the local proxy.
         "methods": ["POST"],
         "paths": ["/v1/responses", "/v1/oripka/*"]
       }
+    ],
+    "secretInjection": [
+      {
+        "name": "OPENAI_API_KEY",
+        "source": { "type": "env", "var": "OPENAI_API_KEY" },
+        "proxyValue": "guard-proxy-openai-token",
+        "matchHeaders": ["Authorization"],
+        "require": true,
+        "rules": [
+          {
+            "host": "api.openai.com",
+            "methods": ["POST"],
+            "paths": ["/v1/responses"]
+          }
+        ]
+      }
     ]
   }
 }
 ```
+
+Secret injection is boundary-side only. The guarded process sends the proxy
+token, for example `Authorization: Bearer guard-proxy-openai-token`; Guard
+renders an `iron-proxy` `secrets` transform that swaps it for the real
+environment secret only on matching host/method/path rules. Profile JSON stores
+secret names and proxy tokens, not real secret values, and monitor UI surfaces
+secret routes as redacted rows.
 
 Both the default Guard proxy backend and the `iron-proxy` backend expose an
 HTTP proxy and a SOCKS proxy to the guarded process. Guard sets common proxy
@@ -307,6 +330,7 @@ guard settings [--json]
 guard tls status [--json]
 guard app-summary --profile NAME [--json]
 guard daemon [guardd options...]
+guard ui [--dir DIR]
 guard monitor-log [--json] [--limit N] [PATH]
 guard profile add FIELD VALUE [--json]
 guard profile remove FIELD VALUE [--json]
@@ -344,6 +368,7 @@ guard init [template] [--force]
 - `guard app-summary`: print the permission summary used by native launchers
 - `guard daemon`: run the local `guardd` prototype for health and recent event
   APIs
+- `guard ui`: build, install, open, and self-bootstrap the native Guard Monitor
 - `guard monitor-log`: summarize the persistent Guard event stream used by the
   native monitor
 - `guard profile add` / `guard profile remove`: edit project-local profile
@@ -379,6 +404,17 @@ guard init [template] [--force]
 Install the local monitor app:
 
 ```sh
+guard ui
+```
+
+This builds and opens `Guard Monitor.app`. On launch, the monitor connects to an
+existing local `guardd` if one is reachable; otherwise it starts a temporary
+local daemon using the selected project when available or Guard's global
+app-support policy store by default.
+
+Install the local monitor app without opening it:
+
+```sh
 guard install-monitor
 ```
 
@@ -403,6 +439,34 @@ curl http://127.0.0.1:8765/health
 curl 'http://127.0.0.1:8765/events?limit=20&type=network.decision'
 ```
 
+When `Guard Monitor.app` can reach `guardd`, its right-side inspector uses the
+daemon as the write path. The Rules button opens the selected profile's allow,
+deny, HTTP, disabled-rule, and version summary. The Templates button opens a
+focused template window that can preview or apply bundled templates through
+`guardd`. The Settings button opens daemon, TLS, extension, and diagnostics
+controls; it can start a local temporary `guardd` using the selected event
+project when available, otherwise Guard's global app-support policy root under
+`~/Library/Application Support/guard`; it can also stop that monitor-managed
+daemon, toggle explicit TLS policy for the selected profile, and edit visible
+rules with enable/disable/delete row actions. The Log button opens recent JSONL
+history in a separate diagnostics window instead of occupying the main monitor.
+`guardd` can also write the canonical shared-policy snapshot used by the
+NetworkExtension app-group sync manifest/policy/event paths through
+`POST /extension/sync`; the unsigned scaffold consumes that contract for policy
+cache invalidation, policy digest validation, stale-policy fallback, and
+event-log backpressure. These controls are feature-only local development
+flows; they do not install launch agents or NetworkExtension components.
+
+The monitor UI is intentionally moving toward a Little Snitch-style native
+workflow without adding packaging or signing requirements: the header shows
+profile risk and rule status chips, a compact live allow/deny traffic graph, and
+a Focus Top Host action that opens the Rules window filtered to the busiest recent
+destination. Rules carry action, type, enabled state, and scope-risk labels so
+broad host/domain grants are easier to spot before editing. The dedicated Rules
+window supports multi-select edits, a Disable Visible bulk action, and
+optimistic profile-version checks so stale UI edits reload instead of silently
+overwriting newer CLI or daemon changes.
+
 Review TLS inspection explicitly:
 
 ```sh
@@ -414,7 +478,36 @@ guard profile tls disable --json
 
 TLS inspection uses the `iron-proxy` backend with a per-run CA scoped to the
 guarded process environment. Guard does not install a global trusted CA as part
-of these commands.
+of these commands. `guardd` can generate, rotate, and revoke local CA artifacts
+and can issue cached per-host leaf certificates under its state directory for
+development, but it always reports `globalTrustManaged: false`. `guardd` also
+exposes `/tls/status` for trust diagnostics and `/security/status` for local
+token, permission, and CA-key checks. `/events/query` scans the persisted JSONL
+log tail for filtered history when the in-memory monitor buffer is not enough,
+while `/events/index` keeps durable counts for long-running history summaries.
+`/alerts/decision` records allow/deny decisions for `once`, `session`, or
+`forever`; forever decisions persist profile rules with optimistic version
+checks. `/alerts/pending` and `/alerts/:id/resolve` provide the live alert
+lifecycle used by native monitor controls: pending alerts carry `createdAt`,
+`expiresAt`, and `timeoutMs`, resolution emits normal decision history plus a
+resolved event, and expired alerts are marked explicitly instead of lingering as
+ambiguous unanswered prompts. Pending alert state is persisted under the daemon
+state directory so unresolved prompts survive a `guardd` restart.
+
+For local secret hardening, `GUARDD_TOKEN_KEYCHAIN=1` lets `guardd` read its API
+token from macOS Keychain when no token is supplied on the command line, and
+`POST /auth/token/persist` can store the current runtime token through the
+system `security` tool. This is still separate from packaging/signing.
+
+The native monitor Settings window includes the guided TLS trust onboarding flow.
+It reads the existing `GET /tls/status` payload and shows the local CA lifecycle,
+certificate and bundle paths, process-scoped trust environment variables,
+cached host-certificate counts, expired-certificate diagnostics, and any CA
+permission or lifecycle findings. The trust actions are deliberately local:
+Generate Local CA creates daemon-state artifacts, Rotate Local CA archives and
+replaces those artifacts for recovery, and Revoke Local CA marks the local CA
+metadata revoked. None of these actions install or modify global macOS trust;
+guarded tools must receive the per-process trust environment from Guard.
 
 `guard install-app webex`, `guard install-app teams`, and `guard install-app zoom`
 are optional. They create native macOS wrapper apps in `~/Applications` by

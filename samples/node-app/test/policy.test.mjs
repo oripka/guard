@@ -1,14 +1,22 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { createServer as createHttpServer } from 'node:http'
+import { createServer as createHttpsServer } from 'node:https'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
+import { connect as netConnect } from 'node:net'
 import test from 'node:test'
+import { connect as tlsConnect } from 'node:tls'
 import { fileURLToPath } from 'node:url'
 
 import { generateProfile } from '../../../lib/guard-manager.mjs'
-import { createDomainFilter, buildProxyEnv } from '../../../lib/guard-network.mjs'
+import {
+  createDomainFilter,
+  buildProxyEnv,
+  createGuarddTlsCertificateIssuer,
+  startHttpProxy,
+} from '../../../lib/guard-network.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const appRoot = resolve(__dirname, '..')
@@ -114,13 +122,14 @@ const networkProfileConfig = ({
   },
 })
 
-const ironProxyNetworkProfileConfig = ({ ask = false, httpRules = [] } = {}) => ({
+const ironProxyNetworkProfileConfig = ({ ask = false, httpRules = [], secretInjection = [] } = {}) => ({
   ...networkProfileConfig({ allowedDomains: [] }),
   network: {
     ...networkProfileConfig({ allowedDomains: [] }).network,
     backend: 'iron-proxy',
     ask,
     httpRules,
+    secretInjection,
   },
 })
 
@@ -140,6 +149,55 @@ const listenLoopback = async (server) => {
   return server.address().port
 }
 
+const connectSocket = (options) =>
+  new Promise((resolve, reject) => {
+    const socket = netConnect(options)
+    socket.once('connect', () => resolve(socket))
+    socket.once('error', reject)
+  })
+
+const readUntil = (socket, marker) =>
+  new Promise((resolve, reject) => {
+    let data = Buffer.alloc(0)
+    const onData = (chunk) => {
+      data = Buffer.concat([data, chunk])
+      if (data.includes(marker)) {
+        socket.off('data', onData)
+        resolve(data)
+      }
+    }
+    socket.on('data', onData)
+    socket.once('error', reject)
+    socket.once('end', () => resolve(data))
+  })
+
+const httpsThroughConnect = async ({ proxyPort, targetPort, path = '/', ca }) => {
+  const socket = await connectSocket({ host: '127.0.0.1', port: proxyPort })
+  socket.write(
+    `CONNECT localhost:${targetPort} HTTP/1.1\r\nHost: localhost:${targetPort}\r\n\r\n`,
+  )
+  const connectResponse = await readUntil(socket, Buffer.from('\r\n\r\n'))
+  assert.match(connectResponse.toString('utf8'), /^HTTP\/1\.[01] 200\b/)
+  const tlsSocket = tlsConnect({
+    socket,
+    servername: 'localhost',
+    ca,
+    rejectUnauthorized: true,
+  })
+  await new Promise((resolve, reject) => {
+    tlsSocket.once('secureConnect', resolve)
+    tlsSocket.once('error', reject)
+  })
+  tlsSocket.write(
+    `GET ${path} HTTP/1.1\r\nHost: localhost:${targetPort}\r\nConnection: close\r\n\r\n`,
+  )
+  const chunks = []
+  for await (const chunk of tlsSocket) {
+    chunks.push(chunk)
+  }
+  return Buffer.concat(chunks).toString('utf8')
+}
+
 const firstExisting = (candidates) =>
   candidates.find((candidate) => candidate && existsSync(candidate)) || null
 
@@ -151,15 +209,15 @@ const expectNoDirectNetwork = (result) => {
   )
 }
 
-const startGuarddForTest = async ({ policyRoot, eventLog, token = 'test-token', extraArgs = [] }) => {
+const startGuarddForTest = async ({ policyRoot, eventLog, token = 'test-token', extraArgs = [], extraEnv = {} }) => {
   let child = null
+  const policyRootArgs = policyRoot ? ['--policy-root', policyRoot] : []
   const ready = new Promise((resolveReady, rejectReady) => {
     child = spawn(process.execPath, [
       resolve(repoRoot, 'daemon/guardd.mjs'),
       '--port',
       '0',
-      '--policy-root',
-      policyRoot,
+      ...policyRootArgs,
       '--event-log',
       eventLog,
       '--api-token',
@@ -172,6 +230,7 @@ const startGuarddForTest = async ({ policyRoot, eventLog, token = 'test-token', 
       encoding: 'utf8',
       env: {
         ...process.env,
+        ...extraEnv,
         GUARD_QUIET: '1',
       },
     })
@@ -1142,6 +1201,100 @@ test('iron-proxy backend blocks non-matching HTTP methods', async () => {
   }
 })
 
+test('iron-proxy backend swaps proxy tokens for scoped secrets without exposing the real secret to the workload', async () => {
+  const profilePath = writeGuardProfile(
+    'network-iron-secret-injection',
+    ironProxyNetworkProfileConfig({
+      httpRules: [
+        {
+          host: 'localhost',
+          methods: ['GET'],
+          paths: ['/secret', '/blocked'],
+        },
+      ],
+      secretInjection: [
+        {
+          name: 'OPENAI_API_KEY',
+          source: { type: 'env', var: 'GUARD_TEST_REAL_SECRET' },
+          proxyValue: 'guard-proxy-token-for-test',
+          matchHeaders: ['Authorization'],
+          require: true,
+          rules: [
+            {
+              host: 'localhost',
+              methods: ['GET'],
+              paths: ['/secret'],
+            },
+          ],
+        },
+      ],
+    }),
+  )
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({
+      authorization: req.headers.authorization || '',
+    }))
+  })
+  const port = await listenLoopback(server)
+
+  try {
+    const result = await runGuardCommandAsync([
+      '--profile',
+      'network-iron-secret-injection',
+      '/usr/bin/curl',
+      '--noproxy',
+      '',
+      '-fsS',
+      '-H',
+      'Authorization: Bearer guard-proxy-token-for-test',
+      `http://localhost:${port}/secret`,
+    ], {
+      GUARD_TEST_REAL_SECRET: 'real-secret-value-from-parent-only',
+    })
+    expectOk(result)
+    const json = JSON.parse(result.stdout)
+    assert.equal(json.authorization, 'Bearer real-secret-value-from-parent-only')
+    assert.equal(result.stdout.includes('guard-proxy-token-for-test'), false)
+
+    const missingProxyToken = await runGuardCommandAsync([
+      '--profile',
+      'network-iron-secret-injection',
+      '/usr/bin/curl',
+      '--noproxy',
+      '',
+      '-fsS',
+      '-H',
+      'Authorization: Bearer user-bypassed-token',
+      `http://localhost:${port}/secret`,
+    ], {
+      GUARD_TEST_REAL_SECRET: 'real-secret-value-from-parent-only',
+    })
+    assert.notEqual(missingProxyToken.status, 0)
+    assert.match(`${missingProxyToken.stderr}\n${missingProxyToken.stdout}`, /403|Forbidden/i)
+
+    const wrongPath = await runGuardCommandAsync([
+      '--profile',
+      'network-iron-secret-injection',
+      '/usr/bin/curl',
+      '--noproxy',
+      '',
+      '-fsS',
+      '-H',
+      'Authorization: Bearer guard-proxy-token-for-test',
+      `http://localhost:${port}/blocked`,
+    ], {
+      GUARD_TEST_REAL_SECRET: 'real-secret-value-from-parent-only',
+    })
+    expectOk(wrongPath)
+    const wrongPathJson = JSON.parse(wrongPath.stdout)
+    assert.equal(wrongPathJson.authorization, 'Bearer guard-proxy-token-for-test')
+  } finally {
+    rmSync(profilePath, { force: true })
+    await closeServer(server)
+  }
+})
+
 test('iron-proxy interactive backend denies unknown requests in non-interactive shells', async () => {
   const profilePath = writeGuardProfile(
     'network-iron-ask-noninteractive',
@@ -1385,6 +1538,87 @@ test('HTTPS CONNECT tunnels are filtered by allowedDomains', async () => {
   } finally {
     rmSync(profilePath, { force: true })
     await closeServer(server)
+  }
+})
+
+test('CONNECT TLS interception uses guardd host certs and filters decrypted HTTPS paths', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-connect-tls-'))
+  const eventLog = join(tempRoot, 'events.jsonl')
+  const stateDir = join(tempRoot, 'state')
+  const daemon = await startGuarddForTest({
+    policyRoot: tempRoot,
+    eventLog,
+    token: 'tls-test-token',
+    extraEnv: { GUARD_STATE_DIR: stateDir },
+  })
+  const headers = {
+    authorization: `Bearer ${daemon.token}`,
+    'content-type': 'application/json',
+  }
+  let upstream = null
+  let proxy = null
+
+  try {
+    const caResponse = await fetch(`${daemon.base}/tls/ca`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ action: 'generate', days: 1, commonName: 'Guard Test CA' }),
+    })
+    assert.equal(caResponse.status, 200)
+    const caJson = await caResponse.json()
+    const ca = readFileSync(caJson.paths.certificatePath, 'utf8')
+    const issuer = createGuarddTlsCertificateIssuer({
+      baseUrl: daemon.base,
+      token: daemon.token,
+      days: 1,
+    })
+    const issued = await issuer.issue('localhost')
+
+    upstream = createHttpsServer(
+      { cert: issued.cert, key: issued.key },
+      (req, res) => {
+        res.writeHead(200, { 'content-type': 'text/plain' })
+        res.end(`tls-ok ${req.method} ${req.url}\n`)
+      },
+    )
+    const upstreamPort = await listenLoopback(upstream)
+    const seen = []
+    proxy = await startHttpProxy({
+      filter: async (host, port) => host === 'localhost' && port === upstreamPort,
+      tlsIntercept: true,
+      tlsCertificateIssuer: issuer,
+      upstreamTls: { ca },
+      requestFilter: async (request) => {
+        seen.push(`${request.method} ${request.host}${request.path}`)
+        return request.path === '/allowed'
+      },
+    })
+
+    const allowed = await httpsThroughConnect({
+      proxyPort: proxy.port,
+      targetPort: upstreamPort,
+      path: '/allowed',
+      ca,
+    })
+    assert.match(allowed, /200 OK/)
+    assert.match(allowed, /tls-ok GET \/allowed/)
+
+    const blocked = await httpsThroughConnect({
+      proxyPort: proxy.port,
+      targetPort: upstreamPort,
+      path: '/blocked',
+      ca,
+    })
+    assert.match(blocked, /403 Forbidden/)
+    assert.deepEqual(seen, [
+      'GET localhost/allowed',
+      'GET localhost/blocked',
+    ])
+  } finally {
+    if (proxy) await proxy.close()
+    if (upstream) await closeServer(upstream)
+    await daemon.stop()
+    rmSync(tempRoot, { recursive: true, force: true })
   }
 })
 
@@ -1937,6 +2171,60 @@ test('iron-proxy backend exposes the same reusable SOCKS and SSH proxy environme
     )
   } finally {
     rmSync(profilePath, { force: true })
+  }
+})
+
+test('iron-proxy backend reuses guardd local TLS CA and warms host certificate cache', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-iron-guardd-ca-'))
+  const eventLog = resolve(tempRoot, 'events.jsonl')
+  const stateDir = resolve(tempRoot, 'state')
+  const profilePath = writeGuardProfile(
+    'network-iron-guardd-ca',
+    ironProxyNetworkProfileConfig({
+      httpRules: [{ host: 'localhost', methods: ['GET'], paths: ['/warm'] }],
+    }),
+  )
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end(`guardd-ca-ok ${req.url}\n`)
+  })
+  const port = await listenLoopback(server)
+  let daemon = null
+
+  try {
+    daemon = await startGuarddForTest({
+      policyRoot: appRoot,
+      eventLog,
+      extraEnv: { GUARD_STATE_DIR: stateDir },
+    })
+    const result = await runGuardCommandAsync([
+      '--profile',
+      'network-iron-guardd-ca',
+      '/usr/bin/curl',
+      '--noproxy',
+      '',
+      '-fsS',
+      `http://localhost:${port}/warm`,
+    ], {
+      GUARD_EVENT_LOG: eventLog,
+      GUARD_DAEMON_URL: daemon.base,
+      GUARDD_API_TOKEN: daemon.token,
+    })
+    expectOk(result)
+
+    const events = readFileSync(eventLog, 'utf8')
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+    const warmed = events.find((event) => event.type === 'tls.cert_cache_warmed')
+    assert.equal(warmed.backend, 'iron-proxy')
+    assert.equal(warmed.globalTrustManaged, false)
+    assert.equal(warmed.warmed.some((entry) => entry.host === 'localhost'), true)
+  } finally {
+    rmSync(profilePath, { force: true })
+    rmSync(tempRoot, { recursive: true, force: true })
+    await closeServer(server)
+    await daemon?.stop()
   }
 })
 
@@ -2640,9 +2928,13 @@ test('guardd health and mutation events expose versioned API contracts', async (
     const healthJson = await health.json()
     assert.equal(healthJson.ok, true)
     assert.equal(healthJson.service, 'guardd')
+    assert.equal(healthJson.apiVersion, 1)
     assert.equal(healthJson.authRequired, true)
     assert.equal(healthJson.policyRoot, tempRoot)
     assert.equal(healthJson.eventLogPath, eventLog)
+    assert.equal(healthJson.stateDir, join(process.env.HOME, 'Library', 'Application Support', 'guard'))
+    assert.equal(healthJson.paths.eventLogPath, eventLog)
+    assert.equal(healthJson.auth.mutationTokenRequired, true)
 
     const mutation = await fetch(`${daemon.base}/profiles/guard/rules`, {
       method: 'POST',
@@ -2665,6 +2957,577 @@ test('guardd health and mutation events expose versioned API contracts', async (
     assert.equal(eventJson.events[0].backend, 'guardd')
     assert.equal(eventJson.events[0].operation, 'add')
     assert.equal(eventJson.events[0].field, 'network.allowedDomains')
+  } finally {
+    await daemon?.stop()
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('guardd defaults to global app-support profile storage without a project root', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guardd-global-policy-'))
+  const stateDir = resolve(tempRoot, 'state')
+  const eventLog = resolve(tempRoot, 'events.jsonl')
+  let daemon = null
+
+  try {
+    daemon = await startGuarddForTest({
+      eventLog,
+      extraEnv: {
+        GUARD_STATE_DIR: stateDir,
+        GUARD_PROJECT_DIR: '',
+        GUARDD_POLICY_ROOT: '',
+      },
+    })
+    const headers = {
+      authorization: `Bearer ${daemon.token}`,
+      'content-type': 'application/json',
+    }
+
+    const health = await fetch(`${daemon.base}/health`, { headers })
+    assert.equal(health.status, 200)
+    const healthJson = await health.json()
+    assert.equal(healthJson.policyRoot, stateDir)
+    assert.equal(healthJson.paths.projectProfilesDir, resolve(stateDir, '.guard'))
+
+    const mutation = await fetch(`${daemon.base}/profiles/guard/rules`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        action: 'add',
+        field: 'network.allowedDomains',
+        value: 'global-config.example',
+      }),
+    })
+    assert.equal(mutation.status, 200)
+    const mutationJson = await mutation.json()
+    assert.equal(mutationJson.changed, true)
+    assert.equal(mutationJson.path, resolve(stateDir, '.guard/guard.json'))
+
+    const globalProfile = JSON.parse(readFileSync(resolve(stateDir, '.guard/guard.json'), 'utf8'))
+    assert.deepEqual(globalProfile.network.allowedDomains, ['global-config.example'])
+    assert.equal(globalProfile.metadata.source, 'guardd-global-config')
+  } finally {
+    await daemon?.stop()
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('guardd state, TLS CA scaffold, and bounded event log truncation stay local', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guardd-state-hardening-'))
+  const guardDir = resolve(tempRoot, '.guard')
+  const eventLog = resolve(tempRoot, 'events.jsonl')
+  const stateDir = resolve(tempRoot, 'state')
+  let daemon = null
+
+  try {
+    mkdirSync(guardDir, { recursive: true })
+    writeFileSync(
+      resolve(guardDir, 'guard.json'),
+      JSON.stringify({ network: { allowedDomains: [] }, filesystem: {} }, null, 2) + '\n',
+    )
+    writeFileSync(
+      eventLog,
+      [
+        JSON.stringify({ schemaVersion: 1, type: 'seed', n: 1 }),
+        '{not-json',
+        JSON.stringify({ schemaVersion: 99, type: 'seed', n: 99 }),
+        JSON.stringify({ schemaVersion: 1, type: 'seed', n: 2 }),
+        JSON.stringify({ schemaVersion: 1, type: 'seed', n: 3 }),
+      ].join('\n') + '\n',
+    )
+
+    daemon = await startGuarddForTest({
+      policyRoot: tempRoot,
+      eventLog,
+      extraEnv: { GUARD_STATE_DIR: stateDir },
+    })
+    const headers = {
+      authorization: `Bearer ${daemon.token}`,
+      'content-type': 'application/json',
+    }
+
+    const state = await fetch(`${daemon.base}/state`, { headers })
+    assert.equal(state.status, 200)
+    const stateJson = await state.json()
+    assert.equal(stateJson.service, 'guardd')
+    assert.equal(stateJson.paths.policyRoot, tempRoot)
+    assert.equal(stateJson.paths.eventLogPath, eventLog)
+    assert.equal(stateJson.paths.stateDir, stateDir)
+    assert.equal(stateJson.tail.eventLogSize > 0, true)
+    assert.equal(stateJson.tail.metadataPath, resolve(stateDir, 'daemon-state.json'))
+    assert.equal(stateJson.tail.recovery.attempted, true)
+    assert.equal(stateJson.tail.retention.maxEvents > 0, true)
+    assert.equal(stateJson.tail.invalidLineCount, 1)
+    assert.equal(stateJson.tail.tamperLineCount, 1)
+    assert.equal(stateJson.tail.index.schemaVersion, 2)
+    assert.equal(stateJson.tail.index.rebuild.completed, true)
+    assert.equal(stateJson.tail.index.rebuild.invalidLineCount, 1)
+    assert.equal(stateJson.tail.index.rebuild.tamperLineCount, 1)
+    assert.equal(stateJson.auth.token.configured, true)
+    assert.match(stateJson.auth.token.fingerprint, /^sha256:[0-9a-f]{16}$/)
+    assert.equal(stateJson.auth.token.secretExposed, false)
+
+    const tokenStatus = await fetch(`${daemon.base}/auth/token`, { headers })
+    assert.equal(tokenStatus.status, 200)
+    const tokenStatusJson = await tokenStatus.json()
+    assert.equal(tokenStatusJson.storage, 'runtime-memory')
+    assert.equal(tokenStatusJson.length, daemon.token.length)
+    assert.match(tokenStatusJson.fingerprint, /^sha256:[0-9a-f]{16}$/)
+    assert.equal(Object.hasOwn(tokenStatusJson, 'token'), false)
+    assert.equal(tokenStatusJson.keychainDescriptor.invokedByGuardd, false)
+
+    const rotatedRuntimeToken = 'rotated-test-token-for-guardd-runtime-123'
+    const rotateToken = await fetch(`${daemon.base}/auth/token/rotate`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ newToken: rotatedRuntimeToken }),
+    })
+    assert.equal(rotateToken.status, 200)
+    const rotateTokenJson = await rotateToken.json()
+    assert.equal(rotateTokenJson.action, 'rotate-runtime-token')
+    assert.equal(rotateTokenJson.changed, true)
+    assert.equal(rotateTokenJson.token, rotatedRuntimeToken)
+    assert.notEqual(rotateTokenJson.auth.fingerprint, tokenStatusJson.fingerprint)
+    assert.equal(rotateTokenJson.auth.rotation.persistsAcrossRestart, false)
+
+    const oldTokenRejected = await fetch(`${daemon.base}/auth/token`, {
+      headers: { authorization: `Bearer ${daemon.token}` },
+    })
+    assert.equal(oldTokenRejected.status, 401)
+    headers.authorization = `Bearer ${rotatedRuntimeToken}`
+
+    const tlsCa = await fetch(`${daemon.base}/tls/ca`, { headers })
+    assert.equal(tlsCa.status, 200)
+    const tlsCaJson = await tlsCa.json()
+    assert.equal(tlsCaJson.scaffold, false)
+    assert.equal(tlsCaJson.installedGlobally, false)
+    assert.equal(tlsCaJson.globalTrustManaged, false)
+    assert.equal(tlsCaJson.trustStoreAction, 'not-managed-by-guardd')
+    assert.match(tlsCaJson.paths.certificatePath, /guard-local-ca\.pem$/)
+    assert.equal(tlsCaJson.generated.certificate, false)
+    assert.equal(tlsCaJson.privateKeyProtection.storage, 'filesystem')
+    assert.equal(tlsCaJson.privateKeyProtection.secretExposed, false)
+    assert.equal(tlsCaJson.privateKeyProtection.keychainDescriptor.invokedByGuardd, false)
+
+    const generateCa = await fetch(`${daemon.base}/tls/ca`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ action: 'generate', days: 1, commonName: 'Guard Test CA' }),
+    })
+    assert.equal(generateCa.status, 200)
+    const generateCaJson = await generateCa.json()
+    assert.equal(generateCaJson.action, 'generate-ca')
+    assert.equal(generateCaJson.lifecycle, 'active')
+    assert.equal(generateCaJson.generated.certificate, true)
+    assert.equal(generateCaJson.globalTrustManaged, false)
+    assert.equal(generateCaJson.privateKeyProtection.modeOk, true)
+    assert.equal(generateCaJson.privateKeyProtection.actualMode, '0600')
+    assert.ok(existsSync(generateCaJson.paths.certificatePath))
+    assert.ok(existsSync(generateCaJson.paths.privateKeyPath))
+
+    const issueCert = await fetch(`${daemon.base}/tls/cert`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ host: 'api.example.com', days: 1 }),
+    })
+    assert.equal(issueCert.status, 200)
+    const issueCertJson = await issueCert.json()
+    assert.equal(issueCertJson.action, 'issue-cert')
+    assert.equal(issueCertJson.lifecycle, 'active')
+    assert.equal(issueCertJson.host, 'api.example.com')
+    assert.equal(issueCertJson.generated.certificate, true)
+    assert.equal(issueCertJson.generated.privateKey, true)
+    assert.equal(issueCertJson.globalTrustManaged, false)
+    assert.ok(existsSync(issueCertJson.paths.certificatePath))
+    assert.ok(existsSync(issueCertJson.paths.privateKeyPath))
+
+    const tlsStatus = await fetch(`${daemon.base}/tls/status`, { headers })
+    assert.equal(tlsStatus.status, 200)
+    const tlsStatusJson = await tlsStatus.json()
+    assert.equal(tlsStatusJson.globalTrustManaged, false)
+    assert.equal(tlsStatusJson.trustStoreAction, 'not-managed-by-guardd')
+    assert.equal(tlsStatusJson.issued.count, 1)
+    assert.equal(tlsStatusJson.issued.certificates[0].host, 'api.example.com')
+    assert.ok(tlsStatusJson.onboarding.environmentVariables.includes('NODE_EXTRA_CA_CERTS'))
+
+    const securityStatus = await fetch(`${daemon.base}/security/status`, { headers })
+    assert.equal(securityStatus.status, 200)
+    const securityStatusJson = await securityStatus.json()
+    assert.equal(securityStatusJson.checks.some((check) => check.id === 'api-token-required' && check.ok === true), true)
+    assert.equal(securityStatusJson.token.fingerprint, rotateTokenJson.auth.fingerprint)
+    assert.equal(securityStatusJson.token.keychainDescriptor.invokedByGuardd, false)
+    assert.equal(securityStatusJson.caKeyProtection.keychainDescriptor.invokedByGuardd, false)
+    assert.equal(securityStatusJson.findings.some((finding) => finding.id === 'tls-ca-key-private'), false)
+
+    const rotateCa = await fetch(`${daemon.base}/tls/ca`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ action: 'rotate', days: 1 }),
+    })
+    assert.equal(rotateCa.status, 200)
+    const rotateCaJson = await rotateCa.json()
+    assert.equal(rotateCaJson.action, 'rotate-ca')
+    assert.equal(rotateCaJson.lifecycle, 'active')
+
+    const revokeCa = await fetch(`${daemon.base}/tls/ca`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ action: 'revoke' }),
+    })
+    assert.equal(revokeCa.status, 200)
+    const revokeCaJson = await revokeCa.json()
+    assert.equal(revokeCaJson.action, 'revoke-ca')
+    assert.equal(revokeCaJson.lifecycle, 'revoked')
+
+    const tlsMutation = await fetch(`${daemon.base}/profiles/guard/tls`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ enabled: true }),
+    })
+    assert.equal(tlsMutation.status, 200)
+
+    const tlsEvents = await fetch(`${daemon.base}/events?type=tls.changed&limit=1`, { headers })
+    assert.equal(tlsEvents.status, 200)
+    const tlsEventJson = await tlsEvents.json()
+    assert.equal(tlsEventJson.events.length, 1)
+    assert.equal(tlsEventJson.events[0].type, 'tls.changed')
+    assert.equal(tlsEventJson.events[0].profile, 'guard')
+    assert.equal(tlsEventJson.events[0].globalTrustManaged, false)
+    assert.equal(tlsEventJson.events[0].after.enabled, true)
+
+    const queriedTlsEvents = await fetch(`${daemon.base}/events/query?type=tls.changed&profile=guard&limit=5`, { headers })
+    assert.equal(queriedTlsEvents.status, 200)
+    const queriedTlsEventsJson = await queriedTlsEvents.json()
+    assert.equal(queriedTlsEventsJson.events.length, 1)
+    assert.equal(queriedTlsEventsJson.events[0].type, 'tls.changed')
+    assert.equal(queriedTlsEventsJson.invalidLineCount, 1)
+    assert.equal(queriedTlsEventsJson.tamperLineCount, 1)
+    assert.equal(queriedTlsEventsJson.summary.byType.some((entry) => entry.key === 'tls.changed' && entry.count === 1), true)
+
+    const alertOnce = await fetch(`${daemon.base}/alerts/decision`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        profile: 'guard',
+        host: 'api.example.com',
+        port: 443,
+        action: 'allow',
+        duration: 'once',
+      }),
+    })
+    assert.equal(alertOnce.status, 200)
+    const alertOnceJson = await alertOnce.json()
+    assert.equal(alertOnceJson.decision.type, 'guard.alert.decision')
+    assert.equal(alertOnceJson.decision.duration, 'once')
+    assert.equal(alertOnceJson.decision.rulePersisted, false)
+
+    const pendingAlert = await fetch(`${daemon.base}/alerts/pending`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        profile: 'guard',
+        host: 'pending.example.com',
+        port: 443,
+        method: 'POST',
+        path: '/v1/responses',
+        timeoutMs: 5000,
+      }),
+    })
+    assert.equal(pendingAlert.status, 201)
+    const pendingAlertJson = await pendingAlert.json()
+    assert.equal(pendingAlertJson.alert.status, 'pending')
+    assert.equal(pendingAlertJson.alert.host, 'pending.example.com')
+    assert.equal(pendingAlertJson.alert.method, 'POST')
+    assert.equal(pendingAlertJson.alert.path, '/v1/responses')
+    assert.match(pendingAlertJson.alert.id, /^[0-9a-f-]{36}$/)
+    assert.match(pendingAlertJson.alert.expiresAt, /^\d{4}-\d{2}-\d{2}T/)
+
+    const pendingList = await fetch(`${daemon.base}/alerts/pending?limit=5`, { headers })
+    assert.equal(pendingList.status, 200)
+    const pendingListJson = await pendingList.json()
+    assert.equal(pendingListJson.pendingCount, 1)
+    assert.equal(pendingListJson.persisted, true)
+    assert.match(pendingListJson.statePath, /pending-alerts\.json$/)
+    assert.equal(pendingListJson.alerts.some((alert) => alert.id === pendingAlertJson.alert.id), true)
+
+    await daemon.stop()
+    daemon = await startGuarddForTest({
+      policyRoot: tempRoot,
+      eventLog,
+      extraEnv: { GUARD_STATE_DIR: stateDir },
+    })
+    headers.authorization = `Bearer ${daemon.token}`
+    const restoredPendingList = await fetch(`${daemon.base}/alerts/pending?limit=5`, { headers })
+    assert.equal(restoredPendingList.status, 200)
+    const restoredPendingListJson = await restoredPendingList.json()
+    assert.equal(restoredPendingListJson.pendingCount, 1)
+    assert.equal(restoredPendingListJson.alerts.some((alert) => alert.id === pendingAlertJson.alert.id), true)
+
+    const resolvedPending = await fetch(`${daemon.base}/alerts/${pendingAlertJson.alert.id}/resolve`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        action: 'allow',
+        duration: 'session',
+      }),
+    })
+    assert.equal(resolvedPending.status, 200)
+    const resolvedPendingJson = await resolvedPending.json()
+    assert.equal(resolvedPendingJson.decision.alertId, pendingAlertJson.alert.id)
+    assert.equal(resolvedPendingJson.decision.duration, 'session')
+    assert.equal(resolvedPendingJson.alert.status, 'resolved')
+    assert.equal(resolvedPendingJson.alert.decision.action, 'allow')
+
+    const resolvedList = await fetch(`${daemon.base}/alerts/pending?status=resolved&limit=5`, { headers })
+    assert.equal(resolvedList.status, 200)
+    const resolvedListJson = await resolvedList.json()
+    assert.equal(resolvedListJson.alerts.some((alert) => alert.id === pendingAlertJson.alert.id), true)
+
+    const expiringAlert = await fetch(`${daemon.base}/alerts/pending`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        profile: 'guard',
+        host: 'expiring.example.com',
+        timeoutMs: 1,
+      }),
+    })
+    assert.equal(expiringAlert.status, 201)
+    await new Promise((resolveDone) => setTimeout(resolveDone, 20))
+    const expiredList = await fetch(`${daemon.base}/alerts/pending?status=expired&limit=5`, { headers })
+    assert.equal(expiredList.status, 200)
+    const expiredListJson = await expiredList.json()
+    assert.equal(expiredListJson.alerts.some((alert) => alert.host === 'expiring.example.com'), true)
+
+    const alertForever = await fetch(`${daemon.base}/alerts/decision`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        profile: 'guard',
+        host: 'forever.example.com',
+        action: 'deny',
+        duration: 'forever',
+      }),
+    })
+    assert.equal(alertForever.status, 200)
+    const alertForeverJson = await alertForever.json()
+    assert.equal(alertForeverJson.decision.rulePersisted, true)
+    assert.equal(alertForeverJson.mutation.field, 'network.deniedDomains')
+
+    const alerts = await fetch(`${daemon.base}/alerts?limit=5`, { headers })
+    assert.equal(alerts.status, 200)
+    const alertsJson = await alerts.json()
+    assert.equal(alertsJson.events.some((event) => event.host === 'forever.example.com'), true)
+
+    const index = await fetch(`${daemon.base}/events/index`, { headers })
+    assert.equal(index.status, 200)
+    const indexJson = await index.json()
+    assert.equal(indexJson.schemaVersion, 2)
+    assert.equal(indexJson.eventSchemaVersion, 1)
+    assert.equal(indexJson.rebuild.completed, true)
+    assert.equal(indexJson.rebuild.validLineCount >= 3, true)
+    assert.equal(indexJson.rebuild.invalidLineCount, 1)
+    assert.equal(indexJson.rebuild.tamperLineCount, 1)
+    assert.equal(indexJson.integrity.invalidLineCount, 1)
+    assert.equal(indexJson.integrity.tamperLineCount, 1)
+    assert.equal(indexJson.summaries.byType.some((entry) => entry.key === 'seed' && entry.count === 3), true)
+    assert.equal(indexJson.byType['guard.alert.decision'] >= 3, true)
+    assert.equal(indexJson.byType['guard.alert.pending'] >= 2, true)
+    assert.equal(indexJson.byType['guard.alert.resolved'] >= 1, true)
+    assert.equal(indexJson.byType['guard.alert.expired'] >= 1, true)
+    assert.equal(indexJson.alertDecisions >= 3, true)
+
+    const integrity = await fetch(`${daemon.base}/events/integrity`, { headers })
+    assert.equal(integrity.status, 200)
+    const integrityJson = await integrity.json()
+    assert.equal(integrityJson.ok, false)
+    assert.equal(integrityJson.schemaVersion, 2)
+    assert.equal(integrityJson.eventSchemaVersion, 1)
+    assert.equal(integrityJson.invalidLineCount, 1)
+    assert.equal(integrityJson.tamperLineCount, 1)
+    assert.equal(integrityJson.issues.some((issue) => issue.reason === 'json_parse_failed'), true)
+    assert.equal(integrityJson.issues.some((issue) => issue.reason === 'unsupported_schema_version'), true)
+    assert.match(integrityJson.digest, /^sha256:/)
+
+    const denyForEvaluation = await fetch(`${daemon.base}/profiles/guard/rules`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        action: 'add',
+        field: 'network.deniedDomains',
+        value: 'api.example.com',
+      }),
+    })
+    assert.equal(denyForEvaluation.status, 200)
+
+    const evaluationAllowed = await fetch(`${daemon.base}/policy/evaluate`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ profile: 'guard', host: 'api.example.com' }),
+    })
+    assert.equal(evaluationAllowed.status, 200)
+    const evaluationAllowedJson = await evaluationAllowed.json()
+    assert.equal(evaluationAllowedJson.contractVersion, 1)
+    assert.equal(evaluationAllowedJson.decision.allowed, false)
+    assert.equal(evaluationAllowedJson.decision.reason, 'deniedDomains')
+    assert.equal(evaluationAllowedJson.decision.contractVersion, 1)
+    assert.equal(evaluationAllowedJson.decision.evaluator, 'guard-policy')
+
+    const sync = await fetch(`${daemon.base}/extension/sync`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ profile: 'guard', mode: 'strict-deny' }),
+    })
+    assert.equal(sync.status, 200)
+    const syncJson = await sync.json()
+    assert.equal(syncJson.syncVersion, 1)
+    assert.equal(syncJson.configured, true)
+    assert.equal(syncJson.manifest.profile, 'guard')
+    assert.equal(syncJson.manifest.fallback.stalePolicy, 'strict-deny')
+    assert.match(syncJson.manifest.policyDigest, /^sha256:[0-9a-f]{64}$/)
+    assert.equal(syncJson.validPolicyDigest, true)
+    assert.equal(syncJson.invalidated, false)
+    assert.ok(existsSync(syncJson.paths.manifestPath))
+    assert.ok(existsSync(syncJson.paths.policyPath))
+    const syncedPolicy = JSON.parse(readFileSync(syncJson.paths.policyPath, 'utf8'))
+    assert.equal(syncedPolicy.profile, 'guard')
+    assert.equal(syncedPolicy.contractVersion, 1)
+    assert.equal(syncedPolicy.syncVersion, 1)
+    assert.equal(syncedPolicy.decisionContract.evaluator, 'guard-policy')
+    assert.equal(syncedPolicy.network.deniedDomains.includes('api.example.com'), true)
+
+    const syncState = await fetch(`${daemon.base}/extension/sync`, { headers })
+    assert.equal(syncState.status, 200)
+    const syncStateJson = await syncState.json()
+    assert.equal(syncStateJson.manifest.sequence, syncJson.sequence)
+    assert.equal(syncStateJson.validPolicyDigest, true)
+
+    const invalidateSync = await fetch(`${daemon.base}/extension/sync`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ action: 'invalidate', reason: 'test-invalidation' }),
+    })
+    assert.equal(invalidateSync.status, 200)
+    const invalidateSyncJson = await invalidateSync.json()
+    assert.equal(invalidateSyncJson.action, 'extension-sync-invalidate')
+    assert.equal(invalidateSyncJson.invalidated, true)
+    assert.equal(invalidateSyncJson.manifest.invalidateReason, 'test-invalidation')
+    assert.equal(invalidateSyncJson.manifest.sequence, syncJson.sequence + 1)
+
+    const unbounded = await fetch(`${daemon.base}/events/truncate`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ keepBytes: 1024 * 1024 + 1 }),
+    })
+    assert.equal(unbounded.status, 400)
+    const unboundedJson = await unbounded.json()
+    assert.equal(unboundedJson.error, 'truncate_failed')
+
+    const truncate = await fetch(`${daemon.base}/events/truncate`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ keepBytes: 0 }),
+    })
+    assert.equal(truncate.status, 200)
+    const truncateJson = await truncate.json()
+    assert.equal(truncateJson.type, 'daemon.log.truncated')
+    assert.equal(truncateJson.keepBytes, 0)
+    assert.equal(truncateJson.maxKeepBytes, 1024 * 1024)
+
+    const afterEvents = await fetch(`${daemon.base}/events?type=daemon.log.truncated&limit=1`, { headers })
+    assert.equal(afterEvents.status, 200)
+    const afterEventJson = await afterEvents.json()
+    assert.equal(afterEventJson.events.length, 1)
+    assert.equal(afterEventJson.events[0].path, eventLog)
+
+    const afterState = await fetch(`${daemon.base}/state`, { headers })
+    assert.equal(afterState.status, 200)
+    const afterStateJson = await afterState.json()
+    assert.equal(afterStateJson.tail.retention.truncated, true)
+    assert.equal(afterStateJson.tail.retention.lastTruncation.eventLogPath, eventLog)
+    assert.equal(afterStateJson.tail.retention.lastTruncation.keepBytes, 0)
+    assert.ok(existsSync(afterStateJson.tail.metadataPath))
+    const persistedState = JSON.parse(readFileSync(afterStateJson.tail.metadataPath, 'utf8'))
+    assert.equal(persistedState.service, 'guardd')
+    assert.equal(persistedState.schemaVersion, 2)
+    assert.equal(persistedState.eventSchemaVersion, 1)
+    assert.equal(persistedState.migrations[0].to, 2)
+    assert.equal(persistedState.cursor.eventLogPath, eventLog)
+    assert.equal(persistedState.retention.truncated, true)
+  } finally {
+    await daemon?.stop()
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('guardd recovers event cursor and recent events across restart', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guardd-cursor-recovery-'))
+  const guardDir = resolve(tempRoot, '.guard')
+  const eventLog = resolve(tempRoot, 'events.jsonl')
+  const stateDir = resolve(tempRoot, 'state')
+  let daemon = null
+
+  try {
+    mkdirSync(guardDir, { recursive: true })
+    writeFileSync(
+      resolve(guardDir, 'guard.json'),
+      JSON.stringify({ network: { allowedDomains: [] }, filesystem: {} }, null, 2) + '\n',
+    )
+    writeFileSync(
+      eventLog,
+      [
+        JSON.stringify({ schemaVersion: 1, type: 'seed', n: 1 }),
+        JSON.stringify({ schemaVersion: 1, type: 'seed', n: 2 }),
+      ].join('\n') + '\n',
+    )
+
+    daemon = await startGuarddForTest({
+      policyRoot: tempRoot,
+      eventLog,
+      extraArgs: ['--max-events', '2'],
+      extraEnv: { GUARD_STATE_DIR: stateDir },
+    })
+    const headers = { authorization: `Bearer ${daemon.token}` }
+
+    const firstState = await fetch(`${daemon.base}/state`, { headers })
+    assert.equal(firstState.status, 200)
+    const firstStateJson = await firstState.json()
+    assert.equal(firstStateJson.tail.recovery.mode, 'tail-scan')
+    assert.equal(firstStateJson.tail.retainedEventCount, 2)
+    assert.equal(firstStateJson.tail.offset, readFileSync(eventLog).byteLength)
+
+    await daemon.stop()
+    daemon = null
+
+    writeFileSync(
+      eventLog,
+      `${readFileSync(eventLog, 'utf8')}${JSON.stringify({ schemaVersion: 1, type: 'missed', n: 3 })}\n`,
+    )
+
+    daemon = await startGuarddForTest({
+      policyRoot: tempRoot,
+      eventLog,
+      extraArgs: ['--max-events', '2'],
+      extraEnv: { GUARD_STATE_DIR: stateDir },
+    })
+
+    const secondState = await fetch(`${daemon.base}/state`, { headers })
+    assert.equal(secondState.status, 200)
+    const secondStateJson = await secondState.json()
+    assert.equal(secondStateJson.tail.recovery.mode, 'cursor')
+    assert.equal(secondStateJson.tail.recovery.recovered, true)
+    assert.equal(secondStateJson.tail.recovery.unreadBytes > 0, true)
+    assert.equal(secondStateJson.tail.offset, readFileSync(eventLog).byteLength)
+
+    const missedEvents = await fetch(`${daemon.base}/events?type=missed&limit=1`, { headers })
+    assert.equal(missedEvents.status, 200)
+    const missedEventsJson = await missedEvents.json()
+    assert.equal(missedEventsJson.events.length, 1)
+    assert.equal(missedEventsJson.events[0].n, 3)
+
+    const persistedState = JSON.parse(readFileSync(resolve(stateDir, 'daemon-state.json'), 'utf8'))
+    assert.equal(persistedState.cursor.offset, readFileSync(eventLog).byteLength)
+    assert.equal(persistedState.recovery.mode, 'cursor')
   } finally {
     await daemon?.stop()
     rmSync(tempRoot, { recursive: true, force: true })

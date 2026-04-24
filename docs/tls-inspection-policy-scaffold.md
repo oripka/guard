@@ -18,6 +18,10 @@ The current policy surface is:
 - `network.ask: true` enables per-run prompts for unmatched proxied requests.
 - `network.allowedDomains` allows host/domain-level proxied requests.
 - `network.httpRules` allows method/path-scoped HTTP rules.
+- `network.secretInjection` maps proxy tokens to real secrets through
+  `iron-proxy`'s built-in `secrets` transform. Real secret values come from the
+  proxy process environment or supported secret backends; the sandboxed
+  workload only sees the proxy token.
 - `guard --deep-egress --ask-network` can force the same backend for a run.
 
 The CA is deliberately run-scoped. Guard injects the generated certificate via
@@ -63,6 +67,21 @@ Example profile setting:
 ```json
 "network": {
   "backend": "iron-proxy",
+  "httpRules": [
+    { "host": "api.openai.com", "methods": ["POST"], "paths": ["/v1/responses"] }
+  ],
+  "secretInjection": [
+    {
+      "name": "OPENAI_API_KEY",
+      "source": { "type": "env", "var": "OPENAI_API_KEY" },
+      "proxyValue": "guard-proxy-openai-token",
+      "matchHeaders": ["Authorization"],
+      "require": true,
+      "rules": [
+        { "host": "api.openai.com", "methods": ["POST"], "paths": ["/v1/responses"] }
+      ]
+    }
+  ],
   "tlsInspection": {
     "enabled": true,
     "mode": "ephemeral-run-ca",
@@ -75,6 +94,9 @@ Example profile setting:
 ## Test Coverage
 
 Current tests cover `guard settings --json`, `guard tls status --json`, and
-profile-local TLS setting mutation. Future Network Extension tests should cover
-installed/enabled/degraded system-extension states once Apple signing and
+profile-local TLS setting mutation. They also cover boundary-side secret
+injection through `iron-proxy`: a proxy token is swapped on a matching route,
+requests missing the token are rejected when `require` is true, and nonmatching
+paths keep the proxy token unchanged. Future Network Extension tests should
+cover installed/enabled/degraded system-extension states once Apple signing and
 System Settings approval are available.
