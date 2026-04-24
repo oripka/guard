@@ -324,6 +324,53 @@ test('generates the expected effective sandbox config', () => {
   assert.match(cfg.network.allowUnixSockets[0], /\/guard\/run-/)
 })
 
+test('profile imports merge named template fragments', () => {
+  const profilePath = writeGuardProfile('import-merge', {
+    imports: ['node-app-defaults', 'cloudflare-wrangler'],
+    network: {
+      allowedDomains: ['akcvwaclnbxroirpbesp.supabase.co'],
+      allowLoopbackPorts: [54321],
+    },
+  })
+
+  try {
+    const result = runGuardCommand([
+      '--profile',
+      'import-merge',
+      'node',
+      'scripts/probe.mjs',
+      'runtime-config-json',
+    ])
+    expectOk(result)
+    const cfg = JSON.parse(result.stdout)
+    assert.deepEqual(cfg.filesystem.denyRead, [
+      '/Users',
+      '/Volumes',
+      '/Applications',
+      '/cores',
+      '/home',
+    ])
+    assert.deepEqual(cfg.network.allowLoopbackPorts, [
+      3000,
+      3001,
+      4983,
+      8787,
+      8788,
+      8976,
+      54321,
+    ])
+    assert.deepEqual(cfg.network.allowedDomains, [
+      'api.cloudflare.com',
+      '*.cloudflare.com',
+      '*.workers.dev',
+      '*.pages.dev',
+      'akcvwaclnbxroirpbesp.supabase.co',
+    ])
+  } finally {
+    rmSync(profilePath, { force: true })
+  }
+})
+
 test('allowLocalBinding emits loopback bind rules without direct outbound access', () => {
   const profile = generateProfile(
     {
@@ -1858,6 +1905,20 @@ test('init creates a project config from the bundled template', () => {
     '/cores',
     '/home',
   ])
+})
+
+test('init can create the Cloudflare Wrangler template', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-init-cloudflare-'))
+  const result = spawnSync(guard, ['init', 'cloudflare-wrangler'], {
+    cwd: tempRoot,
+    encoding: 'utf8',
+  })
+
+  expectOk(result)
+  const created = resolve(tempRoot, '.guard/guard.json')
+  assert.equal(existsSync(created), true)
+  const cfg = JSON.parse(readFileSync(created, 'utf8'))
+  assert.deepEqual(cfg.imports, ['node-app-defaults', 'cloudflare-wrangler'])
 })
 
 test('shim resolves the real tool from sanitized PATH instead of fixed package-manager paths', () => {

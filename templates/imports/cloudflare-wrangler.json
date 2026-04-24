@@ -1,0 +1,16 @@
+{
+  "network": {
+    "allowedDomains": [
+      "api.cloudflare.com",
+      "*.cloudflare.com",
+      "*.workers.dev",
+      "*.pages.dev"
+    ],
+    "allowLocalBinding": true,
+    "allowLoopbackPorts": [
+      8787,
+      8788,
+      8976
+    ]
+  }
+}

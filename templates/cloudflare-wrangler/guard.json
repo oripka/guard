@@ -1,0 +1,11 @@
+{
+  "metadata": {
+    "description": "Project profile for Cloudflare Wrangler/Nitro deploys.",
+    "risk": "medium",
+    "status": "template"
+  },
+  "imports": [
+    "node-app-defaults",
+    "cloudflare-wrangler"
+  ]
+}
