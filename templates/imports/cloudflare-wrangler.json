@@ -12,5 +12,19 @@
       8788,
       8976
     ]
-  }
+  },
+  "filesystem": {
+    "allowRead": [
+      "${GUARD_REAL_HOME}/Library/Preferences/.wrangler/config"
+    ],
+    "allowWrite": [
+      "${GUARD_REAL_HOME}/Library/Preferences/.wrangler/config"
+    ]
+  },
+  "homeLinks": [
+    {
+      "source": "${GUARD_REAL_HOME}/Library/Preferences/.wrangler/config",
+      "target": "Library/Preferences/.wrangler/config"
+    }
+  ]
 }

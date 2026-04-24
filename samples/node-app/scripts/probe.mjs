@@ -114,6 +114,9 @@ switch (action) {
     writeFileSync(`${process.env.TMPDIR}/tmp-ok.txt`, 'ok\n')
     readFileSync(`${process.env.TMPDIR}/tmp-ok.txt`, 'utf8')
     break
+  case 'read-home-link':
+    process.stdout.write(readFileSync(`${process.env.HOME}/${value}`, 'utf8'))
+    break
   case 'fs-watch': {
     const watcher = watch(value || '.', () => {})
     await new Promise((resolve) => setTimeout(resolve, 200))

@@ -371,6 +371,46 @@ test('profile imports merge named template fragments', () => {
   }
 })
 
+test('homeLinks materialize narrow real paths inside the fake home', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-home-link-'))
+  const sourceDir = resolve(tempRoot, 'real-config')
+  mkdirSync(sourceDir, { recursive: true })
+  writeFileSync(resolve(sourceDir, 'default.toml'), 'token = "test"\n')
+  const profilePath = writeGuardProfile('home-link', {
+    ...networkProfileConfig({ allowedDomains: [] }),
+    filesystem: {
+      ...networkProfileConfig({ allowedDomains: [] }).filesystem,
+      allowRead: [
+        '${GUARD_PROJECT_DIR}',
+        '${GUARD_RUN_DIR}',
+        sourceDir,
+      ],
+    },
+    homeLinks: [
+      {
+        source: sourceDir,
+        target: 'Library/Preferences/.wrangler/config',
+      },
+    ],
+  })
+
+  try {
+    const result = runGuardCommand([
+      '--profile',
+      'home-link',
+      'node',
+      'scripts/probe.mjs',
+      'read-home-link',
+      'Library/Preferences/.wrangler/config/default.toml',
+    ])
+    expectOk(result)
+    assert.equal(result.stdout, 'token = "test"\n')
+  } finally {
+    rmSync(profilePath, { force: true })
+    rmSync(tempRoot, { force: true, recursive: true })
+  }
+})
+
 test('allowLocalBinding emits loopback bind rules without direct outbound access', () => {
   const profile = generateProfile(
     {
@@ -1898,13 +1938,7 @@ test('init creates a project config from the bundled template', () => {
   const created = resolve(tempRoot, '.guard/guard.json')
   assert.equal(existsSync(created), true)
   const cfg = JSON.parse(readFileSync(created, 'utf8'))
-  assert.deepEqual(cfg.filesystem.denyRead, [
-    '/Users',
-    '/Volumes',
-    '/Applications',
-    '/cores',
-    '/home',
-  ])
+  assert.deepEqual(cfg.imports, ['node-app-defaults'])
 })
 
 test('init can create the Cloudflare Wrangler template', () => {

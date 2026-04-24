@@ -110,6 +110,30 @@ guard pnpm run dev
 guard --ask-network pnpm run dev
 ```
 
+For deep HTTP egress rules, use the optional `iron-proxy` backend. Guard starts
+`iron-proxy` for the run, injects proxy and CA environment variables, and keeps
+the sandboxed process limited to the local proxy.
+
+```json
+{
+  "network": {
+    "backend": "iron-proxy",
+    "ask": true,
+    "allowedDomains": ["registry.npmjs.org"],
+    "httpRules": [
+      {
+        "host": "api.openai.com",
+        "methods": ["POST"],
+        "paths": ["/v1/responses", "/v1/oripka/*"]
+      }
+    ]
+  }
+}
+```
+
+When `ask` is enabled, unknown requests trigger an interactive prompt that can
+allow an exact API path or a generated wildcard path for the current run.
+
 Bootstrap a default project profile for a Node, Vite, Nuxt, Slidev, Wrangler,
 or similar UI/dev-server app:
 
@@ -368,6 +392,25 @@ That gives you:
 - explicit project and per-run write carve-outs
 - a reproducible config that can live in the repo
 
+For a Cloudflare Wrangler or Nitro deploy project:
+
+```sh
+cd ~/code/course-planning
+guard init cloudflare-wrangler --force
+guard pnpm run build
+guard npx wrangler --cwd .output deploy
+```
+
+The Cloudflare template imports the Node app defaults, adds Cloudflare API
+domains, Workers/Pages preview domains, Wrangler dev ports `8787` and `8788`,
+Wrangler's OAuth callback port `8976`, and a narrow home link for
+`~/Library/Preferences/.wrangler/config` so an existing Wrangler OAuth login can
+be reused and refreshed. If Wrangler prints a different
+`redirect_uri=http://localhost:<port>/oauth/callback`, add that port to
+`network.allowLoopbackPorts`.
+
+For CI or repeatable non-interactive deploys, prefer `CLOUDFLARE_API_TOKEN`.
+
 ## What To Guard
 
 Guard tools that either execute project-controlled code or install/fetch code:
@@ -483,6 +526,8 @@ Template:
 
 ```text
 templates/node-app/guard.json
+templates/cloudflare-wrangler/guard.json
+templates/imports/*.json
 ```
 
 Copy it to:
@@ -492,6 +537,27 @@ Copy it to:
 ```
 The template uses `${GUARD_PROJECT_DIR}`, so most projects do not need an
 absolute local path.
+
+Project profiles can import shared fragments before applying local overrides:
+
+```json
+{
+  "imports": ["node-app-defaults", "cloudflare-wrangler"],
+  "network": {
+    "allowedDomains": ["akcvwaclnbxroirpbesp.supabase.co", "*.supabase.co"]
+  }
+}
+```
+
+Named imports resolve from `templates/imports/<name>.json`. Relative imports
+such as `"./local-domains.json"` resolve next to the profile file. Imported
+arrays are merged without duplicates; local profile values are appended and
+object/scalar fields override imported defaults.
+
+Profiles can also declare `homeLinks` for tools that insist on reading from
+`HOME`. Each entry links a real source path into Guard's fake home before the
+sandbox starts; the profile must still explicitly allow the real source path in
+`filesystem.allowRead` or `filesystem.allowWrite`.
 
 ## Packaging
 

@@ -15,6 +15,14 @@ Do not create project configs with empty `denyRead` or broad home/volume reads.
 
 ```json
 {
+  "imports": ["node-app-defaults"]
+}
+```
+
+The imported default expands to:
+
+```json
+{
   "allowPty": true,
   "network": {
     "ask": false,
@@ -64,6 +72,21 @@ Do not create project configs with empty `denyRead` or broad home/volume reads.
   }
 }
 ```
+
+Wrangler/Nitro projects that deploy to Cloudflare can start from:
+
+```sh
+guard init cloudflare-wrangler
+```
+
+That template imports `node-app-defaults` and `cloudflare-wrangler`. The
+Cloudflare import adds `api.cloudflare.com`, `*.cloudflare.com`,
+`*.workers.dev`, `*.pages.dev`, local dev ports `8787` and `8788`, and
+Wrangler OAuth callback port `8976`. It also links the real
+`~/Library/Preferences/.wrangler/config` directory into Guard's fake home so
+Wrangler can reuse and refresh an existing OAuth login.
+
+Prefer `CLOUDFLARE_API_TOKEN` for CI or repeatable non-interactive deploys.
 
 ## Why These Defaults
 
@@ -137,6 +160,30 @@ Add the narrowest explicit path. Examples:
   "allowedDomains": ["api.cloudflare.com", "*.supabase.co"]
 }
 ```
+
+For shared config, import named fragments and keep project-specific hosts in the
+profile:
+
+```json
+{
+  "imports": ["node-app-defaults", "cloudflare-wrangler"],
+  "network": {
+    "allowedDomains": [
+      "akcvwaclnbxroirpbesp.supabase.co",
+      "*.supabase.co",
+      "api.iconify.design"
+    ]
+  }
+}
+```
+
+Named imports resolve from `templates/imports/<name>.json`. Relative imports
+resolve next to `.guard/guard.json`. Imported arrays are merged without
+duplicates, while local object and scalar values override imported defaults.
+
+Use `homeLinks` only for narrow tool-owned config paths. The link is created
+inside Guard's fake `HOME` before the sandbox starts, but the real source path
+still needs an explicit filesystem allow rule.
 
 For exploratory runs, prompt on first access to an unknown proxied host:
 
