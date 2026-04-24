@@ -729,6 +729,52 @@ test('accepts -- as a command separator', () => {
   assert.equal(env.guardProjectDir, appRoot)
 })
 
+test('--deep-egress forces the iron-proxy backend for a run', () => {
+  const profilePath = writeGuardProfile(
+    'deep-egress-flag',
+    networkProfileConfig({ allowedDomains: [] }),
+  )
+
+  try {
+    const result = runGuardCommand([
+      '--deep-egress',
+      '--ask-network',
+      '--profile',
+      'deep-egress-flag',
+      'node',
+      'scripts/probe.mjs',
+      'runtime-config-json',
+    ])
+    expectOk(result)
+    const cfg = JSON.parse(result.stdout)
+    assert.equal(cfg.network.backend, 'iron-proxy')
+    assert.equal(cfg.network.ask, true)
+  } finally {
+    rmSync(profilePath, { force: true })
+  }
+})
+
+test('--deep-egress can run with the built-in guard profile outside a project config', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-deep-egress-'))
+  try {
+    const result = spawnSync(
+      guard,
+      ['--deep-egress', '--ask-network', '--profile', 'guard', '/usr/bin/true'],
+      {
+        cwd: tempRoot,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GUARD_QUIET: '1',
+        },
+      },
+    )
+    expectOk(result)
+  } finally {
+    rmSync(tempRoot, { force: true, recursive: true })
+  }
+})
+
 test('allowedDomains permits allowlisted HTTP traffic through the local proxy runtime', async () => {
   const profilePath = resolve(appRoot, '.guard/network-allow.json')
   writeFileSync(
