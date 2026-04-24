@@ -617,6 +617,129 @@ final class CardView: NSView {
     }
 }
 
+final class HoverPolicySwitch: NSControl {
+    var selectedSegment: Int = 1 {
+        didSet { needsDisplay = true }
+    }
+    private var hoveredSegment: Int?
+    private let denyColor = NSColor.systemRed
+    private let allowColor = NSColor.systemGreen
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        toolTip = "Allow or deny this domain"
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: 54).isActive = true
+        heightAnchor.constraint(equalToConstant: 24).isActive = true
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas {
+            removeTrackingArea(area)
+        }
+        addTrackingArea(NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        ))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        updateHover(with: event)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        updateHover(with: event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hoveredSegment = nil
+        needsDisplay = true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        selectedSegment = segment(at: convert(event.locationInWindow, from: nil))
+        sendAction(action, to: target)
+    }
+
+    private func updateHover(with event: NSEvent) {
+        let segment = segment(at: convert(event.locationInWindow, from: nil))
+        if hoveredSegment != segment {
+            hoveredSegment = segment
+            needsDisplay = true
+        }
+    }
+
+    private func segment(at point: NSPoint) -> Int {
+        point.x < bounds.midX ? 0 : 1
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let baseRect = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(roundedRect: baseRect, xRadius: 6, yRadius: 6)
+        NSColor.controlBackgroundColor.withAlphaComponent(0.62).setFill()
+        path.fill()
+        NSColor.separatorColor.withAlphaComponent(0.48).setStroke()
+        path.lineWidth = 0.8
+        path.stroke()
+
+        let selectedRect = segmentRect(selectedSegment).insetBy(dx: 1.5, dy: 1.5)
+        let selectedPath = NSBezierPath(roundedRect: selectedRect, xRadius: 5, yRadius: 5)
+        (selectedSegment == 0 ? denyColor : allowColor).withAlphaComponent(0.82).setFill()
+        selectedPath.fill()
+
+        if let hoveredSegment, hoveredSegment != selectedSegment {
+            let hoverRect = segmentRect(hoveredSegment).insetBy(dx: 2, dy: 2)
+            let hoverPath = NSBezierPath(roundedRect: hoverRect, xRadius: 5, yRadius: 5)
+            NSColor.white.withAlphaComponent(0.16).setFill()
+            hoverPath.fill()
+        }
+
+        NSColor.separatorColor.withAlphaComponent(0.36).setStroke()
+        let divider = NSBezierPath()
+        divider.move(to: NSPoint(x: bounds.midX, y: bounds.minY + 4))
+        divider.line(to: NSPoint(x: bounds.midX, y: bounds.maxY - 4))
+        divider.lineWidth = 0.6
+        divider.stroke()
+
+        drawSymbol("xmark", in: segmentRect(0), selected: selectedSegment == 0, color: denyColor)
+        drawSymbol("checkmark", in: segmentRect(1), selected: selectedSegment == 1, color: allowColor)
+    }
+
+    private func segmentRect(_ segment: Int) -> NSRect {
+        let width = bounds.width / 2
+        return NSRect(x: segment == 0 ? bounds.minX : bounds.midX, y: bounds.minY, width: width, height: bounds.height)
+    }
+
+    private func drawSymbol(_ name: String, in rect: NSRect, selected: Bool, color: NSColor) {
+        let symbolColor = selected ? NSColor.white : color
+        symbolColor.setStroke()
+        let path = NSBezierPath()
+        path.lineWidth = 2.1
+        path.lineCapStyle = .round
+        path.lineJoinStyle = .round
+        if name == "xmark" {
+            path.move(to: NSPoint(x: rect.midX - 4.2, y: rect.midY - 4.2))
+            path.line(to: NSPoint(x: rect.midX + 4.2, y: rect.midY + 4.2))
+            path.move(to: NSPoint(x: rect.midX - 4.2, y: rect.midY + 4.2))
+            path.line(to: NSPoint(x: rect.midX + 4.2, y: rect.midY - 4.2))
+        } else {
+            path.move(to: NSPoint(x: rect.midX - 5, y: rect.midY - 0.5))
+            path.line(to: NSPoint(x: rect.midX - 1.4, y: rect.midY - 4))
+            path.line(to: NSPoint(x: rect.midX + 5, y: rect.midY + 4.4))
+        }
+        path.stroke()
+    }
+}
+
 final class DisclosureButton: NSButton {
     weak var disclosureView: NSView?
 
@@ -1409,13 +1532,13 @@ final class MonitorRowView: NSTableRowView {
 
     override func drawBackground(in dirtyRect: NSRect) {
         if !isSelected && !group && odd {
-            NSColor.controlBackgroundColor.withAlphaComponent(0.16).setFill()
+            NSColor.controlBackgroundColor.withAlphaComponent(0.10).setFill()
             NSBezierPath(rect: bounds).fill()
         }
     }
 
     override func drawSeparator(in dirtyRect: NSRect) {
-        NSColor.separatorColor.withAlphaComponent(group ? 0.25 : 0.12).setStroke()
+        NSColor.separatorColor.withAlphaComponent(group ? 0.24 : 0.10).setStroke()
         let path = NSBezierPath()
         path.move(to: NSPoint(x: bounds.minX + 8, y: bounds.minY))
         path.line(to: NSPoint(x: bounds.maxX - 8, y: bounds.minY))
@@ -1868,20 +1991,21 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     func show() {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1100, height: 680),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         window.title = "Guard Monitor"
-        window.titleVisibility = .visible
-        window.titlebarAppearsTransparent = false
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = true
         window.minSize = NSSize(width: 700, height: 440)
         window.isRestorable = false
         window.center()
         window.delegate = self
 
         let background = NSVisualEffectView()
-        background.material = .contentBackground
+        background.material = .hudWindow
         background.blendingMode = .behindWindow
         background.state = .active
         background.translatesAutoresizingMaskIntoConstraints = false
@@ -1891,7 +2015,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         root.orientation = .vertical
         root.alignment = .width
         root.spacing = 8
-        root.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 8, right: 12)
+        root.edgeInsets = NSEdgeInsets(top: 44, left: 12, bottom: 8, right: 12)
         root.translatesAutoresizingMaskIntoConstraints = false
         background.addSubview(root)
         NSLayoutConstraint.activate([
@@ -2233,15 +2357,14 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     }
 
     func makeInspector() -> NSView {
-        let sidebar = NSVisualEffectView()
-        sidebar.material = .sidebar
-        sidebar.blendingMode = .withinWindow
-        sidebar.state = .active
+        let sidebar = NSView()
+        sidebar.wantsLayer = true
+        sidebar.layer?.backgroundColor = NSColor.clear.cgColor
         sidebar.translatesAutoresizingMaskIntoConstraints = false
 
         let leadingRule = NSView()
         leadingRule.wantsLayer = true
-        leadingRule.layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.35).cgColor
+        leadingRule.layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.42).cgColor
         leadingRule.translatesAutoresizingMaskIntoConstraints = false
         sidebar.addSubview(leadingRule)
 
@@ -5515,20 +5638,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             return cell
         }
 
-        let control = NSSegmentedControl()
-        control.segmentCount = 2
-        if #available(macOS 11.0, *) {
-            control.setImage(NSImage(systemSymbolName: "xmark", accessibilityDescription: "Deny"), forSegment: 0)
-            control.setImage(NSImage(systemSymbolName: "checkmark", accessibilityDescription: "Allow"), forSegment: 1)
-        } else {
-            control.setLabel("Deny", forSegment: 0)
-            control.setLabel("Allow", forSegment: 1)
-        }
-        control.setWidth(25, forSegment: 0)
-        control.setWidth(25, forSegment: 1)
-        control.trackingMode = .selectOne
-        control.segmentStyle = .texturedRounded
-        control.controlSize = .small
+        let control = HoverPolicySwitch()
         control.selectedSegment = row.decision == "deny" || row.decision == "review" ? 0 : 1
         control.target = self
         control.action = #selector(policySwitchChanged(_:))
@@ -5544,11 +5654,19 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         return cell
     }
 
-    @objc func policySwitchChanged(_ sender: NSSegmentedControl) {
+    @objc func policySwitchChanged(_ sender: NSControl) {
         let row = sender.tag
         guard row >= 0, row < activityRows.count, let event = activityRows[row].event, !event.host.isEmpty else { return }
         tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-        if sender.selectedSegment == 0 {
+        let selectedSegment: Int
+        if let policySwitch = sender as? HoverPolicySwitch {
+            selectedSegment = policySwitch.selectedSegment
+        } else if let segmented = sender as? NSSegmentedControl {
+            selectedSegment = segmented.selectedSegment
+        } else {
+            selectedSegment = 1
+        }
+        if selectedSegment == 0 {
             addSelectedDomain(to: "network.deniedDomains")
         } else {
             addSelectedDomain(to: "network.allowedDomains")
