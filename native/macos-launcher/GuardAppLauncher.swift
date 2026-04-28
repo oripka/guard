@@ -1,10 +1,17 @@
 import AppKit
 import Darwin
 import Foundation
+import UserNotifications
 
 extension Array {
     subscript(safe index: Int) -> Element? {
         indices.contains(index) ? self[index] : nil
+    }
+}
+
+extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
     }
 }
 
@@ -25,6 +32,10 @@ struct GuardAskNetworkInput: Decodable {
     let projectDir: String?
     let runDir: String?
     let command: String?
+    let launcherApp: String?
+    let launcherProcess: String?
+    let launcherPid: Int?
+    let parentChain: String?
 }
 
 struct GuardHttpPolicyRequest: Codable {
@@ -47,11 +58,16 @@ struct GuardAskHttpPolicyInput: Decodable {
     let projectDir: String?
     let runDir: String?
     let command: String?
+    let launcherApp: String?
+    let launcherProcess: String?
+    let launcherPid: Int?
+    let parentChain: String?
 }
 
 struct GuardAskDecision: Encodable {
     let action: String
     let rule: GuardHttpPolicyRule?
+    let duration: String?
 }
 
 struct GuardFinding: Decodable {
@@ -64,8 +80,34 @@ struct GuardFinding: Decodable {
 struct GuardNetworkSummary: Decodable {
     let mode: String
     let allowedDomains: [String]
+    let allowedRawTcp: [GuardRawTcpRule]?
+    let httpRules: [GuardHttpPolicyRule]?
     let deniedDomains: [String]
     let deniedDomainPresets: [String]
+    let tlsInspection: GuardTlsInspection?
+    let allowLocalBinding: Bool?
+    let allowLoopbackConnections: Bool?
+    let allowLoopbackHighPorts: Bool?
+    let allowLoopbackListeningHighPorts: Bool?
+    let allowLoopbackListeningHighPortProcesses: [String]?
+    let allowLoopbackPorts: [Int]?
+}
+
+struct GuardRawTcpRule: Codable {
+    let ip: String?
+    let host: String?
+    let resolveAtLaunch: Bool?
+    let port: Int?
+    let reason: String?
+}
+
+struct GuardTlsInspection: Codable {
+    let enabled: Bool?
+    let explicit: Bool?
+    let mode: String?
+    let caScope: String?
+    let trustedBy: [String]?
+    let userApprovalRequired: Bool?
 }
 
 struct GuardFilesystemSummary: Decodable {
@@ -132,13 +174,576 @@ func loadSummary(config: GuardAppConfig) throws -> GuardAppSummary {
     return try JSONDecoder().decode(GuardAppSummary.self, from: stdout)
 }
 
-final class GuardApplicationDelegate: NSObject, NSApplicationDelegate {
+final class GuardApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    var monitorController: MonitorWindowController?
+    var launcherController: LauncherWindowController?
+    var statusController: GuardStatusItemController?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.setNotificationCategories([
+            UNNotificationCategory(
+                identifier: "GUARD_PENDING_ALERT",
+                actions: [
+                    UNNotificationAction(identifier: "OPEN_GUARD", title: "Open Guard", options: [.foreground])
+                ],
+                intentIdentifiers: [],
+                options: []
+            )
+        ])
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
     }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if revealMonitor() {
+            return true
+        }
+        if let controller = launcherController {
+            if let window = controller.window {
+                if window.isMiniaturized {
+                    window.deminiaturize(nil)
+                }
+                window.makeKeyAndOrderFront(nil)
+                window.orderFrontRegardless()
+            } else {
+                controller.show()
+            }
+            sender.activate(ignoringOtherApps: true)
+            return true
+        }
+        return true
+    }
+
+    @objc func showMonitor(_ sender: Any?) {
+        _ = revealMonitor()
+    }
+
+    @discardableResult
+    func revealMonitor() -> Bool {
+        guard let controller = monitorController else { return false }
+        if let window = controller.window {
+            if window.isMiniaturized {
+                window.deminiaturize(nil)
+            }
+            window.makeKeyAndOrderFront(nil)
+            window.orderFrontRegardless()
+        } else {
+            controller.show()
+        }
+        NSApp.unhide(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        return true
+    }
+
+    @objc func showRules(_ sender: Any?) {
+        monitorController?.openRulesWindow(sender)
+    }
+
+    @objc func showSettings(_ sender: Any?) {
+        monitorController?.openSettingsWindow(sender)
+    }
+
+    @objc func refreshMonitor(_ sender: Any?) {
+        monitorController?.reloadEvents(sender)
+    }
+
+    @objc func focusMonitorSearch(_ sender: Any?) {
+        monitorController?.focusSearch(sender)
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+        await MainActor.run {
+            showMonitor(nil)
+        }
+    }
 }
 
-func installMainMenu(appName: String) {
+final class GuardStatusItemController: NSObject {
+    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    let popover = NSPopover()
+    weak var monitor: MonitorWindowController?
+    let modeLabel = NSTextField(labelWithString: "Mode")
+    let modeValueLabel = NSTextField(labelWithString: "Monitor")
+    let daemonBadgeLabel = NSTextField(labelWithString: "guardd")
+    let extensionBadgeLabel = NSTextField(labelWithString: "NetworkExtension")
+    let allowedPillLabel = NSTextField(labelWithString: "0 allowed")
+    let deniedPillLabel = NSTextField(labelWithString: "0 denied")
+    let sparkline = TrafficSparklineView()
+    let trafficEmptyLabel = NSTextField(labelWithString: "5 minutes ago")
+    let trafficNowLabel = NSTextField(labelWithString: "now")
+    let recentStack = NSStackView()
+    let deniedBadgeLabel = NSTextField(labelWithString: "0")
+    let deniedRow = NSButton()
+    let popoverContentWidth: CGFloat = 360
+    var lastNotifiedPendingCount = 0
+
+    init(monitor: MonitorWindowController) {
+        self.monitor = monitor
+        super.init()
+        if let button = statusItem.button {
+            if #available(macOS 11.0, *) {
+                button.image = statusImage(named: "shield.lefthalf.filled", description: "Guard Monitor")
+                button.title = ""
+            } else {
+                button.title = "G"
+            }
+            button.imagePosition = .imageOnly
+            button.imageScaling = .scaleProportionallyDown
+            button.target = self
+            button.action = #selector(togglePopover(_:))
+            button.toolTip = "Guard Monitor"
+        }
+        popover.behavior = .transient
+        popover.contentSize = NSSize(width: 388, height: 580)
+        popover.contentViewController = NSViewController()
+        popover.contentViewController?.view = makePopoverView()
+    }
+
+    @available(macOS 11.0, *)
+    func statusImage(named symbolName: String, description: String) -> NSImage? {
+        let config = NSImage.SymbolConfiguration(pointSize: 16, weight: .regular)
+        let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: description)?
+            .withSymbolConfiguration(config)
+            ?? NSImage(systemSymbolName: "shield", accessibilityDescription: description)
+        image?.isTemplate = true
+        image?.size = NSSize(width: 18, height: 18)
+        return image
+    }
+
+    func makePopoverView() -> NSView {
+        let root = NSStackView()
+        root.orientation = .vertical
+        root.alignment = .width
+        root.spacing = 12
+        root.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 14, right: 14)
+        root.wantsLayer = true
+        root.layer?.cornerRadius = 18
+        root.layer?.cornerCurve = .continuous
+        root.translatesAutoresizingMaskIntoConstraints = false
+        root.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
+
+        root.addArrangedSubview(popoverHeader())
+        root.addArrangedSubview(statusBadgeRow())
+        root.addArrangedSubview(trafficCard())
+
+        let recentTitle = NSTextField(labelWithString: "Recent Network Activity")
+        recentTitle.font = NSFont.systemFont(ofSize: 16, weight: .bold)
+        recentTitle.textColor = .secondaryLabelColor
+        recentTitle.alignment = .left
+        root.addArrangedSubview(recentTitle)
+
+        recentStack.orientation = .vertical
+        recentStack.alignment = .width
+        recentStack.spacing = 8
+        root.addArrangedSubview(recentStack)
+
+        root.addArrangedSubview(separator())
+        root.addArrangedSubview(recentDeniedRow())
+        root.addArrangedSubview(separator())
+        root.addArrangedSubview(menuAction("Open Monitor...", action: #selector(openMonitor(_:))))
+        root.addArrangedSubview(menuAction("Manage Rules...", action: #selector(openRules(_:))))
+        root.addArrangedSubview(menuAction("Guard Settings...", action: #selector(openSettings(_:))))
+        return root
+    }
+
+    func popoverHeader() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+
+        let tile = NSStackView()
+        tile.orientation = .horizontal
+        tile.alignment = .centerY
+        tile.spacing = 10
+        tile.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+        tile.wantsLayer = true
+        tile.layer?.cornerRadius = 12
+        tile.layer?.cornerCurve = .continuous
+        tile.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.55).cgColor
+        tile.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.25).cgColor
+        tile.layer?.borderWidth = 0.5
+        tile.translatesAutoresizingMaskIntoConstraints = false
+        tile.widthAnchor.constraint(equalToConstant: 240).isActive = true
+
+        tile.addArrangedSubview(symbolCircle("bell.fill", tint: .systemOrange, fallback: "!"))
+        let labelStack = NSStackView()
+        labelStack.orientation = .vertical
+        labelStack.spacing = 0
+        modeLabel.font = NSFont.systemFont(ofSize: 12, weight: .bold)
+        modeLabel.textColor = .secondaryLabelColor
+        modeValueLabel.font = NSFont.systemFont(ofSize: 20, weight: .bold)
+        modeValueLabel.textColor = .labelColor
+        labelStack.addArrangedSubview(modeLabel)
+        labelStack.addArrangedSubview(modeValueLabel)
+        tile.addArrangedSubview(labelStack)
+        row.addArrangedSubview(tile)
+
+        row.addArrangedSubview(iconButton("bell.slash.fill", action: #selector(openSettings(_:)), tint: .secondaryLabelColor, tooltip: "Alert settings"))
+        row.addArrangedSubview(iconButton("network", action: #selector(openMonitor(_:)), tint: .systemBlue, tooltip: "Open live monitor"))
+        return row
+    }
+
+    func statusBadgeRow() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 6
+        row.addArrangedSubview(statusBadge(daemonBadgeLabel, symbol: "bolt.horizontal.circle.fill", width: 132))
+        row.addArrangedSubview(statusBadge(extensionBadgeLabel, symbol: "shield.lefthalf.filled", width: 222))
+        return row
+    }
+
+    func statusBadge(_ label: NSTextField, symbol: String, width: CGFloat) -> NSView {
+        let badge = NSStackView()
+        badge.orientation = .horizontal
+        badge.alignment = .centerY
+        badge.spacing = 5
+        badge.edgeInsets = NSEdgeInsets(top: 4, left: 8, bottom: 4, right: 8)
+        badge.wantsLayer = true
+        badge.layer?.cornerRadius = 7
+        badge.layer?.cornerCurve = .continuous
+        badge.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.34).cgColor
+        badge.translatesAutoresizingMaskIntoConstraints = false
+        badge.widthAnchor.constraint(equalToConstant: width).isActive = true
+        badge.addArrangedSubview(symbolImage(symbol, tint: .secondaryLabelColor, size: 11))
+        label.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        label.textColor = .secondaryLabelColor
+        label.lineBreakMode = .byTruncatingMiddle
+        label.maximumNumberOfLines = 1
+        badge.addArrangedSubview(label)
+        return badge
+    }
+
+    func trafficCard() -> NSView {
+        let card = NSStackView()
+        card.orientation = .vertical
+        card.alignment = .width
+        card.spacing = 8
+        card.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 10, right: 12)
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 12
+        card.layer?.cornerCurve = .continuous
+        card.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.50).cgColor
+        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.26).cgColor
+        card.layer?.borderWidth = 0.5
+
+        let pills = NSStackView()
+        pills.orientation = .horizontal
+        pills.alignment = .centerY
+        pills.spacing = 8
+        pills.addArrangedSubview(metricPill(label: allowedPillLabel, symbol: "arrow.up", tint: .systemPurple))
+        pills.addArrangedSubview(metricPill(label: deniedPillLabel, symbol: "xmark", tint: .systemRed))
+        card.addArrangedSubview(pills)
+
+        sparkline.heightAnchor.constraint(equalToConstant: 124).isActive = true
+        card.addArrangedSubview(sparkline)
+
+        let timeline = NSStackView()
+        timeline.orientation = .horizontal
+        trafficEmptyLabel.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        trafficEmptyLabel.textColor = .tertiaryLabelColor
+        trafficNowLabel.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        trafficNowLabel.textColor = .tertiaryLabelColor
+        timeline.addArrangedSubview(trafficEmptyLabel)
+        timeline.addArrangedSubview(NSView())
+        timeline.addArrangedSubview(trafficNowLabel)
+        card.addArrangedSubview(timeline)
+        return card
+    }
+
+    func metricPill(label: NSTextField, symbol: String, tint: NSColor) -> NSView {
+        let pill = NSStackView()
+        pill.orientation = .horizontal
+        pill.alignment = .centerY
+        pill.spacing = 6
+        pill.edgeInsets = NSEdgeInsets(top: 6, left: 10, bottom: 6, right: 10)
+        pill.wantsLayer = true
+        pill.layer?.cornerRadius = 7
+        pill.layer?.cornerCurve = .continuous
+        pill.layer?.backgroundColor = tint.withAlphaComponent(0.30).cgColor
+        pill.addArrangedSubview(symbolImage(symbol, tint: tint, size: 15))
+        label.font = NSFont.systemFont(ofSize: 15, weight: .bold)
+        label.textColor = .labelColor
+        pill.addArrangedSubview(label)
+        pill.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        return pill
+    }
+
+    func recentDeniedRow() -> NSView {
+        deniedRow.title = ""
+        deniedRow.isBordered = false
+        deniedRow.target = self
+        deniedRow.action = #selector(openDenied(_:))
+        deniedRow.wantsLayer = true
+        deniedRow.layer?.cornerRadius = 8
+        deniedRow.layer?.cornerCurve = .continuous
+        deniedRow.contentTintColor = .labelColor
+        deniedRow.translatesAutoresizingMaskIntoConstraints = false
+        deniedRow.heightAnchor.constraint(equalToConstant: 38).isActive = true
+        deniedRow.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
+
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+        row.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 6)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        deniedRow.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: deniedRow.leadingAnchor),
+            row.trailingAnchor.constraint(equalTo: deniedRow.trailingAnchor),
+            row.topAnchor.constraint(equalTo: deniedRow.topAnchor),
+            row.bottomAnchor.constraint(equalTo: deniedRow.bottomAnchor)
+        ])
+
+        deniedBadgeLabel.font = NSFont.systemFont(ofSize: 15, weight: .bold)
+        deniedBadgeLabel.textColor = .white
+        deniedBadgeLabel.alignment = .center
+        deniedBadgeLabel.wantsLayer = true
+        deniedBadgeLabel.layer?.cornerRadius = 12
+        deniedBadgeLabel.layer?.cornerCurve = .continuous
+        deniedBadgeLabel.layer?.backgroundColor = NSColor.systemRed.cgColor
+        deniedBadgeLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 34).isActive = true
+        deniedBadgeLabel.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        row.addArrangedSubview(deniedBadgeLabel)
+
+        let label = NSTextField(labelWithString: "Recently Denied")
+        label.font = NSFont.systemFont(ofSize: 16, weight: .bold)
+        row.addArrangedSubview(label)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(symbolImage("chevron.right", tint: .secondaryLabelColor, size: 15))
+        return deniedRow
+    }
+
+    func menuAction(_ title: String, action: Selector) -> NSButton {
+        let button = NSButton(title: title, target: self, action: action)
+        button.isBordered = false
+        button.alignment = .left
+        button.cell?.alignment = .left
+        button.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
+        button.contentTintColor = .labelColor
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        button.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
+        return button
+    }
+
+    func iconButton(_ symbol: String, action: Selector, tint: NSColor, tooltip: String) -> NSButton {
+        let button = NSButton()
+        button.isBordered = false
+        button.target = self
+        button.action = action
+        button.toolTip = tooltip
+        button.image = symbolImage(symbol, tint: tint, size: 20).image
+        button.imagePosition = .imageOnly
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 12
+        button.layer?.cornerCurve = .continuous
+        button.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.55).cgColor
+        button.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.25).cgColor
+        button.layer?.borderWidth = 0.5
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.widthAnchor.constraint(equalToConstant: 50).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 50).isActive = true
+        return button
+    }
+
+    func symbolCircle(_ symbol: String, tint: NSColor, fallback: String) -> NSView {
+        let holder = NSView()
+        holder.wantsLayer = true
+        holder.layer?.cornerRadius = 18
+        holder.layer?.cornerCurve = .continuous
+        holder.layer?.backgroundColor = tint.cgColor
+        holder.translatesAutoresizingMaskIntoConstraints = false
+        holder.widthAnchor.constraint(equalToConstant: 36).isActive = true
+        holder.heightAnchor.constraint(equalToConstant: 36).isActive = true
+        let image = symbolImage(symbol, tint: .white, size: 18)
+        image.translatesAutoresizingMaskIntoConstraints = false
+        holder.addSubview(image)
+        NSLayoutConstraint.activate([
+            image.centerXAnchor.constraint(equalTo: holder.centerXAnchor),
+            image.centerYAnchor.constraint(equalTo: holder.centerYAnchor)
+        ])
+        return holder
+    }
+
+    func symbolImage(_ symbol: String, tint: NSColor, size: CGFloat) -> NSImageView {
+        let imageView = NSImageView()
+        if #available(macOS 11.0, *) {
+            let config = NSImage.SymbolConfiguration(pointSize: size, weight: .bold)
+            let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(config)
+            image?.isTemplate = true
+            imageView.image = image
+        }
+        imageView.contentTintColor = tint
+        imageView.imageScaling = .scaleProportionallyDown
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        imageView.widthAnchor.constraint(equalToConstant: size + 4).isActive = true
+        imageView.heightAnchor.constraint(equalToConstant: size + 4).isActive = true
+        return imageView
+    }
+
+    func separator() -> NSView {
+        let line = NSBox()
+        line.boxType = .separator
+        return line
+    }
+
+    func refresh() {
+        guard let monitor else { return }
+        let denied = monitor.recentDeniedCount
+        let pending = monitor.pendingAlertCount
+        modeValueLabel.stringValue = pending > 0 ? "Alert" : "Monitor"
+        daemonBadgeLabel.stringValue = monitor.daemonStateLabel.stringValue
+        extensionBadgeLabel.stringValue = monitor.extensionSyncText
+        allowedPillLabel.stringValue = "\(monitor.recentAllowedCount) allowed"
+        deniedPillLabel.stringValue = "\(denied) denied"
+        deniedBadgeLabel.stringValue = "\(denied)"
+        sparkline.buckets = monitor.trafficSparkline.buckets
+        recentStack.arrangedSubviews.forEach { view in
+            recentStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        let recentEvents = monitor.events.filter { event in
+            event.type == "network.decision" ||
+                event.type.hasPrefix("guard.alert.") ||
+                (!event.host.isEmpty && event.result != "inactive")
+        }.prefix(4)
+        if recentEvents.isEmpty {
+            recentStack.addArrangedSubview(emptyRecentRow())
+        } else {
+            for event in recentEvents {
+                recentStack.addArrangedSubview(recentActivityRow(event))
+            }
+        }
+        statusItem.button?.contentTintColor = pending > 0 || denied > 0 ? .systemOrange : NSColor.controlTextColor
+        if pending > 0 && pending != lastNotifiedPendingCount {
+            notifyPendingAlerts(count: pending)
+        }
+        lastNotifiedPendingCount = pending
+    }
+
+    func recentActivityRow(_ event: GuardMonitorEvent) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 9
+
+        let denied = event.result == "deny" || event.result == "denied"
+        row.addArrangedSubview(miniSymbolCircle(denied ? "xmark.shield.fill" : "checkmark.shield.fill", tint: denied ? .systemRed : .systemBlue))
+
+        let text = NSStackView()
+        text.orientation = .vertical
+        text.spacing = 1
+        let title = NSTextField(labelWithString: compactActorLabel(for: event))
+        title.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
+        title.lineBreakMode = .byTruncatingTail
+        let detail = NSTextField(labelWithString: compactDestinationLabel(for: event))
+        detail.font = NSFont.systemFont(ofSize: 11)
+        detail.textColor = denied ? .systemRed : .secondaryLabelColor
+        detail.lineBreakMode = .byTruncatingMiddle
+        text.addArrangedSubview(title)
+        text.addArrangedSubview(detail)
+        row.addArrangedSubview(text)
+        return row
+    }
+
+    func emptyRecentRow() -> NSView {
+        let label = NSTextField(labelWithString: "No recent network activity")
+        label.font = NSFont.systemFont(ofSize: 13)
+        label.textColor = .tertiaryLabelColor
+        return label
+    }
+
+    func miniSymbolCircle(_ symbol: String, tint: NSColor) -> NSView {
+        let holder = NSView()
+        holder.wantsLayer = true
+        holder.layer?.cornerRadius = 9
+        holder.layer?.cornerCurve = .continuous
+        holder.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.62).cgColor
+        holder.translatesAutoresizingMaskIntoConstraints = false
+        holder.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        holder.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        let image = symbolImage(symbol, tint: tint, size: 13)
+        image.translatesAutoresizingMaskIntoConstraints = false
+        holder.addSubview(image)
+        NSLayoutConstraint.activate([
+            image.centerXAnchor.constraint(equalTo: holder.centerXAnchor),
+            image.centerYAnchor.constraint(equalTo: holder.centerYAnchor)
+        ])
+        return holder
+    }
+
+    func compactActorLabel(for event: GuardMonitorEvent) -> String {
+        if !event.launcherApp.isEmpty { return event.launcherApp }
+        if !event.launcherProcess.isEmpty { return event.launcherProcess }
+        if !event.command.isEmpty {
+            return (event.command as NSString).lastPathComponent
+        }
+        if !event.processPath.isEmpty {
+            return (event.processPath as NSString).lastPathComponent
+        }
+        return event.type.isEmpty ? "Guard" : event.type
+    }
+
+    func compactDestinationLabel(for event: GuardMonitorEvent) -> String {
+        let destination = event.host.isEmpty ? event.target : event.host
+        let result = event.result.isEmpty ? "" : "\(event.result) "
+        return destination.isEmpty ? event.type : "\(result)\(destination)"
+    }
+
+    func notifyPendingAlerts(count: Int) {
+        let content = UNMutableNotificationContent()
+        content.title = "Guard needs a network decision"
+        content.body = "\(count) pending alert\(count == 1 ? "" : "s") waiting for review."
+        content.sound = .default
+        content.categoryIdentifier = "GUARD_PENDING_ALERT"
+        let request = UNNotificationRequest(identifier: "dev.guard.pending-alerts", content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    @objc func togglePopover(_ sender: Any?) {
+        refresh()
+        guard let button = statusItem.button else { return }
+        if popover.isShown {
+            popover.performClose(sender)
+        } else {
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        }
+    }
+
+    @objc func openMonitor(_ sender: Any?) {
+        monitor?.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        popover.performClose(sender)
+    }
+
+    @objc func openRules(_ sender: Any?) {
+        monitor?.openRulesWindow(sender)
+        popover.performClose(sender)
+    }
+
+    @objc func openSettings(_ sender: Any?) {
+        monitor?.openSettingsWindow(sender)
+        popover.performClose(sender)
+    }
+
+    @objc func openDenied(_ sender: Any?) {
+        monitor?.monitorFilterControl.selectedSegment = 2
+        monitor?.rebuildActivityRows(keepSelection: false)
+        monitor?.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        popover.performClose(sender)
+    }
+}
+
+func installMainMenu(appName: String, delegate: GuardApplicationDelegate) {
     let mainMenu = NSMenu()
 
     let appItem = NSMenuItem()
@@ -155,8 +760,24 @@ func installMainMenu(appName: String) {
     let close = NSMenuItem(title: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
     close.target = nil
     fileMenu.addItem(close)
+    let refresh = NSMenuItem(title: "Refresh", action: #selector(GuardApplicationDelegate.refreshMonitor(_:)), keyEquivalent: "r")
+    refresh.target = delegate
+    fileMenu.addItem(refresh)
     fileItem.submenu = fileMenu
     mainMenu.addItem(fileItem)
+
+    let viewItem = NSMenuItem()
+    let viewMenu = NSMenu(title: "View")
+    let monitor = NSMenuItem(title: "Show Monitor", action: #selector(GuardApplicationDelegate.showMonitor(_:)), keyEquivalent: "0")
+    let rules = NSMenuItem(title: "Rules", action: #selector(GuardApplicationDelegate.showRules(_:)), keyEquivalent: "1")
+    let settings = NSMenuItem(title: "Settings", action: #selector(GuardApplicationDelegate.showSettings(_:)), keyEquivalent: ",")
+    let search = NSMenuItem(title: "Find", action: #selector(GuardApplicationDelegate.focusMonitorSearch(_:)), keyEquivalent: "f")
+    for item in [monitor, rules, settings, search] {
+        item.target = delegate
+        viewMenu.addItem(item)
+    }
+    viewItem.submenu = viewMenu
+    mainMenu.addItem(viewItem)
 
     NSApp.mainMenu = mainMenu
 }
@@ -244,7 +865,15 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
     let scopeRows: [(String, String)]
     let detailRows: [(String, String)]
     let actions: [(String, GuardPromptChoice, Bool)]
+    let scopeOptions: [(String, GuardPromptChoice)]
+    let lifetimeOptions: [(String, String)]
+    let methodOptions: [(String, [String]?)]
+    let editablePath: String?
     var selectedChoice: GuardPromptChoice = .deny
+    var scopePopup: NSPopUpButton?
+    var lifetimePopup: NSPopUpButton?
+    var methodPopup: NSPopUpButton?
+    var pathField: NSTextField?
     var detailsView: NSView?
     var detailsButton: NSButton?
 
@@ -255,7 +884,11 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         context: String,
         scopeRows: [(String, String)],
         detailRows: [(String, String)],
-        actions: [(String, GuardPromptChoice, Bool)]
+        actions: [(String, GuardPromptChoice, Bool)],
+        scopeOptions: [(String, GuardPromptChoice)] = [],
+        lifetimeOptions: [(String, String)] = [],
+        methodOptions: [(String, [String]?)] = [],
+        editablePath: String? = nil
     ) {
         self.titleText = titleText
         self.actor = actor
@@ -264,15 +897,21 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         self.scopeRows = scopeRows
         self.detailRows = detailRows
         self.actions = actions
+        self.scopeOptions = scopeOptions
+        self.lifetimeOptions = lifetimeOptions
+        self.methodOptions = methodOptions
+        self.editablePath = editablePath
     }
 
     func run() -> GuardPromptChoice {
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 430),
+            contentRect: NSRect(x: 0, y: 0, width: 700, height: 390),
             styleMask: [.titled, .closable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
+        panel.minSize = NSSize(width: 700, height: 390)
+        panel.maxSize = NSSize(width: 700, height: 530)
         panel.title = "Guard Connection"
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
@@ -281,7 +920,7 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         panel.delegate = self
 
         let background = NSVisualEffectView()
-        background.material = .hudWindow
+        background.material = .windowBackground
         background.blendingMode = .behindWindow
         background.state = .active
         background.translatesAutoresizingMaskIntoConstraints = false
@@ -291,7 +930,7 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         root.orientation = .vertical
         root.alignment = .width
         root.spacing = 12
-        root.edgeInsets = NSEdgeInsets(top: 20, left: 24, bottom: 18, right: 24)
+        root.edgeInsets = NSEdgeInsets(top: 34, left: 38, bottom: 18, right: 28)
         root.translatesAutoresizingMaskIntoConstraints = false
         background.addSubview(root)
         NSLayoutConstraint.activate([
@@ -306,6 +945,7 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
 
         let details = makeDetailsPanel()
         details.isHidden = true
+        details.setContentHuggingPriority(.defaultLow, for: .horizontal)
         detailsView = details
         root.addArrangedSubview(details)
 
@@ -333,6 +973,9 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         } else {
             selectedChoice = .deny
         }
+        if selectedChoice != .deny, let scopePopup, scopePopup.indexOfSelectedItem >= 0, scopePopup.indexOfSelectedItem < scopeOptions.count {
+            selectedChoice = scopeOptions[scopePopup.indexOfSelectedItem].1
+        }
         NSApp.stopModal()
     }
 
@@ -340,23 +983,43 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         guard let detailsView else { return }
         detailsView.isHidden.toggle()
         sender.title = detailsView.isHidden ? "Details" : "Hide Details"
+        if let panel = sender.window {
+            panel.setContentSize(NSSize(width: 700, height: detailsView.isHidden ? 390 : 530))
+        }
+    }
+
+    @objc func showPathHelp(_ sender: NSButton) {
+        let alert = NSAlert()
+        alert.messageText = "HTTP Path Rules"
+        alert.informativeText = [
+            "Use /v1/responses for one exact endpoint.",
+            "Use /v1/* to allow everything below a path group.",
+            "Use /* only when every path on this host is acceptable.",
+            "Query strings are visible after TLS inspection and are matched as part of the path when present."
+        ].joined(separator: "\n")
+        alert.addButton(withTitle: "OK")
+        if let window = sender.window {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
     }
 
     func makeHeader() -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .top
-        row.spacing = 14
+        row.spacing = 12
 
         let iconWrap = NSView()
         iconWrap.wantsLayer = true
-        iconWrap.layer?.cornerRadius = 10
+        iconWrap.layer?.cornerRadius = 9
         iconWrap.layer?.cornerCurve = .continuous
         iconWrap.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.16).cgColor
         iconWrap.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            iconWrap.widthAnchor.constraint(equalToConstant: 46),
-            iconWrap.heightAnchor.constraint(equalToConstant: 46)
+            iconWrap.widthAnchor.constraint(equalToConstant: 38),
+            iconWrap.heightAnchor.constraint(equalToConstant: 38)
         ])
 
         let icon = NSImageView()
@@ -372,13 +1035,13 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         NSLayoutConstraint.activate([
             icon.centerXAnchor.constraint(equalTo: iconWrap.centerXAnchor),
             icon.centerYAnchor.constraint(equalTo: iconWrap.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 24),
-            icon.heightAnchor.constraint(equalToConstant: 24)
+            icon.widthAnchor.constraint(equalToConstant: 21),
+            icon.heightAnchor.constraint(equalToConstant: 21)
         ])
 
-        let title = promptLabel(titleText, size: 20, weight: .bold)
-        let subtitle = promptLabel(context, size: 12, weight: .regular, color: .secondaryLabelColor)
-        subtitle.maximumNumberOfLines = 2
+        let title = promptLabel(titleText, size: 18, weight: .bold)
+        let subtitle = promptLabel(context, size: 11.5, weight: .regular, color: .secondaryLabelColor)
+        subtitle.maximumNumberOfLines = 1
 
         let actorLine = makeKeyValueLine("Actor", actor, strong: true)
         let targetLine = makeKeyValueLine("Destination", destination, strong: true)
@@ -387,9 +1050,13 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         text.orientation = .vertical
         text.alignment = .leading
         text.spacing = 5
+        text.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         row.addArrangedSubview(iconWrap)
         row.addArrangedSubview(text)
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(spacer)
         return row
     }
 
@@ -398,8 +1065,49 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         let stack = paddedPromptStack(in: container, inset: 12)
         stack.spacing = 8
 
-        let heading = promptLabel("Rule Preview", size: 12, weight: .semibold, color: .secondaryLabelColor)
+        let heading = promptLabel("Decision", size: 12, weight: .semibold, color: .secondaryLabelColor)
         stack.addArrangedSubview(heading)
+        if !scopeOptions.isEmpty {
+            let popup = NSPopUpButton()
+            popup.addItems(withTitles: scopeOptions.map { $0.0 })
+            popup.controlSize = .regular
+            popup.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+            popup.translatesAutoresizingMaskIntoConstraints = false
+            popup.widthAnchor.constraint(equalToConstant: 430).isActive = true
+            scopePopup = popup
+            stack.addArrangedSubview(makeControlLine("Scope", popup))
+        }
+        if !lifetimeOptions.isEmpty {
+            let popup = NSPopUpButton()
+            popup.addItems(withTitles: lifetimeOptions.map { $0.0 })
+            popup.selectItem(at: min(1, lifetimeOptions.count - 1))
+            popup.controlSize = .regular
+            popup.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+            popup.translatesAutoresizingMaskIntoConstraints = false
+            popup.widthAnchor.constraint(equalToConstant: 220).isActive = true
+            lifetimePopup = popup
+            stack.addArrangedSubview(makeControlLine("Lifetime", popup))
+        }
+        if !methodOptions.isEmpty {
+            let popup = NSPopUpButton()
+            popup.addItems(withTitles: methodOptions.map { $0.0 })
+            popup.controlSize = .regular
+            popup.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+            popup.translatesAutoresizingMaskIntoConstraints = false
+            popup.widthAnchor.constraint(equalToConstant: 220).isActive = true
+            methodPopup = popup
+            stack.addArrangedSubview(makeControlLine("Methods", popup))
+        }
+        if let editablePath {
+            let field = NSTextField(string: editablePath)
+            field.controlSize = .regular
+            field.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+            field.lineBreakMode = .byTruncatingMiddle
+            field.translatesAutoresizingMaskIntoConstraints = false
+            field.widthAnchor.constraint(equalToConstant: 430).isActive = true
+            pathField = field
+            stack.addArrangedSubview(makePathControlLine(field))
+        }
         for (label, value) in scopeRows {
             stack.addArrangedSubview(makeKeyValueLine(label, value, strong: false))
         }
@@ -421,10 +1129,11 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 8
+        row.spacing = 6
 
         let details = NSButton(title: "Details", target: self, action: #selector(toggleDetails(_:)))
-        details.bezelStyle = .rounded
+        details.bezelStyle = .regularSquare
+        details.controlSize = .regular
         detailsButton = details
         row.addArrangedSubview(details)
 
@@ -434,14 +1143,18 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
 
         for (index, action) in actions.enumerated() {
             let button = NSButton(title: action.0, target: self, action: #selector(chooseAction(_:)))
-            button.bezelStyle = .rounded
+            button.bezelStyle = action.2 ? .rounded : .regularSquare
             button.tag = index
+            button.controlSize = .regular
             button.setContentHuggingPriority(.required, for: .horizontal)
             if action.2 {
                 button.keyEquivalent = "\r"
+                button.keyEquivalentModifierMask = []
             }
             if action.1 == .deny {
                 button.hasDestructiveAction = true
+                button.keyEquivalent = "\u{1b}"
+                button.keyEquivalentModifierMask = []
             }
             row.addArrangedSubview(button)
         }
@@ -457,24 +1170,74 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         let keyLabel = promptLabel(key, size: 11, weight: .medium, color: .tertiaryLabelColor)
         keyLabel.alignment = .right
         keyLabel.translatesAutoresizingMaskIntoConstraints = false
-        keyLabel.widthAnchor.constraint(equalToConstant: 86).isActive = true
+        keyLabel.widthAnchor.constraint(equalToConstant: 104).isActive = true
 
         let valueLabel = promptLabel(value.isEmpty ? "Unknown" : value, size: strong ? 13 : 12, weight: strong ? .semibold : .regular)
         valueLabel.lineBreakMode = .byTruncatingMiddle
         valueLabel.maximumNumberOfLines = 1
+        valueLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         row.addArrangedSubview(keyLabel)
         row.addArrangedSubview(valueLabel)
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(spacer)
         return row
+    }
+
+    func makeControlLine(_ key: String, _ control: NSView) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 9
+
+        let keyLabel = promptLabel(key, size: 11, weight: .medium, color: .tertiaryLabelColor)
+        keyLabel.alignment = .right
+        keyLabel.translatesAutoresizingMaskIntoConstraints = false
+        keyLabel.widthAnchor.constraint(equalToConstant: 104).isActive = true
+
+        row.addArrangedSubview(keyLabel)
+        row.addArrangedSubview(control)
+        return row
+    }
+
+    func makePathControlLine(_ control: NSView) -> NSView {
+        let row = makeControlLine("Path", control) as! NSStackView
+        let help = NSButton(title: "?", target: self, action: #selector(showPathHelp(_:)))
+        help.bezelStyle = .helpButton
+        help.toolTip = "Show path wildcard examples."
+        row.addArrangedSubview(help)
+        return row
+    }
+
+    var selectedDuration: String {
+        guard let lifetimePopup, lifetimePopup.indexOfSelectedItem >= 0, lifetimePopup.indexOfSelectedItem < lifetimeOptions.count else {
+            return "run"
+        }
+        return lifetimeOptions[lifetimePopup.indexOfSelectedItem].1
+    }
+
+    var selectedPath: String {
+        pathField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "/"
+    }
+
+    var selectedMethods: [String]? {
+        guard let methodPopup,
+              methodPopup.indexOfSelectedItem >= 0,
+              methodPopup.indexOfSelectedItem < methodOptions.count else {
+            return nil
+        }
+        return methodOptions[methodPopup.indexOfSelectedItem].1
     }
 
     func promptCard() -> NSView {
         let view = NSView()
+        view.translatesAutoresizingMaskIntoConstraints = false
         view.wantsLayer = true
-        view.layer?.cornerRadius = 10
+        view.layer?.cornerRadius = 6
         view.layer?.cornerCurve = .continuous
-        view.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.58).cgColor
-        view.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.18).cgColor
+        view.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.22).cgColor
+        view.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.12).cgColor
         view.layer?.borderWidth = 0.5
         return view
     }
@@ -506,83 +1269,133 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
 
 func runAskNetworkPanel(input: GuardAskNetworkInput) -> GuardAskDecision {
     let target = input.target ?? "\(input.host)\(input.port.map { ":\($0)" } ?? "")"
-    let actor = input.command?.isEmpty == false ? input.command! : "Guard run"
+    let actorCommand = input.command?.isEmpty == false ? input.command! : "Guard run"
+    let actor = input.launcherApp?.isEmpty == false ? "\(actorCommand) via \(input.launcherApp!)" : actorCommand
+    let domainParts = input.host.split(separator: ".")
+    let wildcard = domainParts.count > 2 ? "*." + domainParts.suffix(domainParts.count - 2).joined(separator: ".") : "*.\(input.host)"
     let controller = GuardConnectionPromptController(
         titleText: "Connection Request",
         actor: actor,
         destination: target,
-        context: "A guarded process wants to open a network connection. This prompt only affects the current run.",
+        context: "Choose the narrowest network rule that fits this request.",
         scopeRows: [
-            ("Action", "Allow or deny this exact connection"),
-            ("Lifetime", "Once for this run"),
+            ("Type", "Destination only"),
+            ("TLS", "Not inspected; path and query are not visible here"),
             ("Profile", input.profile ?? "guard")
         ],
         detailRows: [
             ("Host", input.host),
             ("Port", input.port.map { "\($0)" } ?? "default"),
+            ("Launched By", input.launcherApp?.isEmpty == false ? input.launcherApp! : "Not recorded"),
+            ("Visibility", "Host and port before TLS handshake"),
             ("Project", input.projectDir ?? "Unknown"),
             ("Run", input.runDir ?? "Unknown")
         ],
         actions: [
             ("Deny", .deny, false),
-            ("Allow Once", .allowOnce, true)
-        ]
+            ("Allow", .allowOnce, true)
+        ],
+        scopeOptions: [
+            ("Exact host: \(input.host)", .allowDomain),
+            ("Subdomains: \(wildcard)", .allowPath)
+        ],
+        lifetimeOptions: promptLifetimeOptions()
     )
-    return GuardAskDecision(action: controller.run() == .allowOnce ? "allow" : "deny", rule: nil)
+    let choice = controller.run()
+    return GuardAskDecision(
+        action: choice == .deny ? "deny" : "allow",
+        rule: nil,
+        duration: controller.selectedDuration
+    )
 }
 
 func runAskHttpPolicyPanel(input: GuardAskHttpPolicyInput) -> GuardAskDecision {
     let request = input.request
-    let actor = input.command?.isEmpty == false ? input.command! : "Guard run"
+    let actorCommand = input.command?.isEmpty == false ? input.command! : "Guard run"
+    let actor = input.launcherApp?.isEmpty == false ? "\(actorCommand) via \(input.launcherApp!)" : actorCommand
     let suggestedPaths = input.suggestedRule.paths?.joined(separator: ", ") ?? "Any path"
     let suggestedMethods = input.suggestedRule.methods?.joined(separator: ", ") ?? "Any method"
     let controller = GuardConnectionPromptController(
         titleText: "HTTP Policy Request",
         actor: actor,
         destination: "\(request.method) \(request.host)\(request.path)",
-        context: "The proxy intercepted an HTTP request that needs a policy decision. Choose the narrowest rule that fits this workflow.",
+        context: "Choose the narrowest HTTP rule that fits this request.",
         scopeRows: [
-            ("Exact", "\(request.method) \(request.path) on \(request.host)"),
-            ("Path Rule", "\(suggestedMethods) \(suggestedPaths)"),
-            ("Domain Rule", "Any HTTP request to \(request.host)"),
-            ("Lifetime", "Temporary for this run")
+            ("Type", "HTTP request"),
+            ("TLS", "Inspected by iron-proxy for this guarded process"),
+            ("Suggested", "\(suggestedMethods) \(suggestedPaths)"),
+            ("Host", request.host)
         ],
         detailRows: [
             ("Host", request.host),
             ("Method", request.method),
             ("Path", request.path),
+            ("Launched By", input.launcherApp?.isEmpty == false ? input.launcherApp! : "Not recorded"),
+            ("Visibility", "Method, path, and query visible after TLS interception"),
             ("Profile", input.profile ?? "guard"),
             ("Project", input.projectDir ?? "Unknown"),
             ("Run", input.runDir ?? "Unknown")
         ],
         actions: [
             ("Deny", .deny, false),
-            ("Allow Exact", .allowExact, true),
-            ("Allow Path", .allowPath, false),
-            ("Allow Domain", .allowDomain, false)
-        ]
+            ("Allow", .allowExact, true)
+        ],
+        scopeOptions: [
+            ("Exact path", .allowExact),
+            ("Path group: \(suggestedPaths)", .allowPath),
+            ("Entire host: \(request.host)", .allowDomain)
+        ],
+        lifetimeOptions: promptLifetimeOptions(),
+        methodOptions: [
+            ("All methods", nil),
+            ("Only \(request.method)", [request.method]),
+            ("Read methods: GET, HEAD", ["GET", "HEAD"]),
+            ("Write methods: POST, PUT, PATCH, DELETE", ["POST", "PUT", "PATCH", "DELETE"])
+        ],
+        editablePath: request.path
     )
     switch controller.run() {
     case .allowExact:
         return GuardAskDecision(
             action: "allow",
-            rule: GuardHttpPolicyRule(host: request.host, cidr: nil, methods: [request.method], paths: [request.path])
+            rule: GuardHttpPolicyRule(host: request.host, cidr: nil, methods: controller.selectedMethods, paths: [controller.selectedPath]),
+            duration: controller.selectedDuration
         )
     case .allowPath:
-        return GuardAskDecision(action: "allow", rule: input.suggestedRule)
+        let path = controller.selectedPath
+        let rulePath = path == request.path ? (input.suggestedRule.paths?.first ?? path) : path
+        return GuardAskDecision(
+            action: "allow",
+            rule: GuardHttpPolicyRule(host: request.host, cidr: nil, methods: controller.selectedMethods, paths: [rulePath]),
+            duration: controller.selectedDuration
+        )
     case .allowDomain:
         return GuardAskDecision(
             action: "allow",
-            rule: GuardHttpPolicyRule(host: request.host, cidr: nil, methods: nil, paths: nil)
+            rule: GuardHttpPolicyRule(host: request.host, cidr: nil, methods: nil, paths: nil),
+            duration: controller.selectedDuration
         )
     default:
-        return GuardAskDecision(action: "deny", rule: nil)
+        return GuardAskDecision(action: "deny", rule: nil, duration: controller.selectedDuration)
     }
+}
+
+func promptLifetimeOptions() -> [(String, String)] {
+    [
+        ("Once", "once"),
+        ("5 minutes", "5m"),
+        ("1 hour", "1h"),
+        ("2 days", "2d"),
+        ("5 days", "5d"),
+        ("Forever", "forever")
+    ]
 }
 
 func runCliAskModeIfNeeded() -> Bool {
     guard CommandLine.arguments.count > 1 else { return false }
     let mode = CommandLine.arguments[1]
+    guard mode == "ask-network" || mode == "ask-http-policy" else { return false }
+    NSApp.setActivationPolicy(.accessory)
     do {
         if mode == "ask-network" {
             let input = try decodeJsonArgument(GuardAskNetworkInput.self)
@@ -595,7 +1408,7 @@ func runCliAskModeIfNeeded() -> Bool {
             return true
         }
     } catch {
-        emitDecision(GuardAskDecision(action: "deny", rule: nil))
+        emitDecision(GuardAskDecision(action: "deny", rule: nil, duration: nil))
         return true
     }
     return false
@@ -630,7 +1443,7 @@ final class HoverPolicySwitch: NSControl {
         wantsLayer = true
         toolTip = "Allow or deny this domain"
         translatesAutoresizingMaskIntoConstraints = false
-        widthAnchor.constraint(equalToConstant: 54).isActive = true
+        widthAnchor.constraint(equalToConstant: 62).isActive = true
         heightAnchor.constraint(equalToConstant: 24).isActive = true
     }
 
@@ -720,7 +1533,7 @@ final class HoverPolicySwitch: NSControl {
     }
 
     private func drawSymbol(_ name: String, in rect: NSRect, selected: Bool, color: NSColor) {
-        let symbolColor = selected ? NSColor.white : color
+        let symbolColor = selected ? NSColor.white : NSColor.tertiaryLabelColor
         symbolColor.setStroke()
         let path = NSBezierPath()
         path.lineWidth = 2.1
@@ -1210,6 +2023,10 @@ struct GuardMonitorEvent {
     let runDir: String
     let command: String
     let processPath: String
+    let launcherApp: String
+    let launcherProcess: String
+    let launcherPid: Int
+    let parentChain: String
     let pid: Int
     let bundleIdentifier: String
     let bytesSent: Int
@@ -1220,6 +2037,9 @@ struct GuardMonitorEvent {
     let detail: String
     let status: String
     let expiresAt: String
+    let duration: String
+    let rulePersisted: Bool
+    let ruleId: String
 }
 
 struct MonitorActivityRow {
@@ -1348,6 +2168,12 @@ final class GuardDaemonClient {
         )
     }
 
+    func addProject(root: String, label: String = "") -> GuardDaemonResponse? {
+        var body: [String: Any] = ["root": root]
+        if !label.isEmpty { body["label"] = label }
+        return request(path: "/projects", method: "POST", body: body)
+    }
+
     func mutateRule(profile: String, action: String, field: String, value: Any, disabled: Bool = false, ifMatch: String? = nil) -> GuardDaemonResponse? {
         var body: [String: Any] = ["action": action, "field": field, "disabled": disabled]
         if let ifMatch, !ifMatch.isEmpty { body["ifMatch"] = ifMatch }
@@ -1381,23 +2207,31 @@ final class GuardDaemonClient {
         )
     }
 
-    func postAlertDecision(profile: String, host: String, port: Int = 0, action: String, duration: String, ifMatch: String? = nil) -> GuardDaemonResponse? {
+    func postAlertDecision(profile: String, host: String, port: Int = 0, action: String, duration: String, method: String = "", path: String = "", scope: String = "", launcherApp: String = "", launcherProcess: String = "", launcherPid: Int = 0, parentChain: String = "", ifMatch: String? = nil) -> GuardDaemonResponse? {
         var body: [String: Any] = [
             "profile": profile,
             "host": host,
             "port": port,
             "action": action,
             "duration": duration,
+            "method": method,
+            "path": path,
+            "scope": scope,
+            "launcherApp": launcherApp,
+            "launcherProcess": launcherProcess,
+            "launcherPid": launcherPid,
+            "parentChain": parentChain,
             "reason": "monitor-alert-action"
         ]
         if let ifMatch, !ifMatch.isEmpty { body["ifMatch"] = ifMatch }
         return request(path: "/alerts/decision", method: "POST", body: body)
     }
 
-    func resolvePendingAlert(alertId: String, action: String, duration: String, ifMatch: String? = nil) -> GuardDaemonResponse? {
+    func resolvePendingAlert(alertId: String, action: String, duration: String, scope: String = "", ifMatch: String? = nil) -> GuardDaemonResponse? {
         var body: [String: Any] = [
             "action": action,
             "duration": duration,
+            "scope": scope,
             "reason": "monitor-pending-alert-action"
         ]
         if let ifMatch, !ifMatch.isEmpty { body["ifMatch"] = ifMatch }
@@ -1444,6 +2278,7 @@ enum MonitorInspectorTab: Int {
 }
 
 struct MonitorRuleRow {
+    let id: String
     let kind: String
     let action: String
     let scope: String
@@ -1452,12 +2287,188 @@ struct MonitorRuleRow {
     let source: String
     let field: String
     let value: Any
+    let layer: String
+    let lifetime: String
+    let approvalState: String
+    let notes: String
+    let expiresAt: String
+
+    init(
+        id: String = "",
+        kind: String,
+        action: String,
+        scope: String,
+        detail: String,
+        enabled: Bool,
+        source: String,
+        field: String,
+        value: Any,
+        layer: String = "",
+        lifetime: String = "persistent",
+        approvalState: String = "approved",
+        notes: String = "",
+        expiresAt: String = ""
+    ) {
+        self.id = id
+        self.kind = kind
+        self.action = action
+        self.scope = scope
+        self.detail = detail
+        self.enabled = enabled
+        self.source = source
+        self.field = field
+        self.value = value
+        self.layer = layer
+        self.lifetime = lifetime
+        self.approvalState = approvalState
+        self.notes = notes
+        self.expiresAt = expiresAt
+    }
 }
 
 struct MonitorTemplateRow {
     let name: String
     let description: String
     let detail: String
+}
+
+final class EventLogWindowController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate {
+    weak var parent: MonitorWindowController?
+    var window: NSWindow?
+    var events: [GuardMonitorEvent] = []
+    let tableView = NSTableView()
+    let detailView = NSTextView()
+    let statusLabel = NSTextField(labelWithString: "")
+
+    init(parent: MonitorWindowController) {
+        self.parent = parent
+        super.init()
+    }
+
+    func show() {
+        events = parent?.events ?? []
+        if let window {
+            tableView.reloadData()
+            statusLabel.stringValue = "\(events.count) loaded events"
+            window.makeKeyAndOrderFront(nil)
+            return
+        }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 560), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
+        window.title = "Guard Event Log"
+        window.delegate = self
+        window.isReleasedWhenClosed = false
+        window.setFrameAutosaveName("dev.guard.event-log.window")
+        window.center()
+
+        let split = NSSplitView()
+        split.isVertical = true
+        split.dividerStyle = .thin
+        split.translatesAutoresizingMaskIntoConstraints = false
+        let content = NSVisualEffectView()
+        content.material = .contentBackground
+        content.blendingMode = .behindWindow
+        content.state = .active
+        content.addSubview(split)
+        window.contentView = content
+        NSLayoutConstraint.activate([
+            split.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            split.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            split.topAnchor.constraint(equalTo: content.topAnchor),
+            split.bottomAnchor.constraint(equalTo: content.bottomAnchor)
+        ])
+
+        let tableScroll = NSScrollView()
+        tableScroll.hasVerticalScroller = true
+        tableView.headerView = NSTableHeaderView()
+        tableView.rowHeight = 28
+        tableView.usesAlternatingRowBackgroundColors = true
+        tableView.autosaveName = "dev.guard.event-log.columns"
+        tableView.autosaveTableColumns = true
+        tableView.dataSource = self
+        tableView.delegate = self
+        tableView.addTableColumn(column("time", "Time", 150))
+        tableView.addTableColumn(column("type", "Type", 170))
+        tableView.addTableColumn(column("target", "Target", 260))
+        tableView.addTableColumn(column("result", "Result", 90))
+        tableScroll.documentView = tableView
+
+        detailView.isEditable = false
+        detailView.isRichText = false
+        detailView.usesFindBar = true
+        detailView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        let detailScroll = NSScrollView()
+        detailScroll.hasVerticalScroller = true
+        detailScroll.documentView = detailView
+
+        split.addArrangedSubview(tableScroll)
+        split.addArrangedSubview(detailScroll)
+        tableScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 520).isActive = true
+        self.window = window
+        tableView.reloadData()
+        statusLabel.stringValue = "\(events.count) loaded events"
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    func column(_ identifier: String, _ title: String, _ width: CGFloat) -> NSTableColumn {
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(identifier))
+        column.title = title
+        column.width = width
+        column.minWidth = 60
+        return column
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        sender.orderOut(nil)
+        return false
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { events.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard row < events.count else { return nil }
+        let event = events[row]
+        let id = tableColumn?.identifier.rawValue ?? ""
+        let text: String
+        switch id {
+        case "time": text = event.at
+        case "type": text = event.type
+        case "target": text = event.target.isEmpty ? event.command : event.target
+        case "result": text = event.result
+        default: text = ""
+        }
+        let cell = NSTableCellView()
+        let label = NSTextField(labelWithString: text)
+        label.font = NSFont.systemFont(ofSize: 12)
+        label.lineBreakMode = .byTruncatingMiddle
+        label.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 6),
+            label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
+            label.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
+        ])
+        return cell
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        let row = tableView.selectedRow
+        guard row >= 0 && row < events.count else {
+            detailView.string = "Select an event."
+            return
+        }
+        let event = events[row]
+        detailView.string = [
+            "time: \(event.at)",
+            "type: \(event.type)",
+            "profile: \(event.profile)",
+            "process: \(event.command)",
+            "path: \(event.processPath)",
+            "target: \(event.target)",
+            "result: \(event.result)",
+            "rule: \(event.ruleId)",
+            "detail: \(event.detail)"
+        ].joined(separator: "\n")
+    }
 }
 
 final class TrafficSparklineView: NSView {
@@ -1478,7 +2489,9 @@ final class TrafficSparklineView: NSView {
         layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.42).cgColor
         translatesAutoresizingMaskIntoConstraints = false
         widthAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
-        heightAnchor.constraint(equalToConstant: 42).isActive = true
+        let defaultHeight = heightAnchor.constraint(equalToConstant: 42)
+        defaultHeight.priority = .defaultLow
+        defaultHeight.isActive = true
     }
 
     required init?(coder: NSCoder) {
@@ -1551,19 +2564,23 @@ final class FlippedStackView: NSStackView {
     override var isFlipped: Bool { true }
 }
 
-final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
+final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSOutlineViewDataSource, NSOutlineViewDelegate, NSMenuDelegate, NSToolbarDelegate {
     weak var parent: MonitorWindowController?
     let client: GuardDaemonClient?
     let tableView = NSTableView()
     let searchField = NSSearchField()
     let profilePopup = NSPopUpButton()
+    let sidebar = NSOutlineView()
+    let inspectorStack = NSStackView()
     let filterControl = NSSegmentedControl(labels: ["All", "Allow", "Deny", "HTTP", "Off"], trackingMode: .selectOne, target: nil, action: nil)
     let statusLabel = NSTextField(labelWithString: "")
+    weak var rulesToolbarSearchField: NSSearchField?
     var window: NSWindow?
     var profileNames: [String]
     var selectedProfile: String
     var rows: [MonitorRuleRow]
     var renderedRows: [MonitorRuleRow] = []
+    let sidebarSections = ["All Rules", "Active", "Deny", "Recent Changes", "Temporary", "Unapproved", "Rule Groups", "Blocklists"]
 
     init(client: GuardDaemonClient?, profileNames: [String], selectedProfile: String, rows: [MonitorRuleRow], parent: MonitorWindowController) {
         self.client = client
@@ -1588,14 +2605,26 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             defer: false
         )
         window.title = "Guard Rules"
-        window.titlebarAppearsTransparent = true
+        window.titlebarAppearsTransparent = false
+        let toolbar = NSToolbar(identifier: NSToolbar.Identifier("dev.guard.rules.toolbar"))
+        toolbar.delegate = self
+        toolbar.displayMode = .iconOnly
+        toolbar.allowsUserCustomization = true
+        toolbar.autosavesConfiguration = true
+        window.toolbar = toolbar
+        window.isReleasedWhenClosed = false
+        window.animationBehavior = .none
         window.delegate = self
+        window.setFrameAutosaveName("dev.guard.rules.window")
+        if #available(macOS 11.0, *) {
+            window.toolbarStyle = .unifiedCompact
+        }
         window.center()
 
         let root = NSStackView()
         root.orientation = .vertical
-        root.spacing = 8
-        root.edgeInsets = NSEdgeInsets(top: 12, left: 10, bottom: 8, right: 10)
+        root.spacing = 0
+        root.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 8, right: 0)
         root.translatesAutoresizingMaskIntoConstraints = false
         let content = NSVisualEffectView()
         content.material = .contentBackground
@@ -1610,9 +2639,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             root.bottomAnchor.constraint(equalTo: content.bottomAnchor)
         ])
 
-        root.addArrangedSubview(makeHeader())
-        root.addArrangedSubview(makeToolbar())
-        root.addArrangedSubview(makeTable())
+        root.addArrangedSubview(makeRulesSplitView())
         root.addArrangedSubview(makeActionBar())
 
         self.window = window
@@ -1622,55 +2649,120 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    func windowWillClose(_ notification: Notification) {
-        parent?.rulesWindowController = nil
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        sender.orderOut(nil)
+        return false
     }
 
-    func makeHeader() -> NSView {
-        let title = NSTextField(labelWithString: "Rules")
-        title.font = NSFont.systemFont(ofSize: 22, weight: .bold)
-        let subtitle = NSTextField(labelWithString: "Profile rules, disabled rules, HTTP filters, and rule sources.")
-        subtitle.font = NSFont.systemFont(ofSize: 12)
-        subtitle.textColor = .secondaryLabelColor
-        let stack = NSStackView(views: [title, subtitle])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 2
-        return stack
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [
+            NSToolbarItem.Identifier("rulesRefresh"),
+            NSToolbarItem.Identifier("rulesProfile"),
+            NSToolbarItem.Identifier("rulesFilter"),
+            NSToolbarItem.Identifier("rulesSearch"),
+            .flexibleSpace
+        ]
     }
 
-    func makeToolbar() -> NSView {
-        let row = NSStackView()
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 8
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        toolbarDefaultItemIdentifiers(toolbar) + [.space]
+    }
 
-        searchField.placeholderString = "Search rules"
-        searchField.target = self
-        searchField.action = #selector(filterChanged(_:))
-        searchField.translatesAutoresizingMaskIntoConstraints = false
-        searchField.widthAnchor.constraint(equalToConstant: 260).isActive = true
+    func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+        switch itemIdentifier.rawValue {
+        case "rulesRefresh":
+            item.label = "Refresh"
+            item.paletteLabel = "Refresh"
+            item.target = self
+            item.action = #selector(refresh(_:))
+            if #available(macOS 11.0, *) {
+                item.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Refresh")
+            }
+        case "rulesProfile":
+            item.label = "Profile"
+            item.paletteLabel = "Profile"
+            syncProfilePopup()
+            profilePopup.target = self
+            profilePopup.action = #selector(profileChanged(_:))
+            profilePopup.controlSize = .regular
+            profilePopup.widthAnchor.constraint(equalToConstant: 230).isActive = true
+            item.view = profilePopup
+        case "rulesFilter":
+            item.label = "Filter"
+            item.paletteLabel = "Filter"
+            filterControl.selectedSegment = 0
+            filterControl.target = self
+            filterControl.action = #selector(filterChanged(_:))
+            filterControl.segmentStyle = .texturedRounded
+            filterControl.controlSize = .regular
+            filterControl.widthAnchor.constraint(equalToConstant: 300).isActive = true
+            item.view = filterControl
+        case "rulesSearch":
+            if #available(macOS 11.0, *) {
+                let search = NSSearchToolbarItem(itemIdentifier: itemIdentifier)
+                search.label = "Search"
+                search.searchField.placeholderString = "Search rules"
+                search.searchField.target = self
+                search.searchField.action = #selector(rulesToolbarSearchChanged(_:))
+                rulesToolbarSearchField = search.searchField
+                return search
+            }
+            item.label = "Search"
+            item.target = self
+            item.action = #selector(focusRulesSearch(_:))
+            item.image = NSImage(named: NSImage.touchBarSearchTemplateName)
+        default:
+            return nil
+        }
+        return item
+    }
 
-        profilePopup.addItems(withTitles: profileNames)
-        profilePopup.selectItem(withTitle: selectedProfile)
-        profilePopup.target = self
-        profilePopup.action = #selector(profileChanged(_:))
+    @objc func rulesToolbarSearchChanged(_ sender: NSSearchField) {
+        searchField.stringValue = sender.stringValue
+        filterChanged(sender)
+    }
 
-        filterControl.selectedSegment = 0
-        filterControl.target = self
-        filterControl.action = #selector(filterChanged(_:))
+    @objc func focusRulesSearch(_ sender: Any?) {
+        window?.makeFirstResponder(rulesToolbarSearchField ?? searchField)
+    }
 
-        let refresh = NSButton(title: "Refresh", target: self, action: #selector(refresh(_:)))
-        refresh.bezelStyle = .rounded
+    func makeRulesSplitView() -> NSView {
+        let split = NSSplitView()
+        split.isVertical = true
+        split.dividerStyle = .thin
+        split.translatesAutoresizingMaskIntoConstraints = false
+        split.heightAnchor.constraint(greaterThanOrEqualToConstant: 500).isActive = true
 
-        row.addArrangedSubview(searchField)
-        row.addArrangedSubview(profilePopup)
-        row.addArrangedSubview(filterControl)
-        row.addArrangedSubview(refresh)
-        let spacer = NSView()
-        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        row.addArrangedSubview(spacer)
-        return row
+        let sidebarScroll = NSScrollView()
+        sidebarScroll.borderType = .noBorder
+        sidebarScroll.hasVerticalScroller = true
+        sidebar.headerView = nil
+        sidebar.rowHeight = 28
+        if #available(macOS 11.0, *) {
+            sidebar.style = .sourceList
+        }
+        sidebar.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("section")))
+        sidebar.outlineTableColumn = sidebar.tableColumns.first
+        sidebar.dataSource = self
+        sidebar.delegate = self
+        sidebar.target = self
+        sidebar.action = #selector(ruleSidebarChanged(_:))
+        sidebarScroll.documentView = sidebar
+        sidebar.reloadData()
+        sidebar.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        let table = makeTable()
+        let inspector = makeRuleInspector()
+        sidebarScroll.translatesAutoresizingMaskIntoConstraints = false
+        table.translatesAutoresizingMaskIntoConstraints = false
+        inspector.translatesAutoresizingMaskIntoConstraints = false
+        split.addArrangedSubview(sidebarScroll)
+        split.addArrangedSubview(table)
+        split.addArrangedSubview(inspector)
+        sidebarScroll.widthAnchor.constraint(equalToConstant: 190).isActive = true
+        table.widthAnchor.constraint(greaterThanOrEqualToConstant: 700).isActive = true
+        inspector.widthAnchor.constraint(equalToConstant: 230).isActive = true
+        return split
     }
 
     func syncProfilePopup() {
@@ -1683,23 +2775,63 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
     func makeTable() -> NSView {
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
-        scroll.borderType = .lineBorder
+        scroll.hasHorizontalScroller = false
+        scroll.borderType = .noBorder
         scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 430).isActive = true
+        scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 500).isActive = true
         tableView.headerView = NSTableHeaderView()
         tableView.usesAlternatingRowBackgroundColors = true
         tableView.allowsMultipleSelection = true
         tableView.rowHeight = 30
         tableView.dataSource = self
         tableView.delegate = self
-        tableView.addTableColumn(column("state", "State", 70))
-        tableView.addTableColumn(column("action", "Action", 80))
-        tableView.addTableColumn(column("kind", "Kind", 90))
-        tableView.addTableColumn(column("scope", "Scope", 260))
-        tableView.addTableColumn(column("detail", "Detail", 300))
-        tableView.addTableColumn(column("source", "Source", 120))
+        let menu = NSMenu(title: "Rule Actions")
+        menu.delegate = self
+        tableView.menu = menu
+        tableView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
+        tableView.addTableColumn(column("state", "State", 54))
+        tableView.addTableColumn(column("action", "Action", 82))
+        tableView.addTableColumn(column("kind", "Kind", 108))
+        tableView.addTableColumn(column("scope", "Scope", 320))
+        tableView.addTableColumn(column("detail", "Detail", 210))
+        tableView.addTableColumn(column("lifetime", "Lifetime", 86))
+        tableView.addTableColumn(column("approval", "Review", 76))
+        tableView.autosaveName = "dev.guard.rules.columns"
+        tableView.autosaveTableColumns = true
+        tableView.sortDescriptors = [
+            NSSortDescriptor(key: "kind", ascending: true),
+            NSSortDescriptor(key: "scope", ascending: true)
+        ]
         scroll.documentView = tableView
+        DispatchQueue.main.async {
+            self.resizeRulesColumns()
+            self.resetRulesTableScrollOrigin()
+        }
         return scroll
+    }
+
+    func makeRuleInspector() -> NSView {
+        let panel = NSVisualEffectView()
+        panel.material = .sidebar
+        panel.blendingMode = .withinWindow
+        panel.state = .active
+        panel.translatesAutoresizingMaskIntoConstraints = false
+        panel.widthAnchor.constraint(greaterThanOrEqualToConstant: 210).isActive = true
+
+        inspectorStack.orientation = .vertical
+        inspectorStack.alignment = .leading
+        inspectorStack.spacing = 8
+        inspectorStack.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
+        inspectorStack.translatesAutoresizingMaskIntoConstraints = false
+        panel.addSubview(inspectorStack)
+        NSLayoutConstraint.activate([
+            inspectorStack.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
+            inspectorStack.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
+            inspectorStack.topAnchor.constraint(equalTo: panel.topAnchor),
+            inspectorStack.bottomAnchor.constraint(lessThanOrEqualTo: panel.bottomAnchor)
+        ])
+        renderInspector()
+        return panel
     }
 
     func makeActionBar() -> NSView {
@@ -1707,9 +2839,11 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 8
+        row.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 0, right: 12)
         statusLabel.font = NSFont.systemFont(ofSize: 12)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        statusLabel.lineBreakMode = .byTruncatingTail
         let enable = NSButton(title: "Enable", target: self, action: #selector(enableSelected(_:)))
         let disable = NSButton(title: "Disable", target: self, action: #selector(disableSelected(_:)))
         let delete = NSButton(title: "Delete", target: self, action: #selector(deleteSelected(_:)))
@@ -1735,7 +2869,42 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         return column
     }
 
+    func resizeRulesColumns() {
+        guard tableView.numberOfColumns >= 6 else { return }
+        let available = tableView.enclosingScrollView?.contentView.bounds.width ?? tableView.bounds.width
+        guard available > 0 else { return }
+        let fixed: CGFloat = 54 + 82 + 108 + 86 + 76
+        let remaining = max(320, available - fixed - 12)
+        let scopeWidth = floor(remaining * 0.58)
+        let detailWidth = floor(remaining - scopeWidth)
+        let widths: [String: CGFloat] = [
+            "state": 54,
+            "action": 82,
+            "kind": 108,
+            "scope": max(260, scopeWidth),
+            "detail": max(160, detailWidth),
+            "lifetime": 86,
+            "approval": 76
+        ]
+        for column in tableView.tableColumns {
+            guard let width = widths[column.identifier.rawValue] else { continue }
+            column.width = width
+            column.minWidth = min(width, 70)
+        }
+    }
+
+    func resetRulesTableScrollOrigin() {
+        guard let clipView = tableView.enclosingScrollView?.contentView else { return }
+        let current = clipView.bounds.origin
+        clipView.scroll(to: NSPoint(x: 0, y: current.y))
+        tableView.enclosingScrollView?.reflectScrolledClipView(clipView)
+    }
+
     @objc func filterChanged(_ sender: Any?) {
+        renderRows()
+    }
+
+    @objc func ruleSidebarChanged(_ sender: Any?) {
         renderRows()
     }
 
@@ -1754,6 +2923,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
     func renderRows() {
         let search = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let filter = filterControl.selectedSegment
+        let selectedSection = sidebar.selectedRow >= 0 ? sidebarSections[safe: sidebar.selectedRow] ?? "All Rules" : "All Rules"
         renderedRows = rows.filter { row in
             let text = [row.kind, row.action, row.scope, row.detail, row.source].joined(separator: " ").lowercased()
             let matchesSearch = search.isEmpty || text.contains(search)
@@ -1765,10 +2935,155 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             case 4: matchesFilter = !row.enabled
             default: matchesFilter = true
             }
-            return matchesSearch && matchesFilter
+            let matchesSection: Bool
+            switch selectedSection {
+            case "Active": matchesSection = row.enabled
+            case "Deny": matchesSection = row.action == "deny"
+            case "Recent Changes": matchesSection = !row.detail.isEmpty || !row.id.isEmpty
+            case "Temporary": matchesSection = row.lifetime != "persistent"
+            case "Unapproved": matchesSection = row.approvalState != "approved"
+            case "Rule Groups": matchesSection = row.kind == "HTTP" || row.kind == "Domain"
+            case "Blocklists": matchesSection = row.action == "deny" && row.kind == "Domain"
+            default: matchesSection = true
+            }
+            return matchesSearch && matchesFilter && matchesSection
         }
         tableView.reloadData()
-        statusLabel.stringValue = "\(renderedRows.count) visible of \(rows.count) rules."
+        resizeRulesColumns()
+        resetRulesTableScrollOrigin()
+        if !renderedRows.isEmpty && tableView.selectedRow < 0 {
+            tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        }
+        sidebar.reloadData()
+        renderInspector()
+        statusLabel.stringValue = rows.isEmpty
+            ? "No rules are loaded for \(selectedProfile). Connect guardd or select another profile."
+            : "\(renderedRows.count) visible of \(rows.count) rules."
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        renderInspector()
+    }
+
+    func renderInspector() {
+        for view in inspectorStack.arrangedSubviews {
+            inspectorStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        guard tableView.selectedRow >= 0, tableView.selectedRow < renderedRows.count else {
+            inspectorStack.addArrangedSubview(inspectorLabel("Rule Inspector", weight: .semibold))
+            inspectorStack.addArrangedSubview(inspectorLabel("Select a rule to review scope, lifetime, approval, source, and notes.", color: .secondaryLabelColor))
+            return
+        }
+        let rule = renderedRows[tableView.selectedRow]
+        inspectorStack.addArrangedSubview(inspectorLabel(rule.scope, weight: .semibold))
+        inspectorStack.addArrangedSubview(inspectorBadge(rule.enabled ? "Enabled" : "Disabled", color: rule.enabled ? .systemGreen : .secondaryLabelColor))
+        for (key, value) in [
+            ("Action", rule.action.capitalized),
+            ("Layer", rule.layer.isEmpty ? rule.kind : rule.layer),
+            ("Lifetime", rule.lifetime),
+            ("Review", rule.approvalState),
+            ("Source", rule.source),
+            ("Detail", rule.detail.isEmpty ? "None" : rule.detail),
+            ("Notes", rule.notes.isEmpty ? "None" : rule.notes)
+        ] {
+            inspectorStack.addArrangedSubview(inspectorLabel("\(key): \(value)", color: .labelColor))
+        }
+    }
+
+    func inspectorLabel(_ text: String, weight: NSFont.Weight = .regular, color: NSColor = .labelColor) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = NSFont.systemFont(ofSize: weight == .semibold ? 13 : 11.5, weight: weight)
+        label.textColor = color
+        label.maximumNumberOfLines = 0
+        label.lineBreakMode = .byWordWrapping
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return label
+    }
+
+    func inspectorBadge(_ text: String, color: NSColor) -> NSView {
+        let field = inspectorLabel(text, weight: .semibold, color: color)
+        let box = NSBox()
+        box.boxType = .custom
+        box.borderType = .lineBorder
+        box.borderColor = color.withAlphaComponent(0.22)
+        box.fillColor = color.withAlphaComponent(0.10)
+        box.cornerRadius = 6
+        box.translatesAutoresizingMaskIntoConstraints = false
+        field.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(field)
+        NSLayoutConstraint.activate([
+            field.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 7),
+            field.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -7),
+            field.topAnchor.constraint(equalTo: box.topAnchor, constant: 3),
+            field.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -3)
+        ])
+        return box
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
+        item == nil ? sidebarSections.count : 0
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
+        sidebarSections[index]
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
+        false
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
+        let title = item as? String ?? ""
+        let cell = NSTableCellView()
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 6
+        row.translatesAutoresizingMaskIntoConstraints = false
+        let icon = NSImageView()
+        if #available(macOS 11.0, *) {
+            icon.image = NSImage(systemSymbolName: sidebarSymbol(for: title), accessibilityDescription: title)
+            icon.contentTintColor = .secondaryLabelColor
+        }
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.widthAnchor.constraint(equalToConstant: 16).isActive = true
+        let count = sidebarCount(for: title)
+        let label = NSTextField(labelWithString: count > 0 && title != "All Rules" ? "\(title)  \(count)" : title)
+        label.font = NSFont.systemFont(ofSize: 12, weight: title == "All Rules" ? .semibold : .regular)
+        row.addArrangedSubview(icon)
+        row.addArrangedSubview(label)
+        cell.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
+            row.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
+            row.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
+        ])
+        return cell
+    }
+
+    func sidebarSymbol(for title: String) -> String {
+        switch title {
+        case "Active": return "checkmark.circle"
+        case "Deny": return "xmark.octagon"
+        case "Recent Changes": return "clock.arrow.circlepath"
+        case "Temporary": return "timer"
+        case "Unapproved": return "smallcircle.filled.circle"
+        case "Rule Groups": return "folder"
+        case "Blocklists": return "hand.raised"
+        default: return "list.bullet"
+        }
+    }
+
+    func sidebarCount(for title: String) -> Int {
+        switch title {
+        case "Active": return rows.filter { $0.enabled }.count
+        case "Deny": return rows.filter { $0.action == "deny" }.count
+        case "Temporary": return rows.filter { $0.lifetime != "persistent" }.count
+        case "Unapproved": return rows.filter { $0.approvalState != "approved" }.count
+        case "Blocklists": return rows.filter { $0.action == "deny" && $0.kind == "Domain" }.count
+        default: return rows.count
+        }
     }
 
     func selectedRule() -> MonitorRuleRow? {
@@ -1805,11 +3120,26 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
     }
 
     @objc func closeWindow(_ sender: Any?) {
-        window?.close()
+        window?.orderOut(nil)
     }
 
     func mutateSelected(action: String) {
         mutateRules(selectedRules(), action: action)
+    }
+
+    func isMutableRule(_ row: MonitorRuleRow) -> Bool {
+        switch row.field {
+        case "network.allowedDomains",
+             "network.deniedDomains",
+             "network.httpRules",
+             "filesystem.allowRead",
+             "filesystem.allowWrite",
+             "filesystem.denyRead",
+             "filesystem.denyWrite":
+            return true
+        default:
+            return false
+        }
     }
 
     func mutateRules(_ targetRows: [MonitorRuleRow], action: String) {
@@ -1817,8 +3147,13 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             statusLabel.stringValue = "guardd must be connected before editing rules."
             return
         }
+        let editableRows = targetRows.filter(isMutableRule)
+        guard !editableRows.isEmpty else {
+            statusLabel.stringValue = "Selected rules are derived from runtime settings and cannot be edited here yet."
+            return
+        }
         var changed = 0
-        for row in targetRows {
+        for row in editableRows {
             guard let response = client.mutateRule(
                 profile: selectedProfile,
                 action: action,
@@ -1843,7 +3178,8 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             }
             changed += 1
         }
-        statusLabel.stringValue = "\(action.capitalized) \(changed) rule\(changed == 1 ? "" : "s")."
+        let skipped = targetRows.count - editableRows.count
+        statusLabel.stringValue = "\(action.capitalized) \(changed) rule\(changed == 1 ? "" : "s")\(skipped > 0 ? "; \(skipped) derived rule\(skipped == 1 ? "" : "s") skipped." : ".")"
         parent?.didMutateRules(profile: selectedProfile)
         rows = parent?.ruleRows ?? rows
         renderRows()
@@ -1864,10 +3200,53 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         case "kind": text = rule.kind
         case "scope": text = rule.scope
         case "detail": text = rule.detail
+        case "lifetime": text = rule.lifetime
+        case "approval": text = rule.approvalState
         case "source": text = rule.source
         default: text = ""
         }
         let cell = NSTableCellView()
+        if id == "state" {
+            let toggle = NSButton(checkboxWithTitle: "", target: self, action: #selector(toggleRuleCheckbox(_:)))
+            toggle.state = rule.enabled ? .on : .off
+            toggle.tag = row
+            toggle.translatesAutoresizingMaskIntoConstraints = false
+            cell.addSubview(toggle)
+            NSLayoutConstraint.activate([
+                toggle.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
+                toggle.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
+            ])
+            return cell
+        }
+        if id == "action" || id == "kind" || id == "lifetime" {
+            let rowView = NSStackView()
+            rowView.orientation = .horizontal
+            rowView.alignment = .centerY
+            rowView.spacing = 5
+            rowView.translatesAutoresizingMaskIntoConstraints = false
+            let icon = NSImageView()
+            if #available(macOS 11.0, *) {
+                icon.image = NSImage(systemSymbolName: ruleSymbol(rule, column: id), accessibilityDescription: text)
+                icon.contentTintColor = id == "action"
+                    ? (rule.action == "deny" ? .systemRed : .systemGreen)
+                    : .secondaryLabelColor
+            }
+            icon.translatesAutoresizingMaskIntoConstraints = false
+            icon.widthAnchor.constraint(equalToConstant: 15).isActive = true
+            let label = NSTextField(labelWithString: text)
+            label.font = NSFont.systemFont(ofSize: 12, weight: id == "action" ? .semibold : .regular)
+            label.lineBreakMode = .byTruncatingTail
+            label.textColor = id == "action" ? (rule.action == "deny" ? .systemRed : .systemGreen) : .labelColor
+            rowView.addArrangedSubview(icon)
+            rowView.addArrangedSubview(label)
+            cell.addSubview(rowView)
+            NSLayoutConstraint.activate([
+                rowView.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 6),
+                rowView.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
+                rowView.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
+            ])
+            return cell
+        }
         let label = NSTextField(labelWithString: text)
         label.font = NSFont.systemFont(ofSize: 12)
         label.lineBreakMode = .byTruncatingMiddle
@@ -1885,14 +3264,465 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         ])
         return cell
     }
+
+    func ruleSymbol(_ rule: MonitorRuleRow, column: String) -> String {
+        if column == "action" {
+            return rule.action == "deny" ? "xmark.octagon.fill" : "checkmark.circle.fill"
+        }
+        if column == "lifetime" {
+            return rule.lifetime == "persistent" ? "infinity" : "timer"
+        }
+        switch rule.kind {
+        case "HTTP": return "arrow.left.arrow.right"
+        case "Raw TCP": return "point.3.connected.trianglepath.dotted"
+        case "Filesystem": return "folder"
+        case "Domain": return "globe"
+        default: return "slider.horizontal.3"
+        }
+    }
+
+    @objc func toggleRuleCheckbox(_ sender: NSButton) {
+        guard sender.tag >= 0 && sender.tag < renderedRows.count else { return }
+        mutateRules([renderedRows[sender.tag]], action: sender.state == .on ? "enable" : "disable")
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        guard selectedRule() != nil else { return }
+        menu.addItem(withTitle: "Enable Rule", action: #selector(enableSelected(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: "Disable Rule", action: #selector(disableSelected(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: "Delete Rule", action: #selector(deleteSelected(_:)), keyEquivalent: "")
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Copy Scope", action: #selector(copySelectedRuleScope(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: "Open Inspector", action: #selector(showSelectedRuleInspector(_:)), keyEquivalent: "")
+        for item in menu.items { item.target = self }
+    }
+
+    @objc func copySelectedRuleScope(_ sender: Any?) {
+        guard let rule = selectedRule() else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(rule.scope, forType: .string)
+    }
+
+    @objc func showSelectedRuleInspector(_ sender: Any?) {
+        guard let rule = selectedRule() else { return }
+        let alert = NSAlert()
+        alert.messageText = rule.scope
+        alert.informativeText = [
+            "Action: \(rule.action)",
+            "Layer: \(rule.layer.isEmpty ? rule.kind : rule.layer)",
+            "Lifetime: \(rule.lifetime)",
+            "Review: \(rule.approvalState)",
+            "Source: \(rule.source)",
+            rule.notes.isEmpty ? nil : "Notes: \(rule.notes)"
+        ].compactMap { $0 }.joined(separator: "\n")
+        alert.addButton(withTitle: "OK")
+        if let window {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
+    }
 }
 
-final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
+final class SettingsWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate {
+    enum Pane: String, CaseIterable {
+        case general = "General"
+        case alerts = "Alerts"
+        case proxyTLS = "Proxy / TLS"
+        case daemon = "Daemon"
+        case extensionStatus = "Network Extension"
+        case privacy = "Privacy"
+        case advanced = "Advanced"
+
+        var symbolName: String {
+            switch self {
+            case .general: return "gearshape"
+            case .alerts: return "bell.badge"
+            case .proxyTLS: return "lock.shield"
+            case .daemon: return "server.rack"
+            case .extensionStatus: return "network"
+            case .privacy: return "hand.raised"
+            case .advanced: return "wrench.and.screwdriver"
+            }
+        }
+    }
+
+    weak var parent: MonitorWindowController?
+    var window: NSWindow?
+    var selectedPane: Pane = .general
+    let contentStack = NSStackView()
+    let toolbarIdentifier = NSToolbar.Identifier("dev.guard.monitor.settings.toolbar")
+
+    init(parent: MonitorWindowController) {
+        self.parent = parent
+    }
+
+    func show() {
+        if let window = window {
+            render()
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 420),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = selectedPane.rawValue
+        window.titleVisibility = .visible
+        window.titlebarAppearsTransparent = false
+        window.minSize = NSSize(width: 660, height: 360)
+        window.isReleasedWhenClosed = false
+        window.animationBehavior = .none
+        window.delegate = self
+        window.setFrameAutosaveName("dev.guard.settings.window")
+        if #available(macOS 11.0, *) {
+            window.toolbarStyle = .preference
+        }
+        window.center()
+        let toolbar = NSToolbar(identifier: toolbarIdentifier)
+        toolbar.delegate = self
+        toolbar.displayMode = .iconAndLabel
+        toolbar.sizeMode = .regular
+        toolbar.allowsUserCustomization = false
+        toolbar.autosavesConfiguration = false
+        toolbar.selectedItemIdentifier = toolbarItemIdentifier(for: selectedPane)
+        window.toolbar = toolbar
+
+        let background = NSVisualEffectView()
+        background.material = .contentBackground
+        background.blendingMode = .behindWindow
+        background.state = .active
+        background.translatesAutoresizingMaskIntoConstraints = false
+        window.contentView = background
+
+        contentStack.orientation = .vertical
+        contentStack.alignment = .width
+        contentStack.spacing = 14
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        background.addSubview(contentStack)
+        NSLayoutConstraint.activate([
+            contentStack.topAnchor.constraint(equalTo: background.topAnchor, constant: 36),
+            contentStack.centerXAnchor.constraint(equalTo: background.centerXAnchor),
+            contentStack.widthAnchor.constraint(equalToConstant: 620),
+            contentStack.bottomAnchor.constraint(lessThanOrEqualTo: background.bottomAnchor, constant: -24)
+        ])
+
+        self.window = window
+        render()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        sender.orderOut(nil)
+        return false
+    }
+
+    func toolbarItemIdentifier(for pane: Pane) -> NSToolbarItem.Identifier {
+        NSToolbarItem.Identifier("dev.guard.monitor.settings.\(pane.rawValue)")
+    }
+
+    func pane(for identifier: NSToolbarItem.Identifier) -> Pane? {
+        Pane.allCases.first { toolbarItemIdentifier(for: $0) == identifier }
+    }
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        Pane.allCases.map(toolbarItemIdentifier(for:))
+    }
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        Pane.allCases.map(toolbarItemIdentifier(for:))
+    }
+
+    func toolbarSelectableItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        Pane.allCases.map(toolbarItemIdentifier(for:))
+    }
+
+    func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        guard let pane = pane(for: itemIdentifier) else { return nil }
+        let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+        item.label = pane.rawValue
+        item.paletteLabel = pane.rawValue
+        item.toolTip = pane.rawValue
+        item.target = self
+        item.action = #selector(selectToolbarPane(_:))
+        if #available(macOS 11.0, *) {
+            let image = NSImage(systemSymbolName: pane.symbolName, accessibilityDescription: pane.rawValue)
+            image?.isTemplate = true
+            image?.size = NSSize(width: 28, height: 28)
+            item.image = image
+        }
+        return item
+    }
+
+    @objc func selectToolbarPane(_ sender: NSToolbarItem) {
+        guard let pane = pane(for: sender.itemIdentifier) else {
+            return
+        }
+        selectedPane = pane
+        render()
+    }
+
+    func render() {
+        window?.title = selectedPane.rawValue
+        window?.toolbar?.selectedItemIdentifier = toolbarItemIdentifier(for: selectedPane)
+        for view in contentStack.arrangedSubviews {
+            contentStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        switch selectedPane {
+        case .general: renderGeneral()
+        case .alerts: renderAlerts()
+        case .proxyTLS: renderProxyTLS()
+        case .daemon: renderDaemon()
+        case .extensionStatus: renderExtension()
+        case .privacy: renderPrivacy()
+        case .advanced: renderAdvanced()
+        }
+    }
+
+    func renderGeneral() {
+        addHeader("General", "")
+        let trafficOptions = ["15 minutes", "30 minutes", "1 hour", "All events"]
+        let trafficSelection: String
+        if let minutes = parent?.monitorTimeWindowMinutes {
+            trafficSelection = minutes == 60 ? "1 hour" : "\(minutes) minutes"
+        } else {
+            trafficSelection = "All events"
+        }
+        addControlSection("Current Profile", rows: [
+            ("Profile", readOnlyText(parent?.selectedProfileName.isEmpty == false ? parent?.selectedProfileName ?? "guard" : "guard")),
+            ("Traffic Window", popup(trafficOptions, selected: trafficSelection, defaultsKey: "dev.guard.settings.trafficWindow")),
+            ("Events", readOnlyText("\(parent?.events.count ?? 0) loaded")),
+            ("Top Host", readOnlyText(parent?.recentTopHost ?? "-"))
+        ], actions: [
+            actionButton("Refresh", #selector(MonitorWindowController.reloadEvents(_:)))
+        ])
+    }
+
+    func renderAlerts() {
+        addHeader("Alerts", "")
+        addControlSection("Prompt Service", rows: [
+            ("Alert Mode", popup(["Ask", "Allow silently", "Deny silently"], selected: "Ask", defaultsKey: "dev.guard.settings.alertMode")),
+            ("Default Lifetime", popup(["Once", "5 minutes", "1 hour", "2 days", "5 days", "Forever"], selected: "5 minutes", defaultsKey: "dev.guard.settings.defaultLifetime")),
+            ("Pending Alerts", readOnlyText(parent?.pendingAlertSummaryText ?? "Unavailable")),
+            ("Default Scope", popup(["Exact host", "Subdomains", "Any destination"], selected: "Exact host", defaultsKey: "dev.guard.settings.defaultScope")),
+            ("Bind To", readOnlyText("Profile, actor, destination, launcher"))
+        ], actions: [])
+    }
+
+    func renderProxyTLS() {
+        addHeader("Proxy / TLS", "")
+        addControlSection("TLS Inspection", rows: [
+            ("Inspection", switchControl(isOn: !(parent?.tlsStateText.localizedCaseInsensitiveContains("disabled") ?? false), enabled: false)),
+            ("Profile State", readOnlyText(parent?.tlsStateText ?? "Unknown")),
+            ("Trust", readOnlyText(parent?.tlsTrustText ?? "Unavailable")),
+            ("Recent Status", readOnlyText(parent?.tlsInspectionStatus() ?? "Unknown")),
+            ("Inspection", buttonRow([
+                actionButton("Enable", #selector(MonitorWindowController.enableTLS(_:))),
+                actionButton("Disable", #selector(MonitorWindowController.disableTLS(_:)))
+            ])),
+            ("Certificate", buttonRow([
+                actionButton("Generate CA", #selector(MonitorWindowController.generateTLSCA(_:))),
+                actionButton("Rotate CA", #selector(MonitorWindowController.rotateTLSCA(_:))),
+                actionButton("Revoke CA", #selector(MonitorWindowController.revokeTLSCA(_:)))
+            ]))
+        ], actions: [])
+    }
+
+    func renderDaemon() {
+        addHeader("Daemon", "")
+        addControlSection("guardd", rows: [
+            ("Run Daemon", switchControl(isOn: parent?.daemonConnected ?? false, enabled: false)),
+            ("State", readOnlyText(parent?.daemonStatusText ?? "offline")),
+            ("Health", readOnlyText(parent?.daemonHealthText ?? "Not checked")),
+            ("API", readOnlyText(parent?.daemonURLHint() ?? "Unavailable")),
+            ("Policy Root", readOnlyText(parent?.defaultDaemonPolicyRoot() ?? "Unavailable"))
+        ], actions: [
+            actionButton("Start", #selector(MonitorWindowController.startDaemon(_:))),
+            actionButton("Stop", #selector(MonitorWindowController.stopDaemon(_:)))
+        ])
+    }
+
+    func renderExtension() {
+        addHeader("Network Extension", "")
+        addControlSection("Extension State", rows: [
+            ("Network Filter", switchControl(isOn: false, enabled: false)),
+            ("Status", readOnlyText(parent?.extensionSyncText ?? "Not checked")),
+            ("Backend", readOnlyText("Proxy and sandbox fallback")),
+            ("Purpose", readOnlyText("Direct egress and bypass detection")),
+            ("Approval", readOnlyText("Open macOS Network settings to approve the extension when packaged."))
+        ], actions: [
+            actionButton("Sync", #selector(MonitorWindowController.syncExtension(_:))),
+            actionButton("Invalidate", #selector(MonitorWindowController.invalidateExtension(_:))),
+            actionButton("Open Network Settings", #selector(MonitorWindowController.openNetworkSettings(_:)))
+        ])
+    }
+
+    func renderPrivacy() {
+        addHeader("Privacy", "")
+        addControlSection("Local Data", rows: [
+            ("Event Log", readOnlyText(parent?.eventLogPath() ?? "Unavailable")),
+            ("Retention", popup(["1 hour", "24 hours", "7 days", "30 days"], selected: "1 hour", defaultsKey: "dev.guard.settings.retention")),
+            ("HTTP Details", readOnlyText("Only with TLS inspection"))
+        ], actions: [
+            actionButton("Open Log", #selector(MonitorWindowController.revealLog(_:)))
+        ])
+    }
+
+    func renderAdvanced() {
+        addHeader("Advanced", "")
+        addControlSection("Security Posture", rows: [
+            ("Status", readOnlyText(parent?.securityStatusText ?? "Not checked")),
+            ("Templates", readOnlyText(parent?.templatesSummaryText ?? "Unavailable")),
+            ("Rule Store", readOnlyText(parent?.profileSummaryText ?? "Unavailable"))
+        ], actions: [
+            actionButton("Rules", #selector(MonitorWindowController.openRulesWindow(_:))),
+            actionButton("Templates", #selector(MonitorWindowController.openTemplatesWindow(_:))),
+            actionButton("Refresh", #selector(MonitorWindowController.reloadEvents(_:)))
+        ])
+    }
+
+    func addHeader(_ title: String, _ subtitle: String) {
+        guard !subtitle.isEmpty else { return }
+        let subtitleLabel = label(subtitle, size: 13, weight: .regular, color: .secondaryLabelColor)
+        subtitleLabel.maximumNumberOfLines = 2
+        subtitleLabel.lineBreakMode = .byWordWrapping
+        subtitleLabel.alignment = .center
+        let stack = NSStackView(views: [subtitleLabel])
+        stack.orientation = .vertical
+        stack.alignment = .width
+        stack.spacing = 3
+        contentStack.addArrangedSubview(stack)
+    }
+
+    func addSection(_ title: String, rows: [(String, String)], actions: [NSButton]) {
+        addControlSection(title, rows: rows.map { ($0.0, valueLabel($0.1)) }, actions: actions)
+    }
+
+    func addControlSection(_ title: String, rows: [(String, NSView)], actions: [NSButton]) {
+        let grid = NSGridView()
+        grid.translatesAutoresizingMaskIntoConstraints = false
+        grid.rowSpacing = 13
+        grid.columnSpacing = 14
+        for row in rows {
+            let gridRow = grid.addRow(with: [settingLabel(row.0), row.1])
+            gridRow.yPlacement = .center
+        }
+        if !actions.isEmpty {
+            let actionStack = NSStackView(views: actions)
+            actionStack.orientation = .horizontal
+            actionStack.alignment = .centerY
+            actionStack.spacing = 8
+            let gridRow = grid.addRow(with: [settingLabel(""), actionStack])
+            gridRow.yPlacement = .center
+        }
+        grid.column(at: 0).xPlacement = .trailing
+        grid.column(at: 1).xPlacement = .leading
+        grid.column(at: 1).width = 480
+        contentStack.addArrangedSubview(grid)
+    }
+
+    func settingLabel(_ title: String) -> NSTextField {
+        let titleLabel = label(title, size: 12, weight: .medium, color: .secondaryLabelColor)
+        titleLabel.alignment = .right
+        titleLabel.widthAnchor.constraint(equalToConstant: 170).isActive = true
+        return titleLabel
+    }
+
+    func valueLabel(_ value: String) -> NSTextField {
+        let valueLabel = label(value, size: 13, weight: .regular)
+        valueLabel.maximumNumberOfLines = 3
+        valueLabel.lineBreakMode = .byWordWrapping
+        valueLabel.widthAnchor.constraint(equalToConstant: 480).isActive = true
+        valueLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return valueLabel
+    }
+
+    func readOnlyText(_ value: String) -> NSTextField {
+        let field = valueLabel(value)
+        field.textColor = .labelColor
+        return field
+    }
+
+    func popup(_ options: [String], selected: String, defaultsKey: String = "") -> NSPopUpButton {
+        let control = NSPopUpButton()
+        control.addItems(withTitles: options)
+        let persisted = defaultsKey.isEmpty ? "" : UserDefaults.standard.string(forKey: defaultsKey) ?? ""
+        control.selectItem(withTitle: persisted.isEmpty ? selected : persisted)
+        if control.indexOfSelectedItem < 0, let first = options.first {
+            control.selectItem(withTitle: first)
+        }
+        control.controlSize = .regular
+        control.bezelStyle = .rounded
+        control.widthAnchor.constraint(equalToConstant: 280).isActive = true
+        if !defaultsKey.isEmpty {
+            control.identifier = NSUserInterfaceItemIdentifier(defaultsKey)
+            control.target = self
+            control.action = #selector(persistPopup(_:))
+        }
+        return control
+    }
+
+    @objc func persistPopup(_ sender: NSPopUpButton) {
+        guard let key = sender.identifier?.rawValue else { return }
+        UserDefaults.standard.set(sender.titleOfSelectedItem ?? "", forKey: key)
+    }
+
+    func buttonRow(_ buttons: [NSButton]) -> NSStackView {
+        let row = NSStackView(views: buttons)
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalToConstant: 480).isActive = true
+        return row
+    }
+
+    func switchControl(isOn: Bool, enabled: Bool) -> NSControl {
+        if #available(macOS 10.15, *) {
+            let control = NSSwitch()
+            control.state = isOn ? .on : .off
+            control.isEnabled = enabled
+            return control
+        }
+        let control = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+        control.state = isOn ? .on : .off
+        control.isEnabled = enabled
+        return control
+    }
+
+    func actionButton(_ title: String, _ action: Selector) -> NSButton {
+        let button = NSButton(title: title, target: parent, action: action)
+        button.bezelStyle = .rounded
+        button.controlSize = .regular
+        return button
+    }
+
+    func label(_ text: String, size: CGFloat, weight: NSFont.Weight, color: NSColor = .labelColor) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = NSFont.systemFont(ofSize: size, weight: weight)
+        label.textColor = color
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        return label
+    }
+}
+
+final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSOutlineViewDataSource, NSOutlineViewDelegate, NSMenuDelegate, NSToolbarDelegate {
     let config: GuardAppConfig
     var window: NSWindow?
     var events: [GuardMonitorEvent] = []
     var activityRows: [MonitorActivityRow] = []
     var refreshTimer: Timer?
+    var pendingAlertTimer: Timer?
+    var pendingAlertPollInFlight = false
+    var fullRefreshInFlight = false
     var selectedEventKey: String?
     var selectedActivityRowKey: String?
     var renderedInspectorRowKey: String?
@@ -1921,6 +3751,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     var renderedRuleRows: [MonitorRuleRow] = []
     var templateRows: [MonitorTemplateRow] = []
     var projectSummaryCache: [String: GuardAppSummary?] = [:]
+    var projectSummaryMissCache = Set<String>()
+    var codeSignatureCache: [String: (status: String, signer: String, teamId: String, bundleIdentifier: String)] = [:]
+    var presentedPendingAlertIds = Set<String>()
     var recentAllowedCount = 0
     var recentDeniedCount = 0
     var recentTopHost = "-"
@@ -1928,11 +3761,16 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     var pendingAlertSummaryText = "Pending alerts unavailable until guardd is reachable."
     var profileRiskLabel = "risk unknown"
     var expandedApps = Set<String>()
+    var hiddenActivityRowKeys = Set<String>()
     var didAutoExpandActivityGroups = false
     var rulesWindowController: RulesWindowController?
     let trafficSparkline = TrafficSparklineView()
-    let tableView = NSTableView()
+    let tableView = NSOutlineView()
     let monitorSearchField = NSSearchField()
+    let clearMonitorSearchButton = NSButton()
+    let focusMonitorSearchButton = NSButton()
+    let monitorTimeWindowButton = NSButton()
+    weak var toolbarSearchField: NSSearchField?
     let monitorFilterControl = NSSegmentedControl(labels: ["All", "Net", "Denied", "Files", "Alerts"], trackingMode: .selectOne, target: nil, action: nil)
     let statusLabel = NSTextField(labelWithString: "")
     let daemonStateLabel = NSTextField(labelWithString: "guardd offline")
@@ -1964,6 +3802,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     let openRulesWindowButton = NSButton()
     let openTemplatesWindowButton = NSButton()
     let openSettingsWindowButton = NSButton()
+    let addProjectFolderButton = NSButton()
     let previewTemplateButton = NSButton()
     let applyTemplateButton = NSButton()
     let profilePopup = NSPopUpButton()
@@ -1979,9 +3818,12 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     var monitorTableContainer: NSView?
     var inspectorWidthConstraint: NSLayoutConstraint?
     var settingsWindow: NSWindow?
+    var settingsWindowController: SettingsWindowController?
     var templatesWindow: NSWindow?
     var logWindow: NSWindow?
     var logTextView: NSTextView?
+    var eventLogWindowController: EventLogWindowController?
+    var monitorTimeWindowMinutes: Int? = 60
     var didCleanUp = false
 
     init(config: GuardAppConfig) {
@@ -1998,6 +3840,13 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         window.title = "Guard Monitor"
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
+        window.setFrameAutosaveName("dev.guard.monitor.window")
+        let toolbar = NSToolbar(identifier: NSToolbar.Identifier("dev.guard.monitor.toolbar"))
+        toolbar.delegate = self
+        toolbar.displayMode = .iconOnly
+        toolbar.allowsUserCustomization = true
+        toolbar.autosavesConfiguration = true
+        window.toolbar = toolbar
         window.isMovableByWindowBackground = true
         window.minSize = NSSize(width: 700, height: 440)
         window.isRestorable = false
@@ -2005,29 +3854,27 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         window.delegate = self
 
         let background = NSVisualEffectView()
-        background.material = .hudWindow
+        background.material = .windowBackground
         background.blendingMode = .behindWindow
         background.state = .active
         background.translatesAutoresizingMaskIntoConstraints = false
         window.contentView = background
 
-        let root = NSStackView()
-        root.orientation = .vertical
-        root.alignment = .width
-        root.spacing = 8
-        root.edgeInsets = NSEdgeInsets(top: 44, left: 12, bottom: 8, right: 12)
-        root.translatesAutoresizingMaskIntoConstraints = false
-        background.addSubview(root)
+        let monitorBody = makeMonitorBody()
+        let actionBar = makeActionBar()
+        monitorBody.translatesAutoresizingMaskIntoConstraints = false
+        actionBar.translatesAutoresizingMaskIntoConstraints = false
+        background.addSubview(monitorBody)
+        background.addSubview(actionBar)
         NSLayoutConstraint.activate([
-            root.leadingAnchor.constraint(equalTo: background.leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: background.trailingAnchor),
-            root.topAnchor.constraint(equalTo: background.topAnchor),
-            root.bottomAnchor.constraint(equalTo: background.bottomAnchor)
+            monitorBody.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 12),
+            monitorBody.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -12),
+            monitorBody.topAnchor.constraint(equalTo: background.topAnchor, constant: 10),
+            actionBar.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 12),
+            actionBar.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -12),
+            actionBar.topAnchor.constraint(equalTo: monitorBody.bottomAnchor),
+            actionBar.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -8)
         ])
-
-        root.addArrangedSubview(makeHeader())
-        root.addArrangedSubview(makeMonitorBody())
-        root.addArrangedSubview(makeActionBar())
 
         self.window = window
         NotificationCenter.default.addObserver(
@@ -2036,15 +3883,24 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             name: NSApplication.willTerminateNotification,
             object: nil
         )
-        autoStartDaemonIfNeeded()
-        reloadEvents(nil)
-        refreshTimer = Timer.scheduledTimer(timeInterval: 2.0, target: self, selector: #selector(reloadEvents(_:)), userInfo: nil, repeats: true)
         applyPreferredWindowFrame(window)
         window.makeKeyAndOrderFront(nil)
         DispatchQueue.main.async {
             self.applyPreferredWindowFrame(window)
         }
         NSApp.activate(ignoringOtherApps: true)
+        statusLabel.stringValue = "Loading recent Guard activity..."
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            self.autoStartDaemonIfNeeded()
+            self.reloadEvents(nil)
+            self.showFirstRunOnboardingIfNeeded()
+        }
+        let refreshTimer = Timer(timeInterval: 8.0, target: self, selector: #selector(reloadEvents(_:)), userInfo: nil, repeats: true)
+        let pendingAlertTimer = Timer(timeInterval: 0.05, target: self, selector: #selector(pollPendingAlerts(_:)), userInfo: nil, repeats: true)
+        self.refreshTimer = refreshTimer
+        self.pendingAlertTimer = pendingAlertTimer
+        RunLoop.main.add(refreshTimer, forMode: .common)
+        RunLoop.main.add(pendingAlertTimer, forMode: .common)
     }
 
     func applyPreferredWindowFrame(_ window: NSWindow) {
@@ -2077,11 +3933,33 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         guard !didCleanUp else { return }
         didCleanUp = true
         refreshTimer?.invalidate()
+        pendingAlertTimer?.invalidate()
         stopManagedDaemon()
+    }
+
+    func showFirstRunOnboardingIfNeeded() {
+        let key = "dev.guard.monitor.didShowFirstRun"
+        guard UserDefaults.standard.bool(forKey: key) == false, let window else { return }
+        UserDefaults.standard.set(true, forKey: key)
+        let alert = NSAlert()
+        alert.messageText = "Set Up Guard Monitoring"
+        alert.informativeText = [
+            "Guard can run daemon-free for per-run protection.",
+            "For the richer macOS monitor, connect guardd, review Network Extension status, and enable notifications for pending decisions.",
+            "TLS inspection and the Network Extension remain explicit opt-in surfaces."
+        ].joined(separator: "\n\n")
+        alert.addButton(withTitle: "Open Settings")
+        alert.addButton(withTitle: "Later")
+        alert.beginSheetModal(for: window) { response in
+            if response == .alertFirstButtonReturn {
+                self.openSettingsWindow(nil)
+            }
+        }
     }
 
     func windowDidResize(_ notification: Notification) {
         resizeActivityColumns()
+        resetActivityTableScrollOrigin()
     }
 
     func makeHeader() -> NSView {
@@ -2143,6 +4021,87 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         } else {
             button.title = title
         }
+    }
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [
+            NSToolbarItem.Identifier("refresh"),
+            NSToolbarItem.Identifier("rules"),
+            NSToolbarItem.Identifier("templates"),
+            NSToolbarItem.Identifier("settings"),
+            NSToolbarItem.Identifier("search"),
+            .flexibleSpace,
+            NSToolbarItem.Identifier("log"),
+            NSToolbarItem.Identifier("syncExtension")
+        ]
+    }
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        toolbarDefaultItemIdentifiers(toolbar) + [.flexibleSpace, .space]
+    }
+
+    func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+        switch itemIdentifier.rawValue {
+        case "refresh":
+            item.label = "Refresh"
+            item.paletteLabel = "Refresh"
+            item.target = self
+            item.action = #selector(reloadEvents(_:))
+            if #available(macOS 11.0, *) { item.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Refresh") }
+        case "rules":
+            item.label = "Rules"
+            item.paletteLabel = "Rules"
+            item.target = self
+            item.action = #selector(openRulesWindow(_:))
+            if #available(macOS 11.0, *) { item.image = NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: "Rules") }
+        case "templates":
+            item.label = "Templates"
+            item.paletteLabel = "Templates"
+            item.target = self
+            item.action = #selector(openTemplatesWindow(_:))
+            if #available(macOS 11.0, *) { item.image = NSImage(systemSymbolName: "square.grid.2x2", accessibilityDescription: "Templates") }
+        case "settings":
+            item.label = "Settings"
+            item.paletteLabel = "Settings"
+            item.target = self
+            item.action = #selector(openSettingsWindow(_:))
+            if #available(macOS 11.0, *) { item.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "Settings") }
+        case "search":
+            if #available(macOS 11.0, *) {
+                let search = NSSearchToolbarItem(itemIdentifier: itemIdentifier)
+                search.label = "Search"
+                search.searchField.placeholderString = "Search activity"
+                search.searchField.target = self
+                search.searchField.action = #selector(toolbarSearchChanged(_:))
+                toolbarSearchField = search.searchField
+                return search
+            }
+            item.label = "Search"
+            item.target = self
+            item.action = #selector(focusSearch(_:))
+            item.image = NSImage(named: NSImage.touchBarSearchTemplateName)
+        case "log":
+            item.label = "Log"
+            item.paletteLabel = "Log"
+            item.target = self
+            item.action = #selector(revealLog(_:))
+            if #available(macOS 11.0, *) { item.image = NSImage(systemSymbolName: "list.bullet.rectangle", accessibilityDescription: "Log") }
+        case "syncExtension":
+            item.label = "Sync Extension"
+            item.paletteLabel = "Sync Extension"
+            item.target = self
+            item.action = #selector(syncExtension(_:))
+            if #available(macOS 11.0, *) { item.image = NSImage(systemSymbolName: "network", accessibilityDescription: "Sync Extension") }
+        default:
+            return nil
+        }
+        return item
+    }
+
+    @objc func toolbarSearchChanged(_ sender: NSSearchField) {
+        monitorSearchField.stringValue = sender.stringValue
+        filterMonitorRows(sender)
     }
 
     func makeStatusStrip() -> NSView {
@@ -2224,60 +4183,98 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         container.alignment = .width
         container.spacing = 5
         container.translatesAutoresizingMaskIntoConstraints = false
-        container.heightAnchor.constraint(equalToConstant: 76).isActive = true
+        container.heightAnchor.constraint(equalToConstant: 62).isActive = true
 
-        let rates = NSStackView()
-        rates.orientation = .horizontal
-        rates.alignment = .centerY
-        rates.spacing = 8
-        footerAllowedRateLabel.stringValue = "allowed \(recentAllowedCount)"
-        footerDeniedRateLabel.stringValue = "denied \(recentDeniedCount)"
-        rates.addArrangedSubview(ratePill(symbol: "arrow.up", field: footerAllowedRateLabel, tint: .systemPurple))
-        rates.addArrangedSubview(ratePill(symbol: "xmark", field: footerDeniedRateLabel, tint: .systemRed))
-
-        let spacer = NSView()
-        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        rates.addArrangedSubview(spacer)
-        let windowLabel = label("Policy decisions", size: 11, weight: .medium, color: .tertiaryLabelColor)
-        rates.addArrangedSubview(windowLabel)
-
-        container.addArrangedSubview(rates)
+        let windowLabel = label("Recent policy decisions", size: 11, weight: .medium, color: .tertiaryLabelColor)
+        windowLabel.alignment = .right
+        container.addArrangedSubview(windowLabel)
         container.addArrangedSubview(trafficSparkline)
         return container
     }
 
     func makeMonitorToolbar() -> NSView {
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 8
+        row.translatesAutoresizingMaskIntoConstraints = false
 
-        monitorSearchField.placeholderString = "Search"
+        monitorSearchField.placeholderString = "Search activity"
         monitorSearchField.target = self
         monitorSearchField.action = #selector(filterMonitorRows(_:))
-        monitorSearchField.controlSize = .small
-        monitorSearchField.font = NSFont.systemFont(ofSize: 12)
+        monitorSearchField.controlSize = .regular
+        monitorSearchField.font = NSFont.systemFont(ofSize: NSFont.systemFontSize(for: .regular))
+        monitorSearchField.bezelStyle = .roundedBezel
+        monitorSearchField.focusRingType = .default
         monitorSearchField.translatesAutoresizingMaskIntoConstraints = false
-        monitorSearchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
+        monitorSearchField.widthAnchor.constraint(greaterThanOrEqualToConstant: 1).isActive = true
+        monitorSearchField.widthAnchor.constraint(lessThanOrEqualToConstant: 1).isActive = true
+        monitorSearchField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        monitorSearchField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         monitorSearchField.sendsSearchStringImmediately = true
+        monitorSearchField.toolTip = "Search all activity, or use app:, process:, host:, rule:, path:, profile:, and type: prefixes."
+
+        configureInlineToolButton(clearMonitorSearchButton, symbol: "xmark.rectangle", title: "Clear", action: #selector(clearMonitorSearch(_:)), tooltip: "Clear the current search.")
+        configureInlineToolButton(focusMonitorSearchButton, symbol: "scope", title: "Top Host", action: #selector(focusTopHostSearch(_:)), tooltip: "Search for the busiest recent host.")
+        configureInlineToolButton(monitorTimeWindowButton, symbol: "clock", title: "1h", action: #selector(toggleMonitorTimeWindow(_:)), tooltip: "Cycle the activity time window.")
+        updateMonitorSearchChrome()
 
         monitorFilterControl.selectedSegment = 0
         monitorFilterControl.target = self
         monitorFilterControl.action = #selector(filterMonitorRows(_:))
         monitorFilterControl.segmentStyle = .texturedRounded
-        monitorFilterControl.controlSize = .small
+        monitorFilterControl.controlSize = .regular
+        monitorFilterControl.translatesAutoresizingMaskIntoConstraints = false
+        monitorFilterControl.heightAnchor.constraint(equalToConstant: 30).isActive = true
         monitorFilterControl.setToolTip("Show all recent activity", forSegment: 0)
-        monitorFilterControl.setToolTip("Show network decisions and alerts", forSegment: 1)
+        monitorFilterControl.setToolTip("Show network decisions, proxy listeners, and alerts", forSegment: 1)
         monitorFilterControl.setToolTip("Show denied traffic", forSegment: 2)
         monitorFilterControl.setToolTip("Show filesystem and sandbox activity", forSegment: 3)
         monitorFilterControl.setToolTip("Show pending and resolved alert decisions", forSegment: 4)
 
+        monitorSearchField.isHidden = true
         row.addArrangedSubview(monitorSearchField)
+        row.addArrangedSubview(clearMonitorSearchButton)
+        row.addArrangedSubview(focusMonitorSearchButton)
+        row.addArrangedSubview(monitorTimeWindowButton)
         row.addArrangedSubview(monitorFilterControl)
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         row.addArrangedSubview(spacer)
-        return row
+
+        container.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
+            row.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
+            row.topAnchor.constraint(equalTo: container.topAnchor, constant: 6),
+            row.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -6),
+            container.heightAnchor.constraint(equalToConstant: 42)
+        ])
+        return container
+    }
+
+    func configureInlineToolButton(_ button: NSButton, symbol: String, title: String, action: Selector, tooltip: String) {
+        button.title = title
+        button.target = self
+        button.action = action
+        button.isBordered = true
+        button.bezelStyle = .texturedRounded
+        button.controlSize = .regular
+        button.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+        button.contentTintColor = .secondaryLabelColor
+        button.toolTip = tooltip
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        if #available(macOS 11.0, *), symbol != "clock" {
+            button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+            button.imagePosition = .imageOnly
+            button.widthAnchor.constraint(equalToConstant: 32).isActive = true
+        } else {
+            button.widthAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+        }
     }
 
     func makeTable() -> NSView {
@@ -2285,6 +4282,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         configureOverlayScrollView(scroll)
         scroll.translatesAutoresizingMaskIntoConstraints = false
 
+        tableView.translatesAutoresizingMaskIntoConstraints = true
+        tableView.frame = scroll.contentView.bounds
+        tableView.autoresizingMask = [.width, .height]
         tableView.headerView = nil
         tableView.usesAlternatingRowBackgroundColors = false
         tableView.backgroundColor = .clear
@@ -2296,40 +4296,84 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         tableView.delegate = self
         tableView.target = self
         tableView.doubleAction = #selector(toggleSelectedActivityGroup(_:))
-        tableView.addTableColumn(column("app", title: "App / Command", width: 260))
+        let rowMenu = NSMenu(title: "Connection Actions")
+        rowMenu.delegate = self
+        tableView.menu = rowMenu
+        let appColumn = column("app", title: "App / Command", width: 260)
+        tableView.addTableColumn(appColumn)
+        tableView.outlineTableColumn = appColumn
+        tableView.indentationPerLevel = 18
+        tableView.indentationMarkerFollowsCell = true
         tableView.addTableColumn(column("destination", title: "Destination", width: 280))
         tableView.addTableColumn(column("activity", title: "Policy", width: 360))
         tableView.addTableColumn(column("decision", title: "State", width: 76))
         scroll.documentView = tableView
+        tableView.frame = scroll.contentView.bounds
         DispatchQueue.main.async {
             self.resizeActivityColumns()
+            self.resetActivityTableScrollOrigin()
         }
         return scroll
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        guard let row = selectedActivityRowForAction() else { return }
+        let event = row.event
+        if row.isGroup {
+            menu.addItem(withTitle: expandedApps.contains(row.rowKey) ? "Collapse" : "Expand", action: #selector(toggleSelectedActivityGroup(_:)), keyEquivalent: "")
+            menu.addItem(.separator())
+        }
+        if event?.host.isEmpty == false {
+            menu.addItem(withTitle: "Allow Once", action: #selector(allowSelectedOnce(_:)), keyEquivalent: "")
+            menu.addItem(withTitle: "Allow for 5 Minutes", action: #selector(allowSelectedFiveMinutes(_:)), keyEquivalent: "")
+            menu.addItem(withTitle: "Allow for 1 Hour", action: #selector(allowSelectedOneHour(_:)), keyEquivalent: "")
+            menu.addItem(withTitle: "Deny Once", action: #selector(denySelectedOnce(_:)), keyEquivalent: "")
+            menu.addItem(.separator())
+            menu.addItem(withTitle: "Allow Domain", action: #selector(allowSelectedDomain(_:)), keyEquivalent: "")
+            menu.addItem(withTitle: "Deny Domain", action: #selector(denySelectedDomain(_:)), keyEquivalent: "")
+            menu.addItem(withTitle: "Remove Domain Rules", action: #selector(removeSelectedDomainRules(_:)), keyEquivalent: "")
+            menu.addItem(.separator())
+            menu.addItem(withTitle: "Copy Host", action: #selector(copySelectedHost(_:)), keyEquivalent: "")
+        }
+        if event?.processPath.isEmpty == false {
+            menu.addItem(withTitle: "Reveal Process Binary", action: #selector(revealSelectedProcessBinary(_:)), keyEquivalent: "")
+        }
+        menu.addItem(withTitle: "Hide Connection", action: #selector(hideSelectedConnection(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: "Open Rules", action: #selector(openRulesWindow(_:)), keyEquivalent: "")
+        for item in menu.items {
+            item.target = self
+        }
     }
 
     func resizeActivityColumns() {
         guard tableView.numberOfColumns >= 4 else { return }
         let available = tableView.enclosingScrollView?.contentView.bounds.width ?? tableView.bounds.width
         guard available > 0 else { return }
+        if var frame = tableView.enclosingScrollView?.contentView.bounds {
+            frame.origin.x = 0
+            frame.size.width = available
+            tableView.frame = frame
+        }
 
-        let decisionWidth: CGFloat = available < 760 ? 66 : 74
-        var appWidth = min(max(available * 0.24, 190), 300)
-        var destinationWidth = min(max(available * 0.24, 190), 340)
-        let activityMinimum: CGFloat = available < 760 ? 170 : 260
+        let decisionWidth: CGFloat = available < 760 ? 76 : 92
+        var appWidth = min(max(available * 0.32, 220), 360)
+        var destinationWidth = min(max(available * 0.26, 180), 360)
+        let activityMinimum: CGFloat = available < 760 ? 160 : 220
         var activityWidth = available - appWidth - destinationWidth - decisionWidth
 
         if activityWidth < activityMinimum {
             var deficit = activityMinimum - activityWidth
-            let appReduction = min(deficit * 0.55, max(0, appWidth - 165))
+            let appReduction = min(deficit * 0.55, max(0, appWidth - 200))
             appWidth -= appReduction
             deficit -= appReduction
-            let destinationReduction = min(deficit, max(0, destinationWidth - 160))
+            let destinationReduction = min(deficit, max(0, destinationWidth - 150))
             destinationWidth -= destinationReduction
             activityWidth = max(activityMinimum, available - appWidth - destinationWidth - decisionWidth)
         }
 
         if appWidth + destinationWidth + activityWidth + decisionWidth > available {
-            activityWidth = max(120, available - appWidth - destinationWidth - decisionWidth)
+            activityWidth = max(activityMinimum, available - appWidth - destinationWidth - decisionWidth)
         }
 
         let widths: [String: CGFloat] = [
@@ -2341,8 +4385,15 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         for column in tableView.tableColumns {
             guard let width = widths[column.identifier.rawValue] else { continue }
             column.width = width
-            column.minWidth = min(width, column.identifier.rawValue == "activity" ? 160 : 90)
+            column.minWidth = min(width, column.identifier.rawValue == "app" ? 190 : column.identifier.rawValue == "destination" ? 150 : column.identifier.rawValue == "activity" ? 160 : 70)
         }
+    }
+
+    func resetActivityTableScrollOrigin() {
+        guard let clipView = tableView.enclosingScrollView?.contentView else { return }
+        let current = clipView.bounds.origin
+        clipView.scroll(to: NSPoint(x: 0, y: current.y))
+        tableView.enclosingScrollView?.reflectScrolledClipView(clipView)
     }
 
     func configureOverlayScrollView(_ scroll: NSScrollView, border: NSBorderType = .noBorder) {
@@ -2391,7 +4442,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             leadingRule.widthAnchor.constraint(equalToConstant: 0.5),
             scroll.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 17),
             scroll.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -16),
-            scroll.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 12),
+            scroll.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 0),
             scroll.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -12),
             document.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
             document.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
@@ -2557,19 +4608,25 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         inspectorSummaryStack.addArrangedSubview(detailKeyValueBlock([
             ("Name", processLabel(for: event)),
             ("App", appLabel(for: event)),
+            ("Launched By", event.launcherApp.isEmpty ? "Not recorded" : event.launcherApp),
             ("PID", event.pid > 0 ? "\(event.pid)" : "Not recorded"),
+            ("Parent PID", event.launcherPid > 0 ? "\(event.launcherPid)" : "Not recorded"),
             ("Path", event.processPath.isEmpty ? "Not recorded" : event.processPath),
             ("Command", event.command.isEmpty ? "Unknown" : event.command),
             ("Project", event.projectDir.isEmpty ? "Not recorded" : event.projectDir),
-            ("Profile", event.profile.isEmpty ? "guard" : event.profile)
+            ("Profile", event.profile.isEmpty ? "guard" : event.profile),
+            ("Parent Chain", event.parentChain.isEmpty ? "Not recorded" : event.parentChain)
         ]))
 
         inspectorSummaryStack.addArrangedSubview(inspectorSection("Internet Access Policy"))
+        let lifetime = temporaryRuleSummary(for: event)
+            ?? (event.expiresAt.isEmpty ? "Current profile/session" : "Expires \(event.expiresAt)")
         inspectorSummaryStack.addArrangedSubview(detailKeyValueBlock([
             ("Outcome", decisionLabel(for: event).isEmpty ? "managed" : decisionLabel(for: event)),
             ("Reason", humanDecisionReason(event.detail, fallback: activityLabel(for: event))),
             ("Rule Scope", event.host.isEmpty ? "No destination host" : ruleScopePreview(for: event)),
-            ("Lifetime", event.expiresAt.isEmpty ? "Current profile/session" : "Expires \(event.expiresAt)")
+            ("Lifetime", lifetime),
+            ("Rule ID", event.ruleId.isEmpty ? "Not recorded" : event.ruleId)
         ], valueTint: event.result == "deny" ? .systemRed : .secondaryLabelColor))
 
         inspectorSummaryStack.addArrangedSubview(inspectorSection("Code Signature"))
@@ -2604,8 +4661,8 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         inspectorTitleLabel.isHidden = false
         clearInspectorSummaryPanel()
         let groupEvents = events.filter { appLabel(for: $0) == app }
-        let summary = projectSummary(for: groupEvents)
-        let network = groupEvents.filter { $0.type == "network.decision" || $0.type.hasPrefix("guard.alert.") }
+        let summary = projectSummary(for: groupEvents, allowSubprocess: false)
+        let network = groupEvents.filter { isNetworkActivity($0) }
         let denied = network.filter { $0.result == "deny" || $0.result == "denied" }.count
         let allowed = network.filter { $0.result == "allow" || $0.result == "allowed" }.count
         let fileEvents = groupEvents.filter { isFileActivity($0) }
@@ -2620,22 +4677,25 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             inspectorSummaryStack.addArrangedSubview(inspectorSection("Effective Policy"))
             inspectorSummaryStack.addArrangedSubview(detailKeyValueBlock([
                 ("Status", summary.findings.isEmpty ? "no dangerous defaults detected" : "\(summary.findings.count) finding\(summary.findings.count == 1 ? "" : "s")"),
-                ("Network", summary.network.allowedDomains.isEmpty ? "no allowlist" : "\(summary.network.allowedDomains.count) allowed domains"),
+                ("Network", networkRuleCountText(summary)),
                 ("Filesystem", "\(summary.filesystem.allowRead.count) read allows, \(summary.filesystem.allowWrite.count) write allows"),
                 ("Protections", "\(summary.filesystem.denyRead.count + summary.filesystem.denyWrite.count) deny rules")
             ], valueTint: summary.findings.isEmpty ? .secondaryLabelColor : .systemOrange))
-            inspectorSummaryStack.addArrangedSubview(inspectorSection("Allowed Network"))
-            for domain in summary.network.allowedDomains.prefix(8) {
-                inspectorSummaryStack.addArrangedSubview(summaryListItem(symbol: "network", text: domain))
-            }
-            if summary.network.allowedDomains.isEmpty {
-                inspectorSummaryStack.addArrangedSubview(detailBlock(["No allowed domains configured."], tint: .tertiaryLabelColor))
-            }
+            inspectorSummaryStack.addArrangedSubview(inspectorSection("Network Rules"))
+            inspectorSummaryStack.addArrangedSubview(detailKeyValueBlock(networkPolicyRows(summary)))
+            inspectorSummaryStack.addArrangedSubview(inspectorSection("Proxy / TLS"))
+            inspectorSummaryStack.addArrangedSubview(detailKeyValueBlock(proxyAndTLSRows(summary)))
             inspectorSummaryStack.addArrangedSubview(inspectorSection("Filesystem Scope"))
             inspectorSummaryStack.addArrangedSubview(detailKeyValueBlock([
                 ("Read", compactPolicyList(summary.filesystem.allowRead)),
                 ("Write", compactPolicyList(summary.filesystem.allowWrite)),
                 ("Denied", compactPolicyList(summary.filesystem.denyRead + summary.filesystem.denyWrite))
+            ]))
+            inspectorSummaryStack.addArrangedSubview(inspectorSection("Rule Editing"))
+            inspectorSummaryStack.addArrangedSubview(detailBlock([
+                daemonConnected
+                    ? "Open Rules to edit allow/deny domains, HTTP path rules, raw TCP exceptions, and disabled rule state."
+                    : "Start guardd to edit persistent rules. Without guardd, domain actions are available only for selected events with a project directory."
             ]))
         }
         inspectorSummaryStack.addArrangedSubview(inspectorSection("Recent Activity"))
@@ -2657,9 +4717,220 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     func compactPolicyList(_ values: [String], limit: Int = 4) -> String {
         if values.isEmpty { return "none" }
-        let shown = values.prefix(limit).joined(separator: ", ")
-        let remaining = values.count - min(values.count, limit)
-        return remaining > 0 ? "\(shown), +\(remaining) more" : shown
+        return values.joined(separator: "\n")
+    }
+
+    func inlinePolicyList(_ values: [String], empty: String = "none") -> String {
+        values.isEmpty ? empty : values.joined(separator: ", ")
+    }
+
+    func policyRows(for summary: GuardAppSummary, appKey: String, event: GuardMonitorEvent?) -> [MonitorActivityRow] {
+        let networkKey = "\(appKey)/policy:network"
+        let filesKey = "\(appKey)/policy:files"
+        let proxyKey = "\(appKey)/policy:proxy"
+        var rows: [MonitorActivityRow] = []
+        rows.append(
+            MonitorActivityRow(
+                isGroup: true,
+                kind: "policy-network",
+                level: 1,
+                rowKey: networkKey,
+                app: "Network Policy",
+                destination: networkRuleCountText(summary),
+                activity: "",
+                decision: summary.network.deniedDomains.isEmpty ? "active" : "review",
+                time: "",
+                event: event
+            )
+        )
+        rows.append(contentsOf: networkPolicyTreeRows(summary, parentKey: networkKey, event: event))
+        rows.append(
+            MonitorActivityRow(
+                isGroup: true,
+                kind: "policy-files",
+                level: 1,
+                rowKey: filesKey,
+                app: "Filesystem Policy",
+                destination: "\(summary.filesystem.allowRead.count) read · \(summary.filesystem.allowWrite.count) write · \(summary.filesystem.denyRead.count + summary.filesystem.denyWrite.count) protected",
+                activity: "",
+                decision: summary.findings.isEmpty ? "active" : "review",
+                time: "",
+                event: event
+            )
+        )
+        rows.append(contentsOf: filesystemPolicyTreeRows(summary, parentKey: filesKey, event: event))
+        rows.append(
+            MonitorActivityRow(
+                isGroup: true,
+                kind: "policy-proxy",
+                level: 1,
+                rowKey: proxyKey,
+                app: "Proxy / TLS Policy",
+                destination: summary.network.mode,
+                activity: "",
+                decision: summary.network.tlsInspection?.enabled == false ? "review" : "active",
+                time: "",
+                event: event
+            )
+        )
+        rows.append(contentsOf: proxyPolicyTreeRows(summary, parentKey: proxyKey, event: event))
+        return rows
+    }
+
+    func networkPolicyTreeRows(_ summary: GuardAppSummary, parentKey: String, event: GuardMonitorEvent?) -> [MonitorActivityRow] {
+        var rows: [MonitorActivityRow] = []
+        for host in summary.network.allowedDomains {
+            rows.append(policyLeaf(parentKey: parentKey, kind: "policy-allow-host", label: host, destination: "Allow host", activity: "Proxy-routed domain allowlist", decision: "active", event: event))
+        }
+        for host in summary.network.deniedDomains {
+            rows.append(policyLeaf(parentKey: parentKey, kind: "policy-deny-host", label: host, destination: "Deny host", activity: "Explicit network deny", decision: "deny", event: event))
+        }
+        for rule in summary.network.httpRules ?? [] {
+            let host = rule.host ?? rule.cidr ?? "any host"
+            let methods = rule.methods?.joined(separator: "|") ?? "any method"
+            let paths = rule.paths?.joined(separator: ", ") ?? "any path"
+            rows.append(policyLeaf(parentKey: parentKey, kind: "policy-http", label: host, destination: "HTTP rule", activity: "\(methods) \(paths)", decision: "active", event: event))
+        }
+        for rule in summary.network.allowedRawTcp ?? [] {
+            let destination = rule.ip ?? rule.host ?? "unknown"
+            rows.append(policyLeaf(parentKey: parentKey, kind: "policy-raw-tcp", label: "\(destination):\(rule.port.map { "\($0)" } ?? "?")", destination: "Raw TCP", activity: rule.reason ?? "Direct TCP exception", decision: "active", event: event))
+        }
+        if rows.isEmpty {
+            rows.append(policyLeaf(parentKey: parentKey, kind: "policy-empty", label: "No network rules", destination: "", activity: "", decision: "active", event: event))
+        }
+        return rows
+    }
+
+    func filesystemPolicyTreeRows(_ summary: GuardAppSummary, parentKey: String, event: GuardMonitorEvent?) -> [MonitorActivityRow] {
+        var rows: [MonitorActivityRow] = []
+        for value in summary.filesystem.allowRead {
+            rows.append(policyLeaf(parentKey: parentKey, kind: "policy-read", label: value, destination: "Read", activity: "", decision: "allow", event: event))
+        }
+        for value in summary.filesystem.allowWrite {
+            rows.append(policyLeaf(parentKey: parentKey, kind: "policy-write", label: value, destination: "Write", activity: "", decision: "allow", event: event))
+        }
+        for value in summary.filesystem.denyRead {
+            rows.append(policyLeaf(parentKey: parentKey, kind: "policy-deny-read", label: value, destination: "Deny read", activity: "", decision: "deny", event: event))
+        }
+        for value in summary.filesystem.denyWrite {
+            rows.append(policyLeaf(parentKey: parentKey, kind: "policy-deny-write", label: value, destination: "Deny write", activity: "", decision: "deny", event: event))
+        }
+        if rows.isEmpty {
+            rows.append(policyLeaf(parentKey: parentKey, kind: "policy-empty", label: "No filesystem rules", destination: "", activity: "", decision: "active", event: event))
+        }
+        return rows
+    }
+
+    func proxyPolicyTreeRows(_ summary: GuardAppSummary, parentKey: String, event: GuardMonitorEvent?) -> [MonitorActivityRow] {
+        [
+            policyLeaf(parentKey: parentKey, kind: "policy-proxy-env", label: "HTTP proxy", destination: "enabled", activity: "", decision: "active", event: event),
+            policyLeaf(parentKey: parentKey, kind: "policy-socks-env", label: "SOCKS / SSH", destination: "enabled", activity: "", decision: "active", event: event),
+            policyLeaf(parentKey: parentKey, kind: "policy-tls", label: "TLS inspection", destination: tlsInspectionShortText(summary.network.tlsInspection), activity: "", decision: summary.network.tlsInspection?.enabled == false ? "review" : "active", event: event),
+            policyLeaf(parentKey: parentKey, kind: "policy-loopback", label: "Loopback ports", destination: formatLoopbackPorts(summary.network), activity: "", decision: "active", event: event)
+        ]
+    }
+
+    func tlsInspectionShortText(_ tls: GuardTlsInspection?) -> String {
+        guard let tls else { return "default" }
+        if tls.enabled == true {
+            return tls.mode ?? "enabled"
+        }
+        return "off"
+    }
+
+    func policyLeaf(parentKey: String, kind: String, label: String, destination: String, activity: String, decision: String, event: GuardMonitorEvent?) -> MonitorActivityRow {
+        MonitorActivityRow(
+            isGroup: false,
+            kind: kind,
+            level: 2,
+            rowKey: "\(parentKey)/\(kind):\(label)",
+            app: label,
+            destination: destination,
+            activity: activity,
+            decision: decision,
+            time: "",
+            event: event
+        )
+    }
+
+    func networkRuleCountText(_ summary: GuardAppSummary) -> String {
+        let raw = summary.network.allowedRawTcp?.count ?? 0
+        let http = summary.network.httpRules?.count ?? 0
+        let denied = summary.network.deniedDomains.count
+        return [
+            "\(summary.network.allowedDomains.count) allowed domains",
+            denied > 0 ? "\(denied) denied" : nil,
+            http > 0 ? "\(http) HTTP path rules" : nil,
+            raw > 0 ? "\(raw) raw TCP" : nil
+        ].compactMap { $0 }.joined(separator: ", ")
+    }
+
+    func networkPolicyRows(_ summary: GuardAppSummary) -> [(String, String)] {
+        [
+            ("Allowed Hosts", compactPolicyList(summary.network.allowedDomains)),
+            ("Denied Hosts", compactPolicyList(summary.network.deniedDomains)),
+            ("Deny Presets", compactPolicyList(summary.network.deniedDomainPresets)),
+            ("HTTP Rules", formatHttpRules(summary.network.httpRules ?? [])),
+            ("Raw TCP", formatRawTcpRules(summary.network.allowedRawTcp ?? [])),
+            ("Loopback Ports", formatLoopbackPorts(summary.network))
+        ]
+    }
+
+    func proxyAndTLSRows(_ summary: GuardAppSummary) -> [(String, String)] {
+        [
+            ("Mode", summary.network.mode),
+            ("Proxy Env", "HTTP_PROXY/HTTPS_PROXY plus ALL_PROXY/GUARD_SOCKS_PROXY for guarded runs"),
+            ("SSH/Git Proxy", "GUARD_SSH_PROXY_COMMAND and GIT_SSH_COMMAND when SOCKS proxy is active"),
+            ("TLS Inspection", formatTlsInspection(summary.network.tlsInspection)),
+            ("Local Binding", summary.network.allowLocalBinding == true ? "allowed" : "not allowed unless explicitly configured")
+        ]
+    }
+
+    func formatHttpRules(_ rules: [GuardHttpPolicyRule]) -> String {
+        if rules.isEmpty { return "none" }
+        return rules.map { rule in
+            let host = rule.host ?? rule.cidr ?? "any host"
+            let methods = rule.methods?.joined(separator: "|") ?? "any method"
+            let paths = rule.paths?.joined(separator: ", ") ?? "any path"
+            return "\(host) \(methods) \(paths)"
+        }.joined(separator: "\n")
+    }
+
+    func formatRawTcpRules(_ rules: [GuardRawTcpRule]) -> String {
+        if rules.isEmpty { return "none" }
+        return rules.map { rule in
+            let destination = rule.ip ?? rule.host ?? "unknown"
+            let launch = rule.resolveAtLaunch == true ? ", resolve at launch" : ""
+            let reason = rule.reason?.isEmpty == false ? " — \(rule.reason!)" : ""
+            return "\(destination):\(rule.port.map { "\($0)" } ?? "?")\(launch)\(reason)"
+        }.joined(separator: "\n")
+    }
+
+    func formatLoopbackPorts(_ network: GuardNetworkSummary) -> String {
+        var parts: [String] = []
+        if network.allowLoopbackConnections == true { parts.append("loopback connections") }
+        if network.allowLoopbackHighPorts == true { parts.append("high ports") }
+        if network.allowLoopbackListeningHighPorts == true {
+            let processes = network.allowLoopbackListeningHighPortProcesses ?? []
+            parts.append(processes.isEmpty ? "listening high ports" : "listening high ports: \(processes.joined(separator: ", "))")
+        }
+        if let ports = network.allowLoopbackPorts, !ports.isEmpty {
+            parts.append(ports.map(String.init).joined(separator: ", "))
+        }
+        return parts.isEmpty ? "none" : parts.joined(separator: "; ")
+    }
+
+    func formatTlsInspection(_ tls: GuardTlsInspection?) -> String {
+        guard let tls else {
+            return "default: active only when proxy/TLS backend enables it"
+        }
+        let enabled = tls.enabled == true ? "enabled" : "disabled"
+        let explicit = tls.explicit == true ? "explicit profile rule" : "implicit/default"
+        let mode = tls.mode ?? "unknown mode"
+        let ca = tls.caScope ?? "unknown CA scope"
+        let trustedBy = tls.trustedBy?.isEmpty == false ? tls.trustedBy!.joined(separator: ", ") : "no clients listed"
+        let approval = tls.userApprovalRequired == true ? "user approval required" : "no approval flag"
+        return "\(enabled), \(explicit), \(mode), CA \(ca), trusted by \(trustedBy), \(approval)"
     }
 
     func renderProcessDetailsPanel(row: MonitorActivityRow) {
@@ -2673,7 +4944,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         let denied = network.filter { $0.result == "deny" }.count
         let allowed = network.filter { $0.result == "allow" }.count
         let sampleEvent = processEvents.first
-        let summary = projectSummary(for: processEvents)
+        let summary = projectSummary(for: processEvents, allowSubprocess: false)
         inspectorHelpLabel.stringValue = "Process"
         inspectorTitleLabel.stringValue = row.app
         inspectorSummaryStack.addArrangedSubview(actorHeader(
@@ -2696,15 +4967,15 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             inspectorSummaryStack.addArrangedSubview(inspectorSection("Launch Policy"))
             inspectorSummaryStack.addArrangedSubview(detailKeyValueBlock([
                 ("Status", summary.findings.isEmpty ? "ok, no dangerous defaults" : "\(summary.findings.count) policy finding\(summary.findings.count == 1 ? "" : "s")"),
-                ("Network", summary.network.allowedDomains.isEmpty ? "no network allowlist" : "\(summary.network.allowedDomains.count) allowed domains"),
+                ("Network", networkRuleCountText(summary)),
                 ("Read", compactPolicyList(summary.filesystem.allowRead, limit: 3)),
                 ("Write", compactPolicyList(summary.filesystem.allowWrite, limit: 3)),
                 ("Protected", compactPolicyList(summary.filesystem.denyRead + summary.filesystem.denyWrite, limit: 3))
             ], valueTint: summary.findings.isEmpty ? .secondaryLabelColor : .systemOrange))
-            inspectorSummaryStack.addArrangedSubview(inspectorSection("Allowed Domains"))
-            for domain in summary.network.allowedDomains.prefix(6) {
-                inspectorSummaryStack.addArrangedSubview(summaryListItem(symbol: "network", text: domain))
-            }
+            inspectorSummaryStack.addArrangedSubview(inspectorSection("Network Rules"))
+            inspectorSummaryStack.addArrangedSubview(detailKeyValueBlock(networkPolicyRows(summary)))
+            inspectorSummaryStack.addArrangedSubview(inspectorSection("Proxy / TLS"))
+            inspectorSummaryStack.addArrangedSubview(detailKeyValueBlock(proxyAndTLSRows(summary)))
         }
         inspectorSummaryStack.addArrangedSubview(inspectorSection("Internet Access Policy"))
         inspectorSummaryStack.addArrangedSubview(detailKeyValueBlock([
@@ -2736,16 +5007,22 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         return String(withoutPrefix)
     }
 
-    func projectSummary(for events: [GuardMonitorEvent]) -> GuardAppSummary? {
+    func projectSummary(for events: [GuardMonitorEvent], allowSubprocess: Bool = true) -> GuardAppSummary? {
         guard let event = events.first(where: { !$0.projectDir.isEmpty }) else { return nil }
         let profile = event.profile.isEmpty ? config.profile : event.profile
         let key = "\(profile)|\(event.projectDir)"
+        if projectSummaryMissCache.contains(key) {
+            return nil
+        }
         if let cached = projectSummaryCache[key] {
             return cached
         }
         if let localSummary = projectConfigSummary(for: event) {
             projectSummaryCache[key] = localSummary
             return localSummary
+        }
+        guard allowSubprocess else {
+            return nil
         }
 
         let process = Process()
@@ -2759,7 +5036,11 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             process.waitUntilExit()
             guard process.terminationStatus == 0 else {
                 let fallback = projectConfigSummary(for: event)
-                projectSummaryCache[key] = fallback
+                if let fallback {
+                    projectSummaryCache[key] = fallback
+                } else {
+                    projectSummaryMissCache.insert(key)
+                }
                 return fallback
             }
             let data = stdout.fileHandleForReading.readDataToEndOfFile()
@@ -2768,7 +5049,11 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             return summary
         } catch {
             let fallback = projectConfigSummary(for: event)
-            projectSummaryCache[key] = fallback
+            if let fallback {
+                projectSummaryCache[key] = fallback
+            } else {
+                projectSummaryMissCache.insert(key)
+            }
             return fallback
         }
     }
@@ -2803,8 +5088,17 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             network: GuardNetworkSummary(
                 mode: (network["allowedDomains"] as? [String] ?? []).isEmpty ? "none" : "allowlist",
                 allowedDomains: network["allowedDomains"] as? [String] ?? [],
+                allowedRawTcp: decodeArray(GuardRawTcpRule.self, from: network["allowedRawTcp"]),
+                httpRules: decodeArray(GuardHttpPolicyRule.self, from: network["httpRules"]),
                 deniedDomains: network["deniedDomains"] as? [String] ?? [],
-                deniedDomainPresets: network["deniedDomainPresets"] as? [String] ?? []
+                deniedDomainPresets: network["deniedDomainPresets"] as? [String] ?? [],
+                tlsInspection: decodeObject(GuardTlsInspection.self, from: network["tlsInspection"]),
+                allowLocalBinding: network["allowLocalBinding"] as? Bool,
+                allowLoopbackConnections: network["allowLoopbackConnections"] as? Bool,
+                allowLoopbackHighPorts: network["allowLoopbackHighPorts"] as? Bool,
+                allowLoopbackListeningHighPorts: network["allowLoopbackListeningHighPorts"] as? Bool,
+                allowLoopbackListeningHighPortProcesses: network["allowLoopbackListeningHighPortProcesses"] as? [String],
+                allowLoopbackPorts: network["allowLoopbackPorts"] as? [Int]
             ),
             filesystem: GuardFilesystemSummary(
                 allowRead: expandArray(filesystem["allowRead"] as? [String] ?? []),
@@ -2844,8 +5138,17 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             network: GuardNetworkSummary(
                 mode: network["mode"] as? String ?? "unknown",
                 allowedDomains: network["allowedDomains"] as? [String] ?? [],
+                allowedRawTcp: decodeArray(GuardRawTcpRule.self, from: network["allowedRawTcp"]),
+                httpRules: decodeArray(GuardHttpPolicyRule.self, from: network["httpRules"]),
                 deniedDomains: network["deniedDomains"] as? [String] ?? [],
-                deniedDomainPresets: network["deniedDomainPresets"] as? [String] ?? []
+                deniedDomainPresets: network["deniedDomainPresets"] as? [String] ?? [],
+                tlsInspection: decodeObject(GuardTlsInspection.self, from: network["tlsInspection"]),
+                allowLocalBinding: network["allowLocalBinding"] as? Bool,
+                allowLoopbackConnections: network["allowLoopbackConnections"] as? Bool,
+                allowLoopbackHighPorts: network["allowLoopbackHighPorts"] as? Bool,
+                allowLoopbackListeningHighPorts: network["allowLoopbackListeningHighPorts"] as? Bool,
+                allowLoopbackListeningHighPortProcesses: network["allowLoopbackListeningHighPortProcesses"] as? [String],
+                allowLoopbackPorts: network["allowLoopbackPorts"] as? [Int]
             ),
             filesystem: GuardFilesystemSummary(
                 allowRead: filesystem["allowRead"] as? [String] ?? [],
@@ -2857,6 +5160,24 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         )
     }
 
+    func decodeObject<T: Decodable>(_ type: T.Type, from value: Any?) -> T? {
+        guard let value,
+              JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(withJSONObject: value) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(T.self, from: data)
+    }
+
+    func decodeArray<T: Decodable>(_ type: T.Type, from value: Any?) -> [T] {
+        guard let value,
+              JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(withJSONObject: value) else {
+            return []
+        }
+        return (try? JSONDecoder().decode([T].self, from: data)) ?? []
+    }
+
     func policyTableSummary(_ summary: GuardAppSummary?) -> String? {
         guard let summary else { return nil }
         let network = summary.network.allowedDomains.count
@@ -2864,14 +5185,15 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         let write = summary.filesystem.allowWrite.count
         let protected = summary.filesystem.denyRead.count + summary.filesystem.denyWrite.count
         var parts: [String] = []
-        if network > 0 { parts.append("\(network) network rules") }
-        if read > 0 || write > 0 { parts.append("\(read) read · \(write) write") }
+        if network > 0 { parts.append("\(network) net") }
+        if read > 0 || write > 0 { parts.append("\(read)R \(write)W") }
         if protected > 0 { parts.append("\(protected) protected") }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     func isRunLifecycleActivity(_ event: GuardMonitorEvent) -> Bool {
         event.type == "proxy.started" ||
+        event.type == "guard.project.profile" ||
         event.type == "sandbox.profile_written" ||
         event.type == "process.started" ||
         event.type == "process.exited"
@@ -2894,6 +5216,10 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     func codeSignatureSummary(for event: GuardMonitorEvent) -> (status: String, signer: String, teamId: String, bundleIdentifier: String) {
         let path = event.processPath.isEmpty ? executablePath(from: event.command) : event.processPath
+        let cacheKey = "\(path)|\(event.bundleIdentifier)"
+        if let cached = codeSignatureCache[cacheKey] {
+            return cached
+        }
         guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else {
             return ("Not collected", "Process path unavailable", "Unavailable", event.bundleIdentifier.isEmpty ? "Unavailable" : event.bundleIdentifier)
         }
@@ -2915,7 +5241,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             ? (fieldValue("Identifier", in: stderr) ?? "Unavailable")
             : event.bundleIdentifier
         let status = result.0 == 0 ? "Signature valid" : "Signature invalid"
-        return (status, authority, teamId, identifier)
+        let summary: (status: String, signer: String, teamId: String, bundleIdentifier: String) = (status, authority, teamId, identifier)
+        codeSignatureCache[cacheKey] = summary
+        return summary
     }
 
     func fieldValue(_ key: String, in text: String) -> String? {
@@ -3104,12 +5432,13 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             key.setContentCompressionResistancePriority(.required, for: .horizontal)
 
             let value = label(row.1, size: 11.5, weight: .medium, color: valueTint)
-            value.lineBreakMode = .byTruncatingMiddle
-            value.maximumNumberOfLines = 2
+            value.lineBreakMode = .byCharWrapping
+            value.maximumNumberOfLines = 0
             value.alignment = .left
             value.toolTip = row.1
             value.translatesAutoresizingMaskIntoConstraints = false
             value.widthAnchor.constraint(lessThanOrEqualToConstant: 330).isActive = true
+            value.preferredMaxLayoutWidth = 330
             value.setContentHuggingPriority(.defaultLow, for: .horizontal)
             value.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
@@ -3179,16 +5508,6 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         statusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         statusLabel.lineBreakMode = .byTruncatingMiddle
-
-        let refresh = NSButton(title: "Refresh", target: self, action: #selector(reloadEvents(_:)))
-        refresh.bezelStyle = .rounded
-        refresh.keyEquivalent = "r"
-        refresh.controlSize = .small
-
-        let openLog = NSButton(title: "Log", target: self, action: #selector(revealLog(_:)))
-        openLog.bezelStyle = .rounded
-        openLog.controlSize = .small
-        openLog.toolTip = "Open recent Guard event log entries."
 
         allowDomainButton.title = "Allow Domain"
         allowDomainButton.target = self
@@ -3281,6 +5600,13 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         invalidateExtensionButton.controlSize = .small
         invalidateExtensionButton.toolTip = "Mark the current NetworkExtension sync manifest invalid so the extension falls back to strict stale-policy behavior."
 
+        addProjectFolderButton.title = "Add Project"
+        addProjectFolderButton.target = self
+        addProjectFolderButton.action = #selector(addProjectFolder(_:))
+        addProjectFolderButton.bezelStyle = .rounded
+        addProjectFolderButton.controlSize = .small
+        addProjectFolderButton.toolTip = "Register a project folder with .guard/*.json so inactive configurations are visible and manageable."
+
         previewTemplateButton.title = "Preview Template"
         previewTemplateButton.target = self
         previewTemplateButton.action = #selector(previewTemplate(_:))
@@ -3300,8 +5626,6 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         row.addArrangedSubview(allowOnceButton)
         row.addArrangedSubview(denyDomainButton)
         row.addArrangedSubview(allowDomainButton)
-        row.addArrangedSubview(openLog)
-        row.addArrangedSubview(refresh)
 
         advancedActionStack.orientation = .horizontal
         advancedActionStack.alignment = .centerY
@@ -3315,6 +5639,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         advancedActionStack.addArrangedSubview(revokeTLSCAButton)
         advancedActionStack.addArrangedSubview(syncExtensionButton)
         advancedActionStack.addArrangedSubview(invalidateExtensionButton)
+        advancedActionStack.addArrangedSubview(addProjectFolderButton)
         advancedActionStack.addArrangedSubview(previewTemplateButton)
         advancedActionStack.addArrangedSubview(applyTemplateButton)
         advancedActionStack.isHidden = true
@@ -3347,13 +5672,56 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     @objc func filterMonitorRows(_ sender: Any?) {
         rebuildActivityRows(keepSelection: true)
+        updateMonitorSearchChrome()
         statusLabel.stringValue = "\(events.count) recent event\(events.count == 1 ? "" : "s") · \(activityRows.count) visible row\(activityRows.count == 1 ? "" : "s") · \(daemonStatusText)"
+    }
+
+    @objc func clearMonitorSearch(_ sender: Any?) {
+        monitorSearchField.stringValue = ""
+        toolbarSearchField?.stringValue = ""
+        filterMonitorRows(sender)
+    }
+
+    @objc func focusTopHostSearch(_ sender: Any?) {
+        guard recentTopHost != "-" else {
+            statusLabel.stringValue = "No network host has been observed yet."
+            return
+        }
+        monitorSearchField.stringValue = "host:\(recentTopHost)"
+        toolbarSearchField?.stringValue = monitorSearchField.stringValue
+        filterMonitorRows(sender)
+    }
+
+    @objc func toggleMonitorTimeWindow(_ sender: Any?) {
+        switch monitorTimeWindowMinutes {
+        case 60:
+            monitorTimeWindowMinutes = 15
+        case 15:
+            monitorTimeWindowMinutes = nil
+        default:
+            monitorTimeWindowMinutes = 60
+        }
+        filterMonitorRows(sender)
+    }
+
+    func updateMonitorSearchChrome() {
+        clearMonitorSearchButton.isEnabled = !monitorSearchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        focusMonitorSearchButton.isEnabled = recentTopHost != "-"
+        let title: String
+        switch monitorTimeWindowMinutes {
+        case .some(15): title = "15m"
+        case .some(60): title = "1h"
+        case .some(let minutes): title = "\(minutes)m"
+        case .none: title = "All"
+        }
+        monitorTimeWindowButton.title = title
+        monitorTimeWindowButton.contentTintColor = monitorTimeWindowMinutes == nil ? .secondaryLabelColor : .labelColor
     }
 
     @objc func toggleSelectedActivityGroup(_ sender: Any?) {
         let row = tableView.clickedRow >= 0 ? tableView.clickedRow : tableView.selectedRow
-        guard row >= 0, row < activityRows.count, activityRows[row].isGroup else { return }
-        toggleActivityGroup(named: activityRows[row].app)
+        guard let activityRow = activityRow(atVisibleRow: row), activityRow.isGroup else { return }
+        toggleActivityGroup(row: activityRow)
     }
 
     @objc func focusTopHostInRules(_ sender: Any?) {
@@ -3426,8 +5794,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     func currentSelectedEvent() -> GuardMonitorEvent? {
         let row = tableView.selectedRow
-        guard row >= 0 && row < activityRows.count else { return nil }
-        return activityRows[row].event
+        return activityRow(atVisibleRow: row)?.event
     }
 
     func daemonURLHint() -> String {
@@ -3482,6 +5849,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     }
 
     func stopManagedDaemon() {
+        removeManagedDaemonConnection()
         guard let process = managedDaemon else { return }
         if process.isRunning {
             process.terminate()
@@ -3530,48 +5898,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     }
 
     func openLogWindow() {
-        let window = utilityWindow(existing: logWindow, title: "Event Log", width: 760, height: 540)
-        logWindow = window
-        let root = utilityRoot(in: window)
-        root.addArrangedSubview(utilityTitle("Event Log", subtitle: eventLogPath()))
-
-        let textView = NSTextView()
-        textView.isEditable = false
-        textView.isRichText = false
-        textView.usesFindBar = true
-        textView.drawsBackground = false
-        textView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-        textView.textColor = .labelColor
-        textView.string = logWindowText()
-        logTextView = textView
-
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.hasHorizontalScroller = true
-        scroll.borderType = .lineBorder
-        scroll.documentView = textView
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 380).isActive = true
-        root.addArrangedSubview(scroll)
-
-        let actions = NSStackView()
-        actions.orientation = .horizontal
-        actions.alignment = .centerY
-        actions.spacing = 8
-        let status = label("\(events.count) loaded events", size: 12, weight: .regular, color: .secondaryLabelColor)
-        status.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let refresh = NSButton(title: "Refresh", target: self, action: #selector(refreshLogWindow(_:)))
-        let reveal = NSButton(title: "Reveal File", target: self, action: #selector(revealLogFile(_:)))
-        for button in [refresh, reveal] {
-            button.bezelStyle = .rounded
-            button.controlSize = .small
-        }
-        actions.addArrangedSubview(status)
-        actions.addArrangedSubview(refresh)
-        actions.addArrangedSubview(reveal)
-        root.addArrangedSubview(actions)
-
-        window.makeKeyAndOrderFront(nil)
+        let controller = eventLogWindowController ?? EventLogWindowController(parent: self)
+        eventLogWindowController = controller
+        controller.show()
     }
 
     func logWindowText(limit: Int = 300) -> String {
@@ -3607,6 +5936,14 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     @objc func denySelectedOnce(_ sender: Any?) {
         postSelectedAlertDecision(action: "deny", duration: "once")
+    }
+
+    @objc func allowSelectedFiveMinutes(_ sender: Any?) {
+        postSelectedAlertDecision(action: "allow", duration: "5m")
+    }
+
+    @objc func allowSelectedOneHour(_ sender: Any?) {
+        postSelectedAlertDecision(action: "allow", duration: "1h")
     }
 
     @objc func enableTLS(_ sender: Any?) {
@@ -3708,35 +6045,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     @objc func openSettingsWindow(_ sender: Any?) {
         loadDaemonPolicyState(profile: selectedProfileName.isEmpty ? "guard" : selectedProfileName)
-        let window = utilityWindow(existing: settingsWindow, title: "Settings", width: 620, height: 500)
-        settingsWindow = window
-        let root = utilityRoot(in: window)
-        root.addArrangedSubview(utilityTitle("Settings", subtitle: "Daemon, TLS, Network Extension, and monitor status."))
-
-        let text = NSTextView()
-        text.isEditable = false
-        text.drawsBackground = false
-        text.font = NSFont.systemFont(ofSize: 12)
-        text.textColor = .secondaryLabelColor
-        text.string = settingsBodyText()
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.borderType = .lineBorder
-        scroll.documentView = text
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
-        root.addArrangedSubview(scroll)
-
-        let actions = NSStackView()
-        actions.orientation = .horizontal
-        actions.alignment = .centerY
-        actions.spacing = 8
-        for button in [startDaemonButton, stopDaemonButton, enableTLSButton, disableTLSButton, generateTLSCAButton, rotateTLSCAButton, revokeTLSCAButton, syncExtensionButton, invalidateExtensionButton] {
-            button.isHidden = false
-            actions.addArrangedSubview(button)
-        }
-        root.addArrangedSubview(actions)
-        window.makeKeyAndOrderFront(nil)
+        let controller = settingsWindowController ?? SettingsWindowController(parent: self)
+        settingsWindowController = controller
+        controller.show()
     }
 
     @objc func startDaemon(_ sender: Any?) {
@@ -3778,6 +6089,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             managedDaemon = process
             managedDaemonToken = token
             managedDaemonURL = daemonURL
+            writeManagedDaemonConnection(url: daemonURL, token: token)
             daemonClient = GuardDaemonClient(apiTokenOverride: token, baseURLOverride: daemonURL)
             daemonStatusText = "guardd starting"
             daemonStateLabel.stringValue = daemonStatusText
@@ -3798,6 +6110,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     @objc func stopDaemon(_ sender: Any?) {
         stopManagedDaemon()
+        removeManagedDaemonConnection()
         daemonClient = GuardDaemonClient()
         daemonConnected = false
         daemonStatusText = "guardd stopped"
@@ -3906,7 +6219,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     func selectedNetworkEvent() -> GuardMonitorEvent? {
         let row = tableView.selectedRow
-        guard row >= 0 && row < activityRows.count, let event = activityRows[row].event else {
+        guard let event = activityRow(atVisibleRow: row)?.event else {
             statusLabel.stringValue = "Select a network event first."
             return nil
         }
@@ -4211,6 +6524,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     func updateInspector(_ event: GuardMonitorEvent?) {
         let tab = selectedInspectorTab()
         setInspectorControlMode(tab)
+        inspectorWidthConstraint?.constant = event == nil && tab == .events ? 310 : 340
         inspectorSummaryStack.isHidden = true
         inspectorBodyLabel.isHidden = false
         inspectorRuleLabel.isHidden = false
@@ -4288,6 +6602,10 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             inspectorNoteLabel.isHidden = true
             inspectorRuleLabel.stringValue = monitorSummaryRuleText()
             inspectorNoteLabel.stringValue = ""
+            if !activityRows.isEmpty, tableView.selectedRow < 0 {
+                inspectorRuleLabel.isHidden = false
+                inspectorRuleLabel.stringValue = "Select an app, process, destination, or policy row to inspect exact scope and available actions."
+            }
             updateActionButtons(nil)
             return
         }
@@ -4331,7 +6649,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         case "process.started": return "command started"
         case "process.exited": return "command finished"
         case "sandbox.profile_written": return "sandbox applied"
-        case "proxy.started": return "proxy ready"
+        case "proxy.started": return "proxy listeners ready"
         case "guard.alert.pending": return "alert pending"
         case "guard.alert.resolved": return "alert resolved"
         default: return value.replacingOccurrences(of: "_", with: " ").replacingOccurrences(of: ".", with: " ")
@@ -4364,17 +6682,21 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     }
 
     func monitorSummaryTitle() -> String {
-        let apps = Set(events.map { appLabel(for: $0) }).count
-        let domains = Set(events.compactMap { $0.host.isEmpty ? nil : $0.host }).count
+        let eventApps = Set(events.map { appLabel(for: $0) }).count
+        let visibleApps = Set(activityRows.filter { $0.kind == "app" }.map { $0.app }).count
+        let apps = max(eventApps, visibleApps)
+        let eventDomains = Set(events.compactMap { $0.host.isEmpty ? nil : $0.host }).count
+        let visibleDomains = Set(activityRows.filter { $0.kind == "destination" }.map { $0.app }).count
+        let domains = max(eventDomains, visibleDomains)
         return "\(apps) app\(apps == 1 ? "" : "s"), \(domains) destination\(domains == 1 ? "" : "s")"
     }
 
     func monitorSummaryText() -> String {
-        let network = events.filter { $0.type == "network.decision" || $0.type.hasPrefix("guard.alert.") }
+        let network = events.filter { isNetworkActivity($0) }
         let fileEvents = events.filter { isFileActivity($0) }
         let pending = events.filter { $0.type == "guard.alert.pending" || $0.status == "pending" }.count
-        let topApps = topCounts(events.map { appLabel(for: $0) }, limit: 4)
-        let topHosts = topCounts(events.compactMap { $0.host.isEmpty ? nil : $0.host }, limit: 4)
+        let topApps = topCounts(events.map { appLabel(for: $0) } + activityRows.filter { $0.kind == "app" }.map { $0.app }, limit: 4)
+        let topHosts = topCounts(events.compactMap { $0.host.isEmpty ? nil : $0.host } + activityRows.filter { $0.kind == "destination" }.map { $0.app }, limit: 4)
         return [
             "Connections: \(network.count)",
             "Denied: \(recentDeniedCount)",
@@ -4463,12 +6785,35 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     func addSelectedDomain(to field: String) {
         guard let event = selectedNetworkEvent() else { return }
+        if field == "network.allowedDomains" {
+            setExclusiveRuleValue(event.host, event: event, allowField: "network.allowedDomains", denyField: "network.deniedDomains", allow: true)
+        } else if field == "network.deniedDomains" {
+            setExclusiveRuleValue(event.host, event: event, allowField: "network.allowedDomains", denyField: "network.deniedDomains", allow: false)
+        } else {
+            addRuleValue(event.host, event: event, to: field)
+        }
+    }
+
+    func setExclusiveRuleValue(_ value: String, event: GuardMonitorEvent, allowField: String, denyField: String, allow: Bool) {
+        guard !value.isEmpty else { return }
+        if allow {
+            removeRuleValue(value, event: event, from: denyField, quietIfMissing: true)
+            addRuleValue(value, event: event, to: allowField)
+        } else {
+            removeRuleValue(value, event: event, from: allowField, quietIfMissing: true)
+            addRuleValue(value, event: event, to: denyField)
+        }
+    }
+
+    func addRuleValue(_ value: String, event: GuardMonitorEvent, to field: String) {
+        guard !value.isEmpty else { return }
         let profile = event.profile.isEmpty ? "guard" : event.profile
-        if daemonConnected, let response = daemonClient?.postRule(profile: profile, field: field, value: event.host, ifMatch: profileVersionText) {
+        if daemonConnected, let response = daemonClient?.postRule(profile: profile, field: field, value: value, ifMatch: profileVersionText) {
             if (200..<300).contains(response.statusCode) {
-                statusLabel.stringValue = "Added \(event.host) to \(field) via guardd."
+                statusLabel.stringValue = "Added \(value) to \(field) via guardd."
                 loadDaemonPolicyState(profile: profile)
                 updateInspector(event)
+                reloadEvents(nil)
                 return
             }
             if response.statusCode == 412 {
@@ -4496,7 +6841,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             "--profile",
             profile,
             field,
-            event.host
+            value
         ]
         let stderr = Pipe()
         process.standardError = stderr
@@ -4504,7 +6849,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             try process.run()
             process.waitUntilExit()
             if process.terminationStatus == 0 {
-                statusLabel.stringValue = "Added \(event.host) to \(field) via guard CLI."
+                statusLabel.stringValue = "Added \(value) to \(field) via guard CLI."
+                projectSummaryCache.removeAll()
+                reloadEvents(nil)
             } else {
                 let data = stderr.fileHandleForReading.readDataToEndOfFile()
                 let message = String(data: data, encoding: .utf8) ?? "Rule update failed."
@@ -4512,6 +6859,67 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             }
         } catch {
             statusLabel.stringValue = error.localizedDescription
+        }
+    }
+
+    func removeRuleValue(_ value: String, event: GuardMonitorEvent, from field: String, quietIfMissing: Bool = false) {
+        guard !value.isEmpty else { return }
+        let profile = event.profile.isEmpty ? "guard" : event.profile
+        if daemonConnected, let response = daemonClient?.mutateRule(profile: profile, action: "remove", field: field, value: value, ifMatch: profileVersionText) {
+            if (200..<300).contains(response.statusCode) {
+                statusLabel.stringValue = "Removed \(value) from \(field)."
+                loadDaemonPolicyState(profile: profile)
+                reloadEvents(nil)
+                return
+            }
+            if response.statusCode == 412 {
+                loadDaemonPolicyState(profile: profile)
+                statusLabel.stringValue = "Profile changed on disk. Reloaded latest profile; retry the rule action."
+                return
+            }
+            if quietIfMissing && response.statusCode == 404 {
+                return
+            }
+            statusLabel.stringValue = daemonErrorMessage(response) ?? "Rule removal failed."
+            return
+        }
+        guard !event.projectDir.isEmpty else {
+            if !quietIfMissing {
+                statusLabel.stringValue = "guardd must be connected to remove profile rules."
+            }
+            return
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: config.guardPath)
+        process.currentDirectoryURL = URL(fileURLWithPath: event.projectDir)
+        process.arguments = [
+            "profile",
+            "remove",
+            "--profile",
+            profile,
+            field,
+            value
+        ]
+        let stderr = Pipe()
+        process.standardError = stderr
+        do {
+            try process.run()
+            process.waitUntilExit()
+            if process.terminationStatus == 0 {
+                if !quietIfMissing {
+                    statusLabel.stringValue = "Removed \(value) from \(field) via guard CLI."
+                }
+                projectSummaryCache.removeAll()
+                reloadEvents(nil)
+            } else if !quietIfMissing {
+                let data = stderr.fileHandleForReading.readDataToEndOfFile()
+                let message = String(data: data, encoding: .utf8) ?? "Rule removal failed."
+                statusLabel.stringValue = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        } catch {
+            if !quietIfMissing {
+                statusLabel.stringValue = error.localizedDescription
+            }
         }
     }
 
@@ -4529,6 +6937,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 alertId: event.id,
                 action: action,
                 duration: duration,
+                scope: "",
                 ifMatch: duration == "forever" ? profileVersionText : nil
             )
         } else {
@@ -4538,6 +6947,13 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 port: port,
                 action: action,
                 duration: duration,
+                method: "",
+                path: "",
+                scope: "",
+                launcherApp: event.launcherApp,
+                launcherProcess: event.launcherProcess,
+                launcherPid: event.launcherPid,
+                parentChain: event.parentChain,
                 ifMatch: duration == "forever" ? profileVersionText : nil
             )
         }
@@ -4556,6 +6972,40 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         } else {
             statusLabel.stringValue = daemonErrorMessage(response) ?? "Alert decision failed."
         }
+    }
+
+    func selectedActivityRowForAction() -> MonitorActivityRow? {
+        let row = tableView.clickedRow >= 0 ? tableView.clickedRow : tableView.selectedRow
+        guard let activityRow = activityRow(atVisibleRow: row) else { return nil }
+        if tableView.clickedRow >= 0 {
+            tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        }
+        return activityRow
+    }
+
+    @objc func revealSelectedProcessBinary(_ sender: Any?) {
+        guard let path = selectedActivityRowForAction()?.event?.processPath, !path.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    @objc func hideSelectedConnection(_ sender: Any?) {
+        guard let row = selectedActivityRowForAction() else { return }
+        hiddenActivityRowKeys.insert(row.rowKey)
+        filterMonitorRows(nil)
+        statusLabel.stringValue = "Hidden \(row.app). Use Refresh to rebuild the visible list."
+    }
+
+    @objc func copySelectedHost(_ sender: Any?) {
+        guard let event = selectedActivityRowForAction()?.event, !event.host.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(event.host, forType: .string)
+        statusLabel.stringValue = "Copied \(event.host)."
+    }
+
+    @objc func removeSelectedDomainRules(_ sender: Any?) {
+        guard let event = selectedActivityRowForAction()?.event, !event.host.isEmpty else { return }
+        removeRuleValue(event.host, event: event, from: "network.allowedDomains")
+        removeRuleValue(event.host, event: event, from: "network.deniedDomains")
     }
 
     func mutateTLS(enabled: Bool) {
@@ -4636,7 +7086,58 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         }
     }
 
+    @objc func openNetworkSettings(_ sender: Any?) {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.Network-Settings.extension") {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Library/PreferencePanes/Network.prefPane"))
+    }
+
+    @objc func addProjectFolder(_ sender: Any?) {
+        guard daemonConnected, let client = daemonClient else {
+            statusLabel.stringValue = "Start guardd before registering project folders."
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.title = "Add Guard Project"
+        panel.message = "Choose a project folder containing .guard/*.json."
+        panel.prompt = "Add"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("code", isDirectory: true)
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard let self else { return }
+            guard response == .OK, let url = panel.url else { return }
+            guard FileManager.default.fileExists(atPath: url.appendingPathComponent(".guard", isDirectory: true).path) else {
+                self.statusLabel.stringValue = "Selected folder has no .guard directory."
+                return
+            }
+            guard let result = client.addProject(root: url.path) else {
+                self.statusLabel.stringValue = "Failed to register project folder."
+                return
+            }
+            if (200..<300).contains(result.statusCode) {
+                self.statusLabel.stringValue = "Registered \(self.projectDisplayName(url.path)) as a known Guard project."
+                self.reloadEvents(nil)
+            } else {
+                self.statusLabel.stringValue = self.daemonErrorMessage(result) ?? "Failed to register project folder."
+            }
+        }
+        if let window {
+            panel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(panel.runModal())
+        }
+    }
+
     @objc func reloadEvents(_ sender: Any?) {
+        if sender is Timer {
+            guard !fullRefreshInFlight, pendingAlertCount == 0 else { return }
+        }
+        fullRefreshInFlight = true
+        defer { fullRefreshInFlight = false }
         let previousKey = selectedEventKey
         let previousRowKey = selectedActivityRowKey
         let loaded = loadEvents()
@@ -4653,14 +7154,12 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         activityRows = buildActivityRows(from: filteredEventsForMonitor())
         suppressSelectionChange = true
         tableView.reloadData()
-        if let previousRowKey = previousRowKey, let index = activityRows.firstIndex(where: { $0.rowKey == previousRowKey }) {
-            tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
-            selectedActivityRowKey = activityRows[index].rowKey
-            selectedEventKey = activityRows[index].event.map(eventKey)
-        } else if let previousKey = previousKey, let index = activityRows.firstIndex(where: { $0.event.map(eventKey) == previousKey }) {
-            tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
-            selectedActivityRowKey = activityRows[index].rowKey
-            selectedEventKey = activityRows[index].event.map(eventKey)
+        restoreOutlineExpansion()
+        resizeActivityColumns()
+        resetActivityTableScrollOrigin()
+        if let previousRowKey = previousRowKey, selectActivityRow(rowKey: previousRowKey) {
+        } else if let previousKey = previousKey, let row = activityRows.first(where: { $0.event.map(eventKey) == previousKey }), selectActivityRow(rowKey: row.rowKey) {
+        } else if selectFirstActivityRow() {
         } else {
             selectedEventKey = nil
             selectedActivityRowKey = nil
@@ -4669,6 +7168,15 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         suppressSelectionChange = false
         renderSelectedInspectorIfNeeded(force: sender != nil && !(sender is Timer))
         statusLabel.stringValue = "\(events.count) recent event\(events.count == 1 ? "" : "s") · \(daemonStatusText) · auto-refresh on"
+        (NSApp.delegate as? GuardApplicationDelegate)?.statusController?.refresh()
+    }
+
+    @objc func focusSearch(_ sender: Any?) {
+        if let toolbarSearchField {
+            window?.makeFirstResponder(toolbarSearchField)
+        } else {
+            window?.makeFirstResponder(monitorSearchField)
+        }
     }
 
     func rebuildActivityRows(keepSelection: Bool) {
@@ -4677,14 +7185,12 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         activityRows = buildActivityRows(from: filteredEventsForMonitor())
         suppressSelectionChange = true
         tableView.reloadData()
-        if let previousRowKey = previousRowKey, let index = activityRows.firstIndex(where: { $0.rowKey == previousRowKey }) {
-            tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
-            selectedActivityRowKey = activityRows[index].rowKey
-            selectedEventKey = activityRows[index].event.map(eventKey)
-        } else if let previousKey = previousKey, let index = activityRows.firstIndex(where: { $0.event.map(eventKey) == previousKey }) {
-            tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
-            selectedActivityRowKey = activityRows[index].rowKey
-            selectedEventKey = activityRows[index].event.map(eventKey)
+        restoreOutlineExpansion()
+        resizeActivityColumns()
+        resetActivityTableScrollOrigin()
+        if let previousRowKey = previousRowKey, selectActivityRow(rowKey: previousRowKey) {
+        } else if let previousKey = previousKey, let row = activityRows.first(where: { $0.event.map(eventKey) == previousKey }), selectActivityRow(rowKey: row.rowKey) {
+        } else if selectFirstActivityRow() {
         } else {
             selectedEventKey = nil
             selectedActivityRowKey = nil
@@ -4697,11 +7203,14 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     func filteredEventsForMonitor() -> [GuardMonitorEvent] {
         let query = monitorSearchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let selectedFilter = monitorFilterControl.selectedSegment
+        let cutoff = monitorTimeWindowMinutes.flatMap {
+            Calendar.current.date(byAdding: .minute, value: -$0, to: Date())
+        }
         return events.filter { event in
             let filterMatches: Bool
             switch selectedFilter {
             case 1:
-                filterMatches = event.type == "network.decision" || event.type.hasPrefix("guard.alert.")
+                filterMatches = isNetworkActivity(event)
             case 2:
                 filterMatches = event.result == "deny" || event.result == "denied"
             case 3:
@@ -4712,23 +7221,103 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 filterMatches = true
             }
             guard filterMatches else { return false }
+            if let cutoff, let date = monitorEventDate(event.at), date < cutoff {
+                return false
+            }
             guard !query.isEmpty else { return true }
+            return monitorEvent(event, matchesQuery: query)
+        }
+    }
+
+    func monitorEvent(_ event: GuardMonitorEvent, matchesQuery query: String) -> Bool {
+        let tokens = query
+            .split(whereSeparator: \.isWhitespace)
+            .map(String.init)
+            .filter { !$0.isEmpty }
+        guard !tokens.isEmpty else { return true }
+        return tokens.allSatisfy { token in
+            let parts = token.split(separator: ":", maxSplits: 1).map(String.init)
+            if parts.count == 2 {
+                return monitorScopedValue(parts[0], event: event).contains(parts[1])
+            }
             let haystack = [
                 appLabel(for: event),
+                processLabel(for: event),
+                commandDisplay(event.command),
                 event.host,
                 event.target,
                 event.type,
                 event.result,
                 event.detail,
                 event.profile,
-                event.projectDir
+                event.projectDir,
+                event.processPath,
+                event.launcherApp,
+                event.launcherProcess,
+                event.parentChain,
+                event.bundleIdentifier,
+                humanDecisionReason(event.detail, fallback: activityLabel(for: event))
             ].joined(separator: " ").lowercased()
-            return haystack.contains(query)
+            return haystack.contains(token)
         }
+    }
+
+    func monitorScopedValue(_ scope: String, event: GuardMonitorEvent) -> String {
+        switch scope {
+        case "app", "application":
+            return appLabel(for: event).lowercased()
+        case "process", "proc", "cmd", "command":
+            return [
+                processLabel(for: event),
+                commandDisplay(event.command),
+                event.processPath,
+                event.launcherApp,
+                event.launcherProcess,
+                event.parentChain
+            ].joined(separator: " ").lowercased()
+        case "host", "domain", "destination", "dest":
+            return [event.host, event.target].joined(separator: " ").lowercased()
+        case "rule", "reason", "decision":
+            return [event.result, event.detail, humanDecisionReason(event.detail, fallback: activityLabel(for: event))].joined(separator: " ").lowercased()
+        case "path", "project", "file":
+            return [event.projectDir, event.cwd, event.processPath, event.detail].joined(separator: " ").lowercased()
+        case "profile":
+            return event.profile.lowercased()
+        case "type", "kind":
+            return event.type.lowercased()
+        default:
+            return [
+                appLabel(for: event),
+                processLabel(for: event),
+                event.host,
+                event.target,
+                event.type,
+                event.result,
+                event.detail,
+                event.profile,
+                event.projectDir,
+                event.processPath,
+                event.launcherApp,
+                event.launcherProcess,
+                event.parentChain
+            ].joined(separator: " ").lowercased()
+        }
+    }
+
+    func monitorEventDate(_ value: String) -> Date? {
+        guard !value.isEmpty else { return nil }
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = iso.date(from: value) {
+            return date
+        }
+        iso.formatOptions = [.withInternetDateTime]
+        return iso.date(from: value)
     }
 
     func updateTrafficSummary() {
         let networkEvents = events.filter { $0.type == "network.decision" }
+        let proxyEvents = events.filter { $0.type == "proxy.started" }
         recentAllowedCount = networkEvents.filter { $0.result == "allow" }.count
         recentDeniedCount = networkEvents.filter { $0.result == "deny" }.count
         var counts: [String: Int] = [:]
@@ -4736,7 +7325,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             counts[event.host, default: 0] += 1
         }
         recentTopHost = counts.sorted { lhs, rhs in lhs.value == rhs.value ? lhs.key < rhs.key : lhs.value > rhs.value }.first?.key ?? "-"
-        trafficSummaryLabel.stringValue = "\(recentAllowedCount) allowed · \(recentDeniedCount) denied · \(pendingAlertCount) pending"
+        trafficSummaryLabel.stringValue = "\(recentAllowedCount) allowed · \(recentDeniedCount) denied · \(proxyEvents.count) proxy · \(pendingAlertCount) pending"
         footerAllowedRateLabel.stringValue = "allowed \(recentAllowedCount)"
         footerDeniedRateLabel.stringValue = "denied \(recentDeniedCount)"
         trafficSummaryLabel.textColor = pendingAlertCount > 0 || recentDeniedCount > 0 ? .systemOrange : .secondaryLabelColor
@@ -4794,7 +7383,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     func loadEvents() -> [GuardMonitorEvent] {
         if let daemonEvents = loadDaemonEvents() {
-            return daemonEvents
+            return loadKnownProjectEvents() + daemonEvents
         }
         daemonConnected = false
         daemonStatusText = managedDaemon?.isRunning == true ? "guardd starting" : "guardd offline; showing local JSONL"
@@ -4828,19 +7417,66 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             return nil
         }
         daemonConnected = true
-        if let health = client.getJSON(path: "/health") {
-            daemonHealthText = summarizeHealth(health)
-        }
-        loadPendingAlertState(client: client)
+        writeManagedDaemonConnection(url: client.baseURL.absoluteString, token: client.apiToken ?? "")
         daemonStatusText = managedDaemon == nil ? "guardd connected" : "guardd managed by monitor"
         daemonStateLabel.stringValue = daemonStatusText
         daemonStateLabel.textColor = .systemGreen
-        loadDaemonPolicyState(profile: selectedProfileName.isEmpty ? config.profile : selectedProfileName)
         return rawEvents.map { event(from: $0) }
     }
 
+    func loadKnownProjectEvents() -> [GuardMonitorEvent] {
+        guard let client = daemonClient,
+              let json = client.getJSON(path: "/projects"),
+              let projects = json["projects"] as? [[String: Any]] else {
+            return []
+        }
+        return projects.flatMap { project -> [GuardMonitorEvent] in
+            let root = project["root"] as? String ?? ""
+            let label = project["label"] as? String ?? projectDisplayName(root)
+            let profiles = project["profiles"] as? [[String: Any]] ?? []
+            return profiles.map { profile in
+                let name = profile["name"] as? String ?? "guard"
+                let allowed = profile["allowedDomainsCount"].map { "\($0)" } ?? "0"
+                let denied = profile["deniedDomainsCount"].map { "\($0)" } ?? "0"
+                let description = profile["description"] as? String ?? ""
+                return GuardMonitorEvent(
+                    id: "project:\(root):\(name)",
+                    at: "",
+                    type: "guard.project.profile",
+                    profile: name,
+                    projectDir: root,
+                    cwd: root,
+                    runDir: "",
+                    command: "\(label) \(name)",
+                    processPath: profile["path"] as? String ?? "",
+                    launcherApp: "",
+                    launcherProcess: "",
+                    launcherPid: 0,
+                    parentChain: "",
+                    pid: 0,
+                    bundleIdentifier: "",
+                    bytesSent: 0,
+                    bytesReceived: 0,
+                    host: "",
+                    target: name,
+                    result: "inactive",
+                    detail: [description, "\(allowed) allowed domains", "\(denied) denied domains"].filter { !$0.isEmpty }.joined(separator: " · "),
+                    status: "inactive",
+                    expiresAt: "",
+                    duration: "",
+                    rulePersisted: false,
+                    ruleId: ""
+                )
+            }
+        }
+    }
+
     func loadPendingAlertState(client: GuardDaemonClient) {
-        guard let pendingJSON = client.pendingAlerts(limit: 20) else {
+        applyPendingAlertState(client.pendingAlerts(limit: 20), client: client)
+    }
+
+    func applyPendingAlertState(_ pendingJSON: [String: Any]?, client: GuardDaemonClient) {
+        guard let pendingJSON else {
             pendingAlertCount = 0
             pendingAlertSummaryText = "Pending alerts unavailable."
             return
@@ -4852,6 +7488,149 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         pendingAlertSummaryText = pendingAlertCount == 0
             ? "none pending, \(expired) expired"
             : "\(pendingAlertCount) pending\(hostPreview.isEmpty ? "" : ": \(hostPreview)")"
+        presentNextPendingAlert(alerts, client: client)
+    }
+
+    @objc func pollPendingAlerts(_ sender: Any?) {
+        guard daemonConnected, let client = daemonClient else { return }
+        guard !pendingAlertPollInFlight else { return }
+        pendingAlertPollInFlight = true
+        DispatchQueue.global(qos: .userInteractive).async {
+            let pending = client.pendingAlerts(limit: 8)
+            DispatchQueue.main.async {
+                self.pendingAlertPollInFlight = false
+                self.applyPendingAlertState(pending, client: client)
+                self.trafficSummaryLabel.stringValue = "\(self.recentAllowedCount) allowed · \(self.recentDeniedCount) denied · pending \(self.pendingAlertCount)"
+                self.trafficSummaryLabel.textColor = self.pendingAlertCount > 0 || self.recentDeniedCount > 0 ? .systemOrange : .secondaryLabelColor
+            }
+        }
+    }
+
+    func writeManagedDaemonConnection(url: String, token: String) {
+        let file = managedDaemonConnectionPath()
+        let payload: [String: Any] = [
+            "url": url,
+            "token": token,
+            "pid": managedDaemon?.processIdentifier ?? 0,
+            "updatedAt": ISO8601DateFormatter().string(from: Date())
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]) else { return }
+        try? FileManager.default.createDirectory(atPath: (file as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        try? data.write(to: URL(fileURLWithPath: file), options: [.atomic])
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file)
+    }
+
+    func removeManagedDaemonConnection() {
+        try? FileManager.default.removeItem(atPath: managedDaemonConnectionPath())
+    }
+
+    func managedDaemonConnectionPath() -> String {
+        let base = (eventLogPath() as NSString).deletingLastPathComponent
+        return (base as NSString).appendingPathComponent("guardd-connection.json")
+    }
+
+    func presentNextPendingAlert(_ alerts: [[String: Any]], client: GuardDaemonClient) {
+        guard let alert = alerts.first(where: { alert in
+            let id = alert["id"] as? String ?? ""
+            return !id.isEmpty && !presentedPendingAlertIds.contains(id)
+        }) else { return }
+        let id = alert["id"] as? String ?? ""
+        presentedPendingAlertIds.insert(id)
+        DispatchQueue.main.async {
+            self.presentPendingAlert(alert, client: client)
+        }
+    }
+
+    func presentPendingAlert(_ alert: [String: Any], client: GuardDaemonClient) {
+        let id = alert["id"] as? String ?? ""
+        guard !id.isEmpty else { return }
+        let host = alert["host"] as? String ?? ""
+        let method = alert["method"] as? String ?? ""
+        let path = alert["path"] as? String ?? ""
+        let port = Int("\(alert["port"] ?? 0)") ?? 0
+        let profile = alert["profile"] as? String ?? selectedProfileName
+        let command = alert["command"] as? String ?? "Guard run"
+        let projectDir = alert["projectDir"] as? String ?? ""
+        let runDir = alert["runDir"] as? String ?? ""
+        let isHTTP = !method.isEmpty || !path.isEmpty
+        let controller: GuardConnectionPromptController
+        if isHTTP {
+            controller = GuardConnectionPromptController(
+                titleText: "HTTP Policy Request",
+                actor: command,
+                destination: "\(method.isEmpty ? "HTTP" : method) \(host)\(path)",
+                context: "Choose the narrowest HTTP rule that fits this request.",
+                scopeRows: [
+                    ("Type", "HTTP request"),
+                    ("TLS", "Inspected by iron-proxy for this guarded process"),
+                    ("Host", host)
+                ],
+                detailRows: [
+                    ("Host", host),
+                    ("Method", method.isEmpty ? "GET" : method),
+                    ("Path", path.isEmpty ? "/" : path),
+                    ("Profile", profile),
+                    ("Project", projectDir),
+                    ("Run", runDir)
+                ],
+                actions: [("Deny", .deny, false), ("Allow", .allowExact, true)],
+                scopeOptions: [
+                    ("Exact method and path", .allowExact),
+                    ("Path group", .allowPath),
+                    ("Entire host: \(host)", .allowDomain)
+                ],
+                lifetimeOptions: promptLifetimeOptions(),
+                editablePath: path.isEmpty ? "/" : path
+            )
+        } else {
+            let parts = host.split(separator: ".")
+            let wildcard = parts.count > 2 ? "*." + parts.suffix(parts.count - 2).joined(separator: ".") : "*.\(host)"
+            controller = GuardConnectionPromptController(
+                titleText: "Connection Request",
+                actor: command,
+                destination: "\(host)\(port > 0 ? ":\(port)" : "")",
+                context: "Choose the narrowest network rule that fits this request.",
+                scopeRows: [
+                    ("Type", "Destination only"),
+                    ("TLS", "Not inspected; path and query are not visible here"),
+                    ("Profile", profile)
+                ],
+                detailRows: [
+                    ("Host", host),
+                    ("Port", port > 0 ? "\(port)" : "default"),
+                    ("Visibility", "Host and port before TLS handshake"),
+                    ("Project", projectDir),
+                    ("Run", runDir)
+                ],
+                actions: [("Deny", .deny, false), ("Allow", .allowOnce, true)],
+                scopeOptions: [
+                    ("Exact host: \(host)", .allowDomain),
+                    ("Subdomains: \(wildcard)", .allowPath)
+                ],
+                lifetimeOptions: promptLifetimeOptions()
+            )
+        }
+        let choice = controller.run()
+        let action = choice == .deny ? "deny" : "allow"
+        let scope = alertScopeName(choice)
+        _ = client.resolvePendingAlert(
+            alertId: id,
+            action: action,
+            duration: controller.selectedDuration,
+            scope: scope,
+            ifMatch: controller.selectedDuration == "forever" ? profileVersionText : nil
+        )
+        reloadEvents(nil)
+    }
+
+    func alertScopeName(_ choice: GuardPromptChoice) -> String {
+        switch choice {
+        case .allowExact: return "exact"
+        case .allowPath: return "path"
+        case .allowDomain: return "domain"
+        case .allowOnce: return "once"
+        case .deny: return ""
+        }
     }
 
     func loadDaemonPolicyState(profile: String) {
@@ -4974,7 +7753,46 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     func extractRuleRows(_ json: [String: Any]) -> [MonitorRuleRow] {
         let config = json["config"] as? [String: Any] ?? json
+        let typedRules = (json["typedRules"] as? [[String: Any]] ?? []) + (json["temporaryRules"] as? [[String: Any]] ?? [])
+        if !typedRules.isEmpty {
+            return typedRules.map { typedRule in
+                let layer = typedRule["layer"] as? String ?? ""
+                let value = typedRule["value"] ?? typedRule["scope"] ?? ""
+                let lifetime = typedRule["lifetime"] as? String ?? "persistent"
+                let expiresAt = typedRule["expiresAt"] as? String ?? ""
+                let approval = typedRule["approvalState"] as? String ?? "approved"
+                let notes = typedRule["notes"] as? String ?? ""
+                let detail = [
+                    layer.isEmpty ? nil : layer,
+                    lifetime.isEmpty ? nil : lifetime,
+                    expiresAt.isEmpty ? nil : "expires \(shortTime(expiresAt))",
+                    approval == "approved" ? nil : approval,
+                    notes.isEmpty ? nil : notes
+                ].compactMap { $0 }.joined(separator: " · ")
+                return MonitorRuleRow(
+                    id: typedRule["id"] as? String ?? "",
+                    kind: ruleKindLabel(layer: layer, field: typedRule["field"] as? String ?? ""),
+                    action: typedRule["action"] as? String ?? "allow",
+                    scope: typedRule["scope"] as? String ?? "",
+                    detail: detail.isEmpty ? "Typed Guard rule" : detail,
+                    enabled: typedRule["enabled"] as? Bool ?? true,
+                    source: typedRule["source"] as? String ?? "profile",
+                    field: typedRule["field"] as? String ?? "",
+                    value: value,
+                    layer: layer,
+                    lifetime: lifetime,
+                    approvalState: approval,
+                    notes: notes,
+                    expiresAt: expiresAt
+                )
+            }.sorted { lhs, rhs in
+                if lhs.enabled != rhs.enabled { return lhs.enabled && !rhs.enabled }
+                if lhs.lifetime != rhs.lifetime { return lhs.lifetime < rhs.lifetime }
+                return lhs.scope.localizedCaseInsensitiveCompare(rhs.scope) == .orderedAscending
+            }
+        }
         let network = config["network"] as? [String: Any] ?? [:]
+        let filesystem = config["filesystem"] as? [String: Any] ?? [:]
         let metadata = config["ruleMetadata"] as? [String: Any] ?? [:]
         let source = json["source"] as? String ?? "profile"
         var rows: [MonitorRuleRow] = []
@@ -5004,6 +7822,34 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 source: source,
                 field: "network.deniedDomains",
                 value: domain
+            ))
+        }
+
+        for preset in network["deniedDomainPresets"] as? [String] ?? [] {
+            rows.append(MonitorRuleRow(
+                kind: "Domain",
+                action: "deny",
+                scope: preset,
+                detail: "Deny preset; expands at policy evaluation time",
+                enabled: true,
+                source: source,
+                field: "network.deniedDomainPresets",
+                value: preset
+            ))
+        }
+
+        for raw in network["allowedRawTcp"] as? [[String: Any]] ?? [] {
+            let host = raw["host"] as? String ?? raw["ip"] as? String ?? "unknown"
+            let port = raw["port"].map { "\($0)" } ?? "any"
+            rows.append(MonitorRuleRow(
+                kind: "Raw TCP",
+                action: "allow",
+                scope: "\(host):\(port)",
+                detail: raw["resolveAtLaunch"] as? Bool == true ? "Resolved once when guarded run starts" : (raw["reason"] as? String ?? "Direct TCP exception"),
+                enabled: true,
+                source: source,
+                field: "network.allowedRawTcp",
+                value: raw
             ))
         }
 
@@ -5046,6 +7892,77 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             ))
         }
 
+        let filesystemFields: [(String, String, String, String)] = [
+            ("filesystem.allowRead", "Filesystem", "allow", "Read"),
+            ("filesystem.allowWrite", "Filesystem", "allow", "Write"),
+            ("filesystem.denyRead", "Filesystem", "deny", "Deny read"),
+            ("filesystem.denyWrite", "Filesystem", "deny", "Deny write")
+        ]
+        for (field, kind, action, detail) in filesystemFields {
+            let key = field.split(separator: ".").last.map(String.init) ?? field
+            for path in filesystem[key] as? [String] ?? [] {
+                let meta = metadataFor(scope: path, metadata: metadata)
+                rows.append(MonitorRuleRow(
+                    kind: kind,
+                    action: action,
+                    scope: path,
+                    detail: meta.detail.isEmpty ? detail : "\(detail), \(meta.detail)",
+                    enabled: meta.enabled,
+                    source: source,
+                    field: field,
+                    value: path
+                ))
+            }
+        }
+
+        for key in [
+            "allowLocalBinding",
+            "allowLoopbackConnections",
+            "allowLoopbackHighPorts",
+            "allowLoopbackListeningHighPorts"
+        ] {
+            if let enabled = network[key] as? Bool {
+                rows.append(MonitorRuleRow(
+                    kind: "Local Net",
+                    action: enabled ? "allow" : "deny",
+                    scope: key,
+                    detail: enabled ? "Local networking enabled by profile" : "Local networking disabled by profile",
+                    enabled: true,
+                    source: source,
+                    field: "network.\(key)",
+                    value: enabled
+                ))
+            }
+        }
+
+        if let ports = network["allowLoopbackPorts"] as? [Int], !ports.isEmpty {
+            rows.append(MonitorRuleRow(
+                kind: "Local Net",
+                action: "allow",
+                scope: ports.map(String.init).joined(separator: ", "),
+                detail: "Allowed loopback ports",
+                enabled: true,
+                source: source,
+                field: "network.allowLoopbackPorts",
+                value: ports
+            ))
+        }
+
+        if let tls = network["tlsInspection"] as? [String: Any] {
+            let enabled = tls["enabled"] as? Bool == true
+            let mode = tls["mode"] as? String ?? (enabled ? "enabled" : "off")
+            rows.append(MonitorRuleRow(
+                kind: "TLS",
+                action: enabled ? "allow" : "deny",
+                scope: "TLS inspection",
+                detail: "mode \(mode), CA \(tls["caScope"] as? String ?? "default")",
+                enabled: true,
+                source: source,
+                field: "network.tlsInspection",
+                value: tls
+            ))
+        }
+
         for (key, value) in metadata {
             guard let entry = value as? [String: Any],
                   entry["disabled"] as? Bool == true,
@@ -5068,6 +7985,20 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             if lhs.enabled != rhs.enabled { return lhs.enabled && !rhs.enabled }
             if lhs.action != rhs.action { return lhs.action < rhs.action }
             return lhs.scope.localizedCaseInsensitiveCompare(rhs.scope) == .orderedAscending
+        }
+    }
+
+    func ruleKindLabel(layer: String, field: String) -> String {
+        switch layer {
+        case "http": return "HTTP"
+        case "raw-tcp": return "Raw TCP"
+        case "filesystem": return "Filesystem"
+        case "destination": return "Domain"
+        default:
+            if field == "network.httpRules" { return "HTTP" }
+            if field == "network.allowedRawTcp" { return "Raw TCP" }
+            if field.hasPrefix("filesystem.") { return "Filesystem" }
+            return "Rule"
         }
     }
 
@@ -5145,6 +8076,14 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     }
 
     func summarizeExtensionSync(_ json: [String: Any]) -> String {
+        if let status = json["status"] as? [String: Any] {
+            let running = status["running"] as? Bool == true ? "running" : "not running"
+            let degraded = status["degraded"] as? Bool == true ? "degraded" : "healthy"
+            let stale = status["stale"] as? Bool == true ? "stale" : "fresh"
+            let fallback = status["fallbackMode"] as? String ?? "unknown fallback"
+            let heartbeat = status["lastHeartbeatAt"] as? String ?? "no heartbeat"
+            return "\(running), \(degraded), \(stale), fallback \(fallback), heartbeat \(heartbeat)"
+        }
         let configured = json["configured"] as? Bool == true
         let invalidated = json["invalidated"] as? Bool == true
         let validDigest = json["validPolicyDigest"] as? Bool == true
@@ -5237,7 +8176,19 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         let host = json["host"] as? String ?? ""
         let port = json["port"].map { "\($0)" } ?? ""
         let command = json["command"] as? String ?? ""
-        let target = host.isEmpty ? command : "\(host)\(port.isEmpty ? "" : ":\(port)")"
+        let proxyTarget: String
+        if type == "proxy.started" {
+            let httpPort = json["httpProxyPort"].map { "\($0)" } ?? ""
+            let socksPort = json["socksProxyPort"].map { "\($0)" } ?? ""
+            let listeners = [
+                httpPort.isEmpty ? nil : "HTTP 127.0.0.1:\(httpPort)",
+                socksPort.isEmpty ? nil : "SOCKS 127.0.0.1:\(socksPort)"
+            ].compactMap { $0 }
+            proxyTarget = listeners.isEmpty ? "Local proxy" : listeners.joined(separator: ", ")
+        } else {
+            proxyTarget = ""
+        }
+        let target = host.isEmpty ? (proxyTarget.isEmpty ? command : proxyTarget) : "\(host)\(port.isEmpty ? "" : ":\(port)")"
         let status = json["status"] as? String ?? ""
         let result: String
         if type == "network.decision" {
@@ -5253,6 +8204,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             json["backend"] as? String,
             json["reason"] as? String,
             status.isEmpty ? nil : "status=\(status)",
+            proxyTarget.isEmpty ? nil : proxyTarget,
             json["method"] as? String,
             json["path"] as? String
         ].compactMap { $0 }.filter { !$0.isEmpty }
@@ -5266,6 +8218,10 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             runDir: json["runDir"] as? String ?? "",
             command: command,
             processPath: json["processPath"] as? String ?? json["executablePath"] as? String ?? "",
+            launcherApp: json["launcherApp"] as? String ?? "",
+            launcherProcess: json["launcherProcess"] as? String ?? "",
+            launcherPid: Int("\(json["launcherPid"] ?? 0)") ?? 0,
+            parentChain: json["parentChain"] as? String ?? "",
             pid: Int("\(json["pid"] ?? 0)") ?? 0,
             bundleIdentifier: json["bundleIdentifier"] as? String ?? json["bundleId"] as? String ?? "",
             bytesSent: Int("\(json["bytesSent"] ?? json["sentBytes"] ?? json["uploadBytes"] ?? 0)") ?? 0,
@@ -5275,7 +8231,10 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             result: result,
             detail: detailParts.joined(separator: " "),
             status: status,
-            expiresAt: json["expiresAt"] as? String ?? ""
+            expiresAt: json["expiresAt"] as? String ?? "",
+            duration: json["duration"] as? String ?? "",
+            rulePersisted: json["rulePersisted"] as? Bool ?? false,
+            ruleId: json["ruleId"] as? String ?? ""
         )
     }
 
@@ -5307,16 +8266,18 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         var rows: [MonitorActivityRow] = []
         for app in order {
             let groupEvents = grouped[app] ?? []
-            let summary = projectSummary(for: groupEvents)
-            let network = groupEvents.filter { !$0.host.isEmpty }
-            let denied = network.filter { $0.result == "deny" }.count
-            let allowed = network.filter { $0.result == "allow" }.count
-            let domains = Set(network.map { $0.host }).count
+            let summary = projectSummary(for: groupEvents, allowSubprocess: false)
+            let network = groupEvents.filter { isNetworkActivity($0) }
+            let decisions = network.filter { !$0.host.isEmpty }
+            let denied = decisions.filter { $0.result == "deny" }.count
+            let allowed = decisions.filter { $0.result == "allow" }.count
+            let domains = Set(decisions.map { $0.host }).count
             let fileLike = groupEvents.filter { isFileActivity($0) }.count
             let summaryParts = [
                 domains == 0 ? nil : "\(domains) destination\(domains == 1 ? "" : "s")",
-                network.isEmpty ? nil : "\(allowed) allowed",
+                decisions.isEmpty ? nil : "\(allowed) allowed",
                 denied == 0 ? nil : "\(denied) denied",
+                network.contains { $0.type == "proxy.started" } ? "proxy ready" : nil,
                 policyTableSummary(summary),
                 showingFiles && fileLike > 0 ? "\(fileLike) file event\(fileLike == 1 ? "" : "s")" : nil
             ].compactMap { $0 }
@@ -5333,55 +8294,54 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 time: "",
                 event: groupEvents.first
             ))
-            if !expandedApps.contains(appKey) {
-                continue
+            if let summary {
+                rows.append(contentsOf: policyRows(for: summary, appKey: appKey, event: groupEvents.first))
             }
 
             let visibleEvents = showingFiles
                 ? groupEvents
-                : groupEvents.filter { !$0.host.isEmpty || $0.type.hasPrefix("guard.alert.") || isRunLifecycleActivity($0) }
+                : groupEvents.filter { isNetworkActivity($0) || isRunLifecycleActivity($0) }
             let processGroups = Dictionary(grouping: visibleEvents, by: { processLabel(for: $0) })
             for process in processGroups.keys.sorted(by: sortProcessNames) {
                 let processEvents = processGroups[process] ?? []
-                let processNetwork = processEvents.filter { !$0.host.isEmpty }
-                let hasRunPolicy = processEvents.contains(where: isRunLifecycleActivity)
-                if processNetwork.isEmpty && !showingFiles && !hasRunPolicy {
+                let processNetwork = processEvents.filter { isNetworkActivity($0) }
+                let processDecisions = processNetwork.filter { !$0.host.isEmpty }
+                let hasFilePolicy = processEvents.contains(where: isFileActivity)
+                let hasKnownConfig = processEvents.contains { $0.type == "guard.project.profile" }
+                if processDecisions.isEmpty && (!showingFiles || !hasFilePolicy) && !hasKnownConfig {
                     continue
                 }
-                let processDenied = processNetwork.filter { $0.result == "deny" }.count
-                let processAllowed = processNetwork.filter { $0.result == "allow" }.count
-                let processSummary = projectSummary(for: processEvents) ?? summary
+                let processDenied = processDecisions.filter { $0.result == "deny" }.count
+                let processAllowed = processDecisions.filter { $0.result == "allow" }.count
                 let processKey = "\(appKey)/process:\(process)"
+                let processRowLabel = process == app ? "Connections" : process
                 rows.append(MonitorActivityRow(
                     isGroup: true,
                     kind: "process",
                     level: 1,
                     rowKey: processKey,
-                    app: process,
+                    app: processRowLabel,
                     destination: topDestinationSummary(for: processEvents),
                     activity: [
-                        processNetwork.isEmpty ? nil : "\(processAllowed) allowed",
+                        processDecisions.isEmpty ? nil : "\(processAllowed) allowed",
                         processDenied == 0 ? nil : "\(processDenied) denied",
-                        processSummary.map { "policy: \(policyTableSummary($0) ?? "loaded")" },
                         showingFiles && processEvents.contains(where: isFileActivity) ? "filesystem policy" : nil,
-                        processEvents.contains { $0.type == "proxy.started" || !$0.host.isEmpty } ? "proxy/TLS managed" : nil
+                        hasKnownConfig ? "inactive configuration" : nil,
+                        proxyManagementLabel(for: processEvents)
                     ].compactMap { $0 }.joined(separator: " · "),
                     decision: processDenied > 0 ? "review" : "active",
                     time: shortTime(processEvents.first?.at ?? ""),
                     event: processEvents.first
                 ))
 
-                if !expandedApps.contains(processKey) {
-                    continue
-                }
-
-                let hosts = Dictionary(grouping: processNetwork, by: { hostListLabel(for: $0) })
+                let hosts = Dictionary(grouping: processDecisions, by: { hostListLabel(for: $0) })
                 for host in hosts.keys.sorted() {
                     let hostEvents = hosts[host] ?? []
                     let hostDenied = hostEvents.contains { $0.result == "deny" }
                     let hostAllowed = hostEvents.filter { $0.result == "allow" }.count
                     let hostBlocked = hostEvents.filter { $0.result == "deny" }.count
                     let representative = hostEvents.first
+                    let temporary = hostEvents.compactMap { temporaryRuleSummary(for: $0) }.first
                     rows.append(MonitorActivityRow(
                         isGroup: false,
                         kind: "destination",
@@ -5390,17 +8350,32 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                         app: host,
                         destination: hostPortLabel(for: representative ?? hostEvents[0]),
                         activity: hostDenied
-                            ? "Blocked by network policy · \(hostBlocked) denied"
-                            : "Allowed by network policy · \(hostAllowed) allowed",
+                            ? ["Blocked by network policy", "\(hostBlocked) denied", temporary].compactMap { $0 }.joined(separator: " · ")
+                            : ["Allowed by network policy", "\(hostAllowed) allowed", temporary].compactMap { $0 }.joined(separator: " · "),
                         decision: hostDenied ? "deny" : "allow",
                         time: shortTime(representative?.at ?? ""),
                         event: representative
                     ))
                 }
 
-                let nonNetwork = showingFiles
-                    ? processEvents.filter { $0.host.isEmpty && isFileActivity($0) }
-                    : []
+                for event in processNetwork.filter({ $0.type == "proxy.started" }).prefix(2) {
+                    rows.append(MonitorActivityRow(
+                        isGroup: false,
+                        kind: "proxy",
+                        level: 2,
+                        rowKey: "\(processKey)/proxy:\(eventKey(event))",
+                        app: "Local proxy",
+                        destination: event.target.isEmpty ? "Local proxy" : event.target,
+                        activity: "HTTP/SOCKS listeners ready for this guarded run",
+                        decision: "active",
+                        time: shortTime(event.at),
+                        event: event
+                    ))
+                }
+
+                let nonNetwork = processEvents.filter {
+                    $0.host.isEmpty && ((showingFiles && isFileActivity($0)) || $0.type == "guard.project.profile")
+                }
                 for event in nonNetwork.prefix(3) {
                     rows.append(MonitorActivityRow(
                         isGroup: false,
@@ -5424,6 +8399,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                     let hostEvents = hosts[host] ?? []
                     let hostDenied = hostEvents.contains { $0.result == "deny" }
                     let representative = hostEvents.first
+                    let temporary = hostEvents.compactMap { temporaryRuleSummary(for: $0) }.first
                     rows.append(MonitorActivityRow(
                         isGroup: false,
                         kind: "destination",
@@ -5431,7 +8407,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                         rowKey: "\(appKey)/host:\(host)",
                         app: host,
                         destination: host,
-                        activity: hostDenied ? "Blocked by network policy" : "Allowed by network policy",
+                        activity: [hostDenied ? "Blocked by network policy" : "Allowed by network policy", temporary].compactMap { $0 }.joined(separator: " · "),
                         decision: hostDenied ? "deny" : "allow",
                         time: shortTime(representative?.at ?? ""),
                         event: representative
@@ -5439,7 +8415,47 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 }
             }
         }
-        return rows
+        return rows.filter { !hiddenActivityRowKeys.contains($0.rowKey) }
+    }
+
+    func proxyManagementLabel(for events: [GuardMonitorEvent]) -> String? {
+        if events.contains(where: { $0.detail.contains("iron-proxy") }) {
+            return "TLS inspected"
+        }
+        if events.contains(where: { $0.type == "proxy.started" || !$0.host.isEmpty }) {
+            return "proxy routed"
+        }
+        return nil
+    }
+
+    func temporaryRuleSummary(for event: GuardMonitorEvent) -> String? {
+        guard event.type != "guard.alert.pending" else { return nil }
+        let duration = event.duration.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if event.rulePersisted || duration == "forever" {
+            return "persistent rule"
+        }
+        if let remaining = timeLeftText(event.expiresAt) {
+            return "temporary · \(remaining) left"
+        }
+        if duration == "once" {
+            return "one-time rule"
+        }
+        if duration == "session" {
+            return "temporary · session"
+        }
+        return nil
+    }
+
+    func timeLeftText(_ iso: String) -> String? {
+        guard let date = monitorEventDate(iso) else { return nil }
+        let seconds = Int(date.timeIntervalSinceNow)
+        guard seconds > 0 else { return "expired" }
+        if seconds < 90 { return "\(seconds)s" }
+        let minutes = seconds / 60
+        if minutes < 90 { return "\(minutes)m" }
+        let hours = minutes / 60
+        if hours < 48 { return "\(hours)h" }
+        return "\(hours / 24)d"
     }
 
     func processLabel(for event: GuardMonitorEvent) -> String {
@@ -5491,6 +8507,12 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         return value.contains("file") || value.contains("sandbox") || value.contains("read") || value.contains("write")
     }
 
+    func isNetworkActivity(_ event: GuardMonitorEvent) -> Bool {
+        event.type == "network.decision" ||
+            event.type == "proxy.started" ||
+            event.type.hasPrefix("guard.alert.")
+    }
+
     func topDestinationSummary(for events: [GuardMonitorEvent]) -> String {
         var counts: [String: Int] = [:]
         let networkEvents = events.filter { !$0.host.isEmpty }
@@ -5520,6 +8542,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         }
         if event.type == "process.started" || event.type == "process.exited" {
             return commandDisplay(event.command)
+        }
+        if event.type == "guard.project.profile" {
+            return event.profile.isEmpty ? "guard profile" : event.profile
         }
         if event.type == "proxy.started" {
             return "Local proxy"
@@ -5551,7 +8576,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     func groupSummaryText(for app: String) -> String {
         let groupEvents = events.filter { appLabel(for: $0) == app }
-        let network = groupEvents.filter { $0.type == "network.decision" || $0.type.hasPrefix("guard.alert.") }
+        let network = groupEvents.filter { isNetworkActivity($0) }
         let denied = network.filter { $0.result == "deny" || $0.result == "denied" }.count
         let allowed = network.filter { $0.result == "allow" || $0.result == "allowed" }.count
         let fileEvents = groupEvents.filter { isFileActivity($0) }
@@ -5573,13 +8598,110 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         ].joined(separator: "\n")
     }
 
+    func childRows(of item: Any?) -> [MonitorActivityRow] {
+        guard let parentKey = item as? String,
+              let parent = activityRows.first(where: { $0.rowKey == parentKey }) else {
+            return activityRows.filter { $0.level == 0 }
+        }
+        guard let parentIndex = activityRows.firstIndex(where: { $0.rowKey == parent.rowKey }) else {
+            return []
+        }
+        var children: [MonitorActivityRow] = []
+        var index = parentIndex + 1
+        while index < activityRows.count {
+            let row = activityRows[index]
+            if row.level <= parent.level { break }
+            if row.level == parent.level + 1 {
+                children.append(row)
+            }
+            index += 1
+        }
+        return children
+    }
+
+    func childRowKeys(of item: Any?) -> [String] {
+        childRows(of: item).map(\.rowKey)
+    }
+
+    func activityRow(atVisibleRow row: Int) -> MonitorActivityRow? {
+        guard row >= 0 else { return nil }
+        guard let key = tableView.item(atRow: row) as? String else { return nil }
+        return activityRows.first { $0.rowKey == key }
+    }
+
+    func restoreOutlineExpansion() {
+        for row in activityRows where row.isGroup && expandedApps.contains(row.rowKey) {
+            tableView.expandItem(row.rowKey)
+        }
+    }
+
+    @discardableResult
+    func selectActivityRow(rowKey: String) -> Bool {
+        guard let row = activityRows.first(where: { $0.rowKey == rowKey }) else { return false }
+        expandAncestors(for: row)
+        let visibleRow = tableView.row(forItem: row.rowKey)
+        guard visibleRow >= 0 else { return false }
+        tableView.selectRowIndexes(IndexSet(integer: visibleRow), byExtendingSelection: false)
+        selectedActivityRowKey = row.rowKey
+        selectedEventKey = row.event.map(eventKey)
+        return true
+    }
+
+    @discardableResult
+    func selectFirstActivityRow() -> Bool {
+        guard tableView.numberOfRows > 0, let row = activityRow(atVisibleRow: 0) else { return false }
+        tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        selectedActivityRowKey = row.rowKey
+        selectedEventKey = row.event.map(eventKey)
+        return true
+    }
+
+    func expandAncestors(for row: MonitorActivityRow) {
+        var currentLevel = row.level - 1
+        guard currentLevel >= 0, let rowIndex = activityRows.firstIndex(where: { $0.rowKey == row.rowKey }) else { return }
+        var index = rowIndex - 1
+        while index >= 0 && currentLevel >= 0 {
+            let candidate = activityRows[index]
+            if candidate.level == currentLevel {
+                expandedApps.insert(candidate.rowKey)
+                tableView.expandItem(candidate.rowKey)
+                currentLevel -= 1
+            }
+            index -= 1
+        }
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
+        childRowKeys(of: item).count
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
+        childRowKeys(of: item)[index]
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
+        !childRowKeys(of: item).isEmpty
+    }
+
     func numberOfRows(in tableView: NSTableView) -> Int {
-        activityRows.count
+        self.tableView.numberOfRows
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard row < activityRows.count else { return nil }
-        let activityRow = activityRows[row]
+        guard let activityRow = activityRow(atVisibleRow: row) else { return nil }
+        return activityCellView(for: activityRow, tableColumn: tableColumn, row: row)
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
+        guard let rowKey = item as? String,
+              let activityRow = activityRows.first(where: { $0.rowKey == rowKey }) else {
+            return nil
+        }
+        let row = outlineView.row(forItem: item)
+        return activityCellView(for: activityRow, tableColumn: tableColumn, row: row)
+    }
+
+    func activityCellView(for activityRow: MonitorActivityRow, tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let id = tableColumn?.identifier.rawValue ?? ""
         let text: String
         switch id {
@@ -5594,12 +8716,14 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         }
         let cell = NSTableCellView()
         let label = NSTextField(labelWithString: text)
-        label.lineBreakMode = .byTruncatingMiddle
+        label.lineBreakMode = .byTruncatingTail
         label.font = activityRow.isGroup
-            ? NSFont.systemFont(ofSize: 12.6, weight: .semibold)
+            ? NSFont.systemFont(ofSize: 12.4, weight: id == "activity" ? .regular : .medium)
             : NSFont.systemFont(ofSize: 11.5)
         if id == "decision" {
             label.textColor = decisionColor(text)
+        } else if activityRow.kind.hasPrefix("policy-") && id != "activity" {
+            label.textColor = activityRow.isGroup ? .labelColor : .secondaryLabelColor
         } else if id == "activity" && activityRow.isGroup {
             label.textColor = .secondaryLabelColor
         } else if activityRow.isGroup {
@@ -5624,12 +8748,20 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         stack.translatesAutoresizingMaskIntoConstraints = false
         cell.addSubview(stack)
 
-        let canEditNetworkRule = row.kind == "destination" && row.event?.host.isEmpty == false
-        if !canEditNetworkRule {
-            let state = label(row.decision, size: 10.8, weight: .semibold, color: decisionColor(row.decision))
-            state.alignment = .left
-            state.translatesAutoresizingMaskIntoConstraints = false
-            stack.addArrangedSubview(state)
+        let editable = editablePolicyTarget(for: row)
+        if editable == nil {
+            let lifecycle = policyLifecycle(for: row)
+            guard lifecycle != nil || (!row.decision.isEmpty && row.decision != "active") else {
+                return cell
+            }
+            if let lifecycle {
+                stack.addArrangedSubview(policyLifecycleChip(lifecycle.text, color: lifecycle.color, tooltip: lifecycle.tooltip))
+            } else {
+                let state = label(row.decision, size: 10.8, weight: .semibold, color: decisionColor(row.decision))
+                state.alignment = .left
+                state.translatesAutoresizingMaskIntoConstraints = false
+                stack.addArrangedSubview(state)
+            }
             NSLayoutConstraint.activate([
                 stack.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 6),
                 stack.trailingAnchor.constraint(lessThanOrEqualTo: cell.trailingAnchor, constant: -8),
@@ -5639,16 +8771,20 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         }
 
         let control = HoverPolicySwitch()
-        control.selectedSegment = row.decision == "deny" || row.decision == "review" ? 0 : 1
+        control.selectedSegment = row.kind == "policy-deny-host" || row.kind == "policy-deny-read" || row.kind == "policy-deny-write" || row.decision == "deny" || row.decision == "review" ? 0 : 1
         control.target = self
         control.action = #selector(policySwitchChanged(_:))
         control.tag = rowIndex
-        control.toolTip = "Allow or deny this domain"
+        if let lifecycle = policyLifecycle(for: row), lifecycle.text != "live" {
+            control.toolTip = "\(editable?.tooltip ?? "Allow or deny"). Applies on \(lifecycle.text)."
+        } else {
+            control.toolTip = editable?.tooltip ?? "Allow or deny"
+        }
         stack.addArrangedSubview(control)
 
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(greaterThanOrEqualTo: cell.leadingAnchor, constant: 4),
-            stack.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -14),
+            stack.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -26),
             stack.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
         ])
         return cell
@@ -5656,7 +8792,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     @objc func policySwitchChanged(_ sender: NSControl) {
         let row = sender.tag
-        guard row >= 0, row < activityRows.count, let event = activityRows[row].event, !event.host.isEmpty else { return }
+        guard let activityRow = activityRow(atVisibleRow: row),
+              let target = editablePolicyTarget(for: activityRow),
+              let event = activityRow.event else { return }
         tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
         let selectedSegment: Int
         if let policySwitch = sender as? HoverPolicySwitch {
@@ -5667,10 +8805,65 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             selectedSegment = 1
         }
         if selectedSegment == 0 {
-            addSelectedDomain(to: "network.deniedDomains")
+            setExclusiveRuleValue(target.value, event: event, allowField: target.allowField, denyField: target.denyField, allow: false)
         } else {
-            addSelectedDomain(to: "network.allowedDomains")
+            setExclusiveRuleValue(target.value, event: event, allowField: target.allowField, denyField: target.denyField, allow: true)
         }
+    }
+
+    func editablePolicyTarget(for row: MonitorActivityRow) -> (value: String, allowField: String, denyField: String, tooltip: String)? {
+        if row.kind == "destination", row.event?.host.isEmpty == false {
+            return (row.event!.host, "network.allowedDomains", "network.deniedDomains", "Allow or deny this domain")
+        }
+        if row.kind == "policy-allow-host" || row.kind == "policy-deny-host" {
+            return row.app.isEmpty ? nil : (row.app, "network.allowedDomains", "network.deniedDomains", "Allow or deny this domain")
+        }
+        if row.kind == "policy-read" || row.kind == "policy-deny-read" {
+            return row.app.isEmpty ? nil : (row.app, "filesystem.allowRead", "filesystem.denyRead", "Allow or deny reads for this path")
+        }
+        if row.kind == "policy-write" || row.kind == "policy-deny-write" {
+            return row.app.isEmpty ? nil : (row.app, "filesystem.allowWrite", "filesystem.denyWrite", "Allow or deny writes for this path")
+        }
+        return nil
+    }
+
+    func policyLifecycle(for row: MonitorActivityRow) -> (text: String, color: NSColor, tooltip: String)? {
+        switch row.kind {
+        case "destination", "policy-allow-host", "policy-deny-host":
+            return ("live", .systemGreen, "Applies to new proxy decisions in this run.")
+        case "policy-read", "policy-write", "policy-deny-read", "policy-deny-write":
+            return ("next run", .secondaryLabelColor, "Filesystem sandbox rules are generated when a guarded run starts.")
+        case "policy-raw-tcp", "policy-proxy-env", "policy-socks-env", "policy-loopback":
+            return ("next run", .secondaryLabelColor, "Proxy environment and direct TCP exceptions are fixed for the current guarded run.")
+        case "policy-http":
+            return ("proxy reload", .systemOrange, "Deep HTTP rules are enforced by the proxy and require a proxy reload or the next run.")
+        case "policy-tls":
+            if row.destination == "off" {
+                return ("setup", .systemBlue, "TLS inspection depends on proxy and certificate setup.")
+            }
+            return ("proxy reload", .systemOrange, "TLS inspection changes require proxy and certificate state to be refreshed.")
+        default:
+            return nil
+        }
+    }
+
+    func policyLifecycleChip(_ text: String, color: NSColor, tooltip: String) -> NSView {
+        let chip = CardView(fill: color.withAlphaComponent(0.10), border: color.withAlphaComponent(0.28))
+        chip.layer?.cornerRadius = 5
+        chip.toolTip = tooltip
+        chip.translatesAutoresizingMaskIntoConstraints = false
+        let title = label(text, size: 9.5, weight: .semibold, color: color)
+        title.alignment = .center
+        title.translatesAutoresizingMaskIntoConstraints = false
+        chip.addSubview(title)
+        NSLayoutConstraint.activate([
+            title.leadingAnchor.constraint(equalTo: chip.leadingAnchor, constant: 6),
+            title.trailingAnchor.constraint(equalTo: chip.trailingAnchor, constant: -6),
+            title.centerYAnchor.constraint(equalTo: chip.centerYAnchor),
+            chip.heightAnchor.constraint(equalToConstant: 20),
+            chip.widthAnchor.constraint(greaterThanOrEqualToConstant: text.count > 8 ? 74 : 56)
+        ])
+        return chip
     }
 
     func decisionColor(_ text: String) -> NSColor {
@@ -5707,27 +8900,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         let stack = NSStackView()
         stack.orientation = .horizontal
         stack.alignment = .centerY
-        stack.spacing = 7
+        stack.spacing = 5
         stack.translatesAutoresizingMaskIntoConstraints = false
         cell.addSubview(stack)
-
-        let disclosure = NSButton()
-        disclosure.title = ""
-        disclosure.target = self
-        disclosure.action = #selector(toggleActivityGroupButton(_:))
-        disclosure.bezelStyle = .disclosure
-        disclosure.setButtonType(.pushOnPushOff)
-        let expandable = row.isGroup
-        disclosure.state = expandedApps.contains(row.rowKey) ? .on : .off
-        disclosure.tag = rowIndex
-        disclosure.isBordered = true
-        disclosure.controlSize = .small
-        disclosure.toolTip = expandedApps.contains(row.rowKey) ? "Collapse \(row.app)" : "Expand \(row.app)"
-        disclosure.isHidden = !expandable
-        disclosure.translatesAutoresizingMaskIntoConstraints = false
-        disclosure.widthAnchor.constraint(equalToConstant: 16).isActive = true
-        disclosure.heightAnchor.constraint(equalToConstant: 16).isActive = true
-        stack.addArrangedSubview(disclosure)
 
         let imageView = NSImageView()
         imageView.image = iconForActivityRow(row)
@@ -5738,11 +8913,11 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 : row.decision == "review" ? .systemOrange : .secondaryLabelColor
         }
         imageView.translatesAutoresizingMaskIntoConstraints = false
-        imageView.widthAnchor.constraint(equalToConstant: 20).isActive = true
-        imageView.heightAnchor.constraint(equalToConstant: 20).isActive = true
+        imageView.widthAnchor.constraint(equalToConstant: 18).isActive = true
+        imageView.heightAnchor.constraint(equalToConstant: 18).isActive = true
         stack.addArrangedSubview(imageView)
 
-        let name = label(row.app, size: row.isGroup ? 12.8 : 12, weight: row.kind == "destination" ? .medium : .semibold)
+        let name = label(row.app, size: row.isGroup ? 12.6 : 12, weight: row.kind == "destination" ? .regular : .medium)
         name.lineBreakMode = .byTruncatingTail
         if row.kind == "destination" {
             name.textColor = .labelColor
@@ -5750,7 +8925,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         stack.addArrangedSubview(name)
 
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 7 + CGFloat(row.level * 22)),
+            stack.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 3),
             stack.trailingAnchor.constraint(lessThanOrEqualTo: cell.trailingAnchor, constant: -6),
             stack.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
         ])
@@ -5759,8 +8934,8 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     @objc func toggleActivityGroupButton(_ sender: NSButton) {
         let row = sender.tag
-        guard row >= 0, row < activityRows.count, activityRows[row].isGroup else { return }
-        toggleActivityGroup(row: activityRows[row])
+        guard let activityRow = activityRow(atVisibleRow: row), activityRow.isGroup else { return }
+        toggleActivityGroup(row: activityRow)
     }
 
     func toggleActivityGroup(named app: String) {
@@ -5776,29 +8951,40 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             expandedApps.insert(key)
         }
         rebuildActivityRows(keepSelection: false)
-        if let index = activityRows.firstIndex(where: { $0.rowKey == key }) {
-            tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
-        }
+        _ = selectActivityRow(rowKey: key)
     }
 
     func toggleActivityGroup(row: MonitorActivityRow) {
         didAutoExpandActivityGroups = true
         if expandedApps.contains(row.rowKey) {
             expandedApps.remove(row.rowKey)
+            tableView.collapseItem(row.rowKey)
         } else {
             expandedApps.insert(row.rowKey)
+            tableView.expandItem(row.rowKey)
         }
-        rebuildActivityRows(keepSelection: false)
-        if let index = activityRows.firstIndex(where: { $0.rowKey == row.rowKey }) {
-            tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        _ = selectActivityRow(rowKey: row.rowKey)
+    }
+
+    func descendantRange(in rows: [MonitorActivityRow], parentIndex: Int) -> Range<Int> {
+        guard parentIndex >= 0 && parentIndex < rows.count else {
+            return parentIndex..<parentIndex
         }
+        let parentLevel = rows[parentIndex].level
+        var end = parentIndex + 1
+        while end < rows.count && rows[end].level > parentLevel {
+            end += 1
+        }
+        return (parentIndex + 1)..<end
     }
 
     func iconForApp(_ app: String) -> NSImage? {
         let lower = app.lowercased()
         if #available(macOS 11.0, *) {
             let symbol: String
-            if lower.contains("packetsafari") || lower.contains("course") {
+            if lower.contains("warp") || lower.contains("iterm") || lower.contains("terminal") || lower.contains("ghostty") {
+                symbol = "terminal.fill"
+            } else if lower.contains("packetsafari") || lower.contains("course") {
                 symbol = "folder.fill"
             } else if lower.contains("node") || lower.contains("npm") || lower.contains("pnpm") {
                 symbol = "terminal.fill"
@@ -5818,6 +9004,20 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     }
 
     func iconForActivityRow(_ row: MonitorActivityRow) -> NSImage? {
+        if row.kind.hasPrefix("policy-") {
+            if #available(macOS 11.0, *) {
+                let symbol: String
+                switch row.kind {
+                case "policy-network": symbol = "network"
+                case "policy-files": symbol = "folder.badge.gearshape"
+                case "policy-proxy": symbol = "lock.shield"
+                default: symbol = "list.bullet.rectangle"
+                }
+                let config = NSImage.SymbolConfiguration(pointSize: 17, weight: .semibold)
+                return NSImage(systemSymbolName: symbol, accessibilityDescription: row.app)?.withSymbolConfiguration(config)
+            }
+            return NSImage(named: NSImage.infoName)
+        }
         if row.kind == "destination" {
             if #available(macOS 11.0, *) {
                 let symbol = row.decision == "deny" ? "xmark.circle.fill" : "globe"
@@ -5852,8 +9052,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
         let view = MonitorRowView()
-        if row < activityRows.count {
-            let activityRow = activityRows[row]
+        if let activityRow = activityRow(atVisibleRow: row) {
             view.group = activityRow.isGroup
             view.odd = row % 2 == 1
             view.denied = activityRow.isGroup && activityRow.decision == "review"
@@ -5862,7 +9061,28 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     }
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
-        row < activityRows.count && activityRows[row].isGroup ? 30 : 23
+        activityRow(atVisibleRow: row)?.isGroup == true ? 30 : 23
+    }
+
+    func appLabel(_ label: String, decoratedWithLauncherFor event: GuardMonitorEvent) -> String {
+        let launcher = event.launcherApp.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !launcher.isEmpty else { return label }
+        let launcherLower = launcher.lowercased()
+        if launcherLower == "guard" || launcherLower == "node" || launcherLower == "zsh" || launcherLower == "bash" || launcherLower == "sh" {
+            return label
+        }
+        let labelLower = label.lowercased()
+        if labelLower.contains(" via ") || labelLower.contains(launcherLower) {
+            return label
+        }
+        let commandLower = event.command.lowercased()
+        let directCommand = commandLower.contains("curl") ||
+            commandLower.contains("git") ||
+            commandLower.contains("python") ||
+            commandLower.contains("node") ||
+            commandLower.contains("pnpm") ||
+            commandLower.contains("npm")
+        return directCommand ? "\(label) via \(launcher)" : label
     }
 
     func appLabel(for event: GuardMonitorEvent) -> String {
@@ -5877,17 +9097,17 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 return project
             }
         }
-        if lower.contains("pnpm") { return "pnpm" }
-        if lower.contains("npm") { return "npm" }
-        if lower.contains("node") { return "Node" }
-        if lower.contains("git") { return "Git" }
-        if lower.contains("curl") { return "curl" }
-        if lower.contains("python") { return "Python" }
-        if lower.contains("guard") { return "Guard" }
+        if lower.contains("pnpm") { return appLabel("pnpm", decoratedWithLauncherFor: event) }
+        if lower.contains("npm") { return appLabel("npm", decoratedWithLauncherFor: event) }
+        if lower.contains("node") { return appLabel("Node", decoratedWithLauncherFor: event) }
+        if lower.contains("git") { return appLabel("Git", decoratedWithLauncherFor: event) }
+        if lower.contains("curl") { return appLabel("curl", decoratedWithLauncherFor: event) }
+        if lower.contains("python") { return appLabel("Python", decoratedWithLauncherFor: event) }
+        if lower.contains("guard") { return appLabel("Guard", decoratedWithLauncherFor: event) }
         if !event.profile.isEmpty && event.profile != "guard" {
-            return event.profile
+            return appLabel(event.profile, decoratedWithLauncherFor: event)
         }
-        return event.profile.isEmpty ? "Guarded command" : event.profile
+        return appLabel(event.profile.isEmpty ? "Guarded command" : event.profile, decoratedWithLauncherFor: event)
     }
 
     func projectDisplayName(_ path: String) -> String {
@@ -5914,6 +9134,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         if event.type == "process.exited" {
             return event.result == "exit 0" ? "Command finished" : "Command failed"
         }
+        if event.type == "guard.project.profile" { return "Inactive configuration" }
         if event.type == "sandbox.profile_written" { return "Sandbox applied" }
         if event.type == "guard.alert.pending" { return "Needs a decision" }
         if event.type == "guard.alert.decision" { return "Decision recorded" }
@@ -5973,14 +9194,13 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard !suppressSelectionChange else { return }
         let row = tableView.selectedRow
-        guard row >= 0 && row < activityRows.count else {
+        guard let activityRow = activityRow(atVisibleRow: row) else {
             selectedEventKey = nil
             selectedActivityRowKey = nil
             renderedInspectorRowKey = nil
             updateInspector(nil)
             return
         }
-        let activityRow = activityRows[row]
         selectedActivityRowKey = activityRow.rowKey
         if renderedInspectorRowKey == activityRow.rowKey {
             return
@@ -6014,6 +9234,21 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             updateActionButtons(nil)
             return
         }
+        if activityRow.kind.hasPrefix("policy-") {
+            selectedEventKey = nil
+            inspectorHelpLabel.stringValue = "Configuration"
+            inspectorTitleLabel.stringValue = activityRow.app
+            renderGroupDetailsPanel(app: appLabelForRowKey(activityRow.rowKey))
+            inspectorSummaryStack.isHidden = false
+            inspectorBodyLabel.isHidden = true
+            inspectorBodyLabel.stringValue = ""
+            inspectorRuleLabel.isHidden = false
+            inspectorNoteLabel.isHidden = false
+            inspectorRuleLabel.stringValue = "This row is configuration from the active Guard profile, not a runtime event."
+            inspectorNoteLabel.stringValue = "Use Rules to edit persistent domains, HTTP rules, raw TCP rules, and disabled rule state."
+            updateActionButtons(nil)
+            return
+        }
         guard let event = activityRow.event else {
             selectedEventKey = nil
             renderedInspectorRowKey = nil
@@ -6029,14 +9264,13 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     func renderSelectedInspectorIfNeeded(force: Bool) {
         let row = tableView.selectedRow
-        guard row >= 0 && row < activityRows.count else {
+        guard let activityRow = activityRow(atVisibleRow: row) else {
             if force || renderedInspectorRowKey != nil {
                 renderedInspectorRowKey = nil
                 updateInspector(nil)
             }
             return
         }
-        let activityRow = activityRows[row]
         selectedActivityRowKey = activityRow.rowKey
         guard force || renderedInspectorRowKey != activityRow.rowKey else { return }
         renderedInspectorRowKey = nil
@@ -6056,8 +9290,12 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 let app = NSApplication.shared
 let appDelegate = GuardApplicationDelegate()
 app.delegate = appDelegate
+if runCliAskModeIfNeeded() {
+    exit(0)
+}
+
 app.setActivationPolicy(.regular)
-installMainMenu(appName: "Guard Monitor")
+installMainMenu(appName: "Guard Monitor", delegate: appDelegate)
 if let iconURL = Bundle.main.url(forResource: "GuardAppIcon", withExtension: "icns"),
    let bundledIcon = NSImage(contentsOf: iconURL) {
     app.applicationIconImage = bundledIcon
@@ -6065,25 +9303,20 @@ if let iconURL = Bundle.main.url(forResource: "GuardAppIcon", withExtension: "ic
     app.applicationIconImage = NSImage(systemSymbolName: "network.badge.shield.half.filled", accessibilityDescription: "Guard")
 }
 
-if runCliAskModeIfNeeded() {
-    exit(0)
-}
-
 do {
     let config = try loadConfig()
     if config.mode == "monitor" {
         let controller = MonitorWindowController(config: config)
+        appDelegate.monitorController = controller
+        appDelegate.statusController = GuardStatusItemController(monitor: controller)
         controller.show()
-        withExtendedLifetime(controller) {
-            app.run()
-        }
+        app.run()
     } else {
         let summary = try loadSummary(config: config)
         let controller = LauncherWindowController(config: config, summary: summary)
+        appDelegate.launcherController = controller
         controller.show()
-        withExtendedLifetime(controller) {
-            app.run()
-        }
+        app.run()
     }
 } catch {
     showError(error.localizedDescription)
