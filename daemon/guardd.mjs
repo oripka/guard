@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { URL } from 'node:url'
 import {
+  buildTypedRules,
   buildPolicySnapshot,
   MUTABLE_PROFILE_ARRAY_FIELDS,
   evaluateNetworkPolicy,
@@ -19,6 +20,7 @@ import {
   profileVersion,
   profileVersionInfo,
   readJsonFile,
+  stableJson,
   writeJsonFile,
 } from '../lib/guard-policy.mjs'
 
@@ -134,6 +136,7 @@ Endpoints:
   GET /events/query?limit=N&type=network.decision&host=api.example.com
   GET /events/index
   GET /events/integrity
+  GET /projects
   GET /alerts?limit=N
   GET /alerts/pending?limit=N
   GET /auth/token
@@ -153,6 +156,7 @@ Endpoints:
   POST /alerts/:id/resolve
   POST /auth/token/rotate
   POST /auth/token/persist
+  POST /projects
   POST /profiles/:name/rules
   POST /profiles/:name/tls
   POST /events/truncate
@@ -979,6 +983,168 @@ const templateSummary = (templatePath) => {
   }
 }
 
+const projectDisplayName = (projectRoot) => {
+  const base = path.basename(projectRoot)
+  return base || projectRoot
+}
+
+const hasGuardProfiles = (projectRoot) =>
+  listJsonFiles(path.join(projectRoot, '.guard')).length > 0
+
+const defaultProjectScanRoots = (env = process.env) => {
+  const configured = env.GUARD_PROJECT_SCAN_ROOTS || env.GUARD_CODE_ROOT || ''
+  if (configured) {
+    return configured
+      .split(path.delimiter)
+      .map((entry) => path.resolve(expandHome(entry.trim())))
+      .filter(Boolean)
+  }
+  return [path.join(os.homedir(), 'code')]
+}
+
+const discoverGuardProjects = ({ roots = defaultProjectScanRoots(), maxDepth = 3 } = {}) => {
+  const projects = []
+  const seen = new Set()
+  const skipNames = new Set([
+    '.git',
+    '.hg',
+    '.svn',
+    'node_modules',
+    '.next',
+    '.nuxt',
+    '.turbo',
+    '.cache',
+    'Library',
+    'Applications',
+  ])
+  const visit = (dir, depth) => {
+    if (!dir || seen.has(dir) || depth > maxDepth) return
+    seen.add(dir)
+    if (hasGuardProfiles(dir)) {
+      projects.push({
+        root: dir,
+        label: projectDisplayName(dir),
+        addedAt: '',
+        source: 'auto-scan',
+      })
+      return
+    }
+    let entries = []
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || skipNames.has(entry.name)) continue
+      if (entry.name.startsWith('.') && entry.name !== '.guard') continue
+      visit(path.join(dir, entry.name), depth + 1)
+    }
+  }
+  for (const root of roots) visit(root, 0)
+  return projects
+}
+
+class ProjectRegistry {
+  constructor({ stateDir, policyRoot }) {
+    this.stateDir = stateDir || resolveGuardStateDir()
+    this.policyRoot = policyRoot
+    this.statePath = path.join(this.stateDir, 'known-projects.json')
+    this.projects = []
+    this.load()
+  }
+
+  load() {
+    const state = safeReadJsonFile(this.statePath, null)
+    const seen = new Set()
+    const entries = []
+    const add = (entry) => {
+      const rawRoot = String(entry?.root || entry?.path || '')
+      if (!rawRoot) return
+      const root = path.resolve(expandHome(rawRoot))
+      if (!root || seen.has(root)) return
+      seen.add(root)
+      entries.push({
+        root,
+        label: String(entry?.label || projectDisplayName(root)),
+        addedAt: String(entry?.addedAt || new Date().toISOString()),
+        source: String(entry?.source || 'user'),
+      })
+    }
+    if (Array.isArray(state?.projects)) {
+      for (const entry of state.projects) add(entry)
+    }
+    add({ root: this.policyRoot, label: projectDisplayName(this.policyRoot), source: 'policy-root' })
+    this.projects = entries
+  }
+
+  persist() {
+    fs.mkdirSync(this.stateDir, { recursive: true, mode: 0o700 })
+    writeJsonFile(this.statePath, {
+      schemaVersion: 1,
+      updatedAt: new Date().toISOString(),
+      projects: this.projects,
+    })
+  }
+
+  add({ root, label = '' }) {
+    const resolved = path.resolve(expandHome(String(root || '')))
+    if (!resolved) throw new Error('project root is required')
+    const guardDir = path.join(resolved, '.guard')
+    if (!fs.existsSync(guardDir)) throw new Error(`no .guard directory found in ${resolved}`)
+    const existing = this.projects.find((project) => project.root === resolved)
+    if (existing) {
+      existing.label = label || existing.label || projectDisplayName(resolved)
+      existing.updatedAt = new Date().toISOString()
+    } else {
+      this.projects.push({
+        root: resolved,
+        label: label || projectDisplayName(resolved),
+        addedAt: new Date().toISOString(),
+        source: 'user',
+      })
+    }
+    this.persist()
+    return this.projectSummary(resolved)
+  }
+
+  projectSummary(root) {
+    const project = this.projects.find((entry) => entry.root === root) || {
+      root,
+      label: projectDisplayName(root),
+      source: 'discovered',
+      addedAt: '',
+    }
+    const guardDir = path.join(root, '.guard')
+    const profiles = listJsonFiles(guardDir).map((filePath) => ({
+      ...profileSummary({ filePath, source: 'project' }),
+      projectRoot: root,
+      projectLabel: project.label,
+      active: false,
+    }))
+    return {
+      ...project,
+      guardDir,
+      exists: fs.existsSync(root),
+      hasGuardDir: fs.existsSync(guardDir),
+      profileCount: profiles.length,
+      profiles,
+    }
+  }
+
+  list() {
+    const seen = new Set()
+    return [...this.projects, ...discoverGuardProjects()]
+      .filter((project) => {
+        if (seen.has(project.root)) return false
+        seen.add(project.root)
+        return true
+      })
+      .map((project) => this.projectSummary(project.root))
+      .sort((left, right) => left.label.localeCompare(right.label))
+  }
+}
+
 const normalizeMatchVersion = (value) => {
   if (value === undefined || value === null || value === '') return ''
   const text = String(value).trim()
@@ -1548,15 +1714,31 @@ const extensionSyncState = ({ stateDir }) => {
   if (fileExists(paths.policyPath)) {
     policyDigest = `sha256:${crypto.createHash('sha256').update(fs.readFileSync(paths.policyPath)).digest('hex')}`
   }
+  const heartbeatMs = heartbeat?.at ? Date.parse(heartbeat.at) : NaN
+  const stale = !Number.isFinite(heartbeatMs) || Date.now() - heartbeatMs > 30_000
+  const invalidated = Boolean(manifest?.invalidatedAt)
+  const configured = Boolean(manifest)
+  const validPolicyDigest = Boolean(manifest?.policyDigest && policyDigest && manifest.policyDigest === policyDigest)
+  const fallbackMode = manifest?.fallback?.stalePolicy || manifest?.mode || 'not-configured'
   return {
     syncVersion: EXTENSION_SYNC_VERSION,
-    configured: Boolean(manifest),
+    configured,
+    status: {
+      installed: configured,
+      approved: Boolean(heartbeat),
+      running: Boolean(heartbeat) && !stale && !invalidated,
+      stale,
+      degraded: !configured || stale || invalidated || !validPolicyDigest,
+      fallbackMode,
+      lastHeartbeatAt: heartbeat?.at || '',
+      bypassDetectionEvents: 0,
+    },
     paths,
     manifest,
     heartbeat,
     policyDigest,
-    validPolicyDigest: Boolean(manifest?.policyDigest && policyDigest && manifest.policyDigest === policyDigest),
-    invalidated: Boolean(manifest?.invalidatedAt),
+    validPolicyDigest,
+    invalidated,
     generated: {
       dir: fs.existsSync(paths.dir),
       manifest: fileExists(paths.manifestPath),
@@ -1675,13 +1857,33 @@ const tlsSubjectAltName = (host) =>
     ? `IP:${host}`
     : `DNS:${host}`
 
+const certificateIsCa = (certificatePath) => {
+  if (!fileExists(certificatePath)) return false
+  try {
+    const output = execFileSync(opensslPath(), [
+      'x509',
+      '-in',
+      certificatePath,
+      '-noout',
+      '-text',
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+    return /Basic Constraints[\s\S]*CA:\s*TRUE/i.test(output)
+  } catch {
+    return false
+  }
+}
+
 const generateTlsCa = ({ stateDir, rotate = false, days = 30, commonName = 'Guard Local Development CA' }) => {
   const current = tlsCaMetadata({ stateDir })
   const caDir = current.paths.caDir
   fs.mkdirSync(caDir, { recursive: true, mode: 0o700 })
   const existing = current.generated.certificate || current.generated.privateKey || current.generated.metadata
-  if (existing && !rotate) {
+  const existingValid = existing && certificateIsCa(current.paths.certificatePath)
+  if (existing && existingValid && !rotate) {
     return { action: 'generate-ca', changed: false, ...tlsCaMetadata({ stateDir }) }
+  }
+  if (existing && !existingValid) {
+    rotate = true
   }
 
   const now = new Date().toISOString()
@@ -2270,21 +2472,28 @@ class PendingAlertQueue {
     this.stateDir = stateDir || resolveGuardStateDir()
     this.statePath = path.join(this.stateDir, 'pending-alerts.json')
     this.alerts = new Map()
+    this.decisions = []
     this.expiredCount = 0
     this.load()
   }
 
   load() {
     const state = safeReadJsonFile(this.statePath, null)
-    if (!state || !Array.isArray(state.alerts)) return
+    if (!state) return
     this.expiredCount = Number.isInteger(state.expiredCount) ? state.expiredCount : 0
-    for (const alert of state.alerts) {
-      if (!alert?.id) continue
-      this.alerts.set(String(alert.id), alert)
+    if (Array.isArray(state.alerts)) {
+      for (const alert of state.alerts) {
+        if (!alert?.id) continue
+        this.alerts.set(String(alert.id), alert)
+      }
+    }
+    if (Array.isArray(state.decisions)) {
+      this.decisions = state.decisions.filter((decision) => this.decisionActive(decision))
     }
   }
 
   persist() {
+    this.pruneDecisions()
     fs.mkdirSync(this.stateDir, { recursive: true, mode: 0o700 })
     writeJsonFile(this.statePath, {
       schemaVersion: 1,
@@ -2293,6 +2502,7 @@ class PendingAlertQueue {
       alerts: Array.from(this.alerts.values()).sort((left, right) =>
         String(right.createdAt).localeCompare(String(left.createdAt)),
       ),
+      decisions: this.decisions,
     })
   }
 
@@ -2312,6 +2522,112 @@ class PendingAlertQueue {
     const requested = Number.parseInt(String(body.timeoutMs || DEFAULT_ALERT_TIMEOUT_MS), 10)
     const timeoutMs = Math.max(1, Math.min(Number.isFinite(requested) ? requested : DEFAULT_ALERT_TIMEOUT_MS, MAX_ALERT_TIMEOUT_MS))
     return { timeoutMs, expiresAt: new Date(now + timeoutMs).toISOString() }
+  }
+
+  decisionExpiresAt(duration) {
+    const value = String(duration || 'once').toLowerCase()
+    if (value === 'forever' || value === 'session') return ''
+    const amount = Number.parseInt(value, 10)
+    const unit = value.replace(/^\d+/, '')
+    const unitMs = unit === 'm' ? 60_000 : unit === 'h' ? 3_600_000 : unit === 'd' ? 86_400_000 : 0
+    if (!amount || !unitMs) return ''
+    return new Date(Date.now() + amount * unitMs).toISOString()
+  }
+
+  decisionActive(decision) {
+    if (!decision || !decision.host || !decision.action) return false
+    if (!decision.expiresAt) return true
+    const expiresAtMs = Date.parse(decision.expiresAt)
+    return Number.isFinite(expiresAtMs) && expiresAtMs > Date.now()
+  }
+
+  pruneDecisions() {
+    this.decisions = this.decisions.filter((decision) => this.decisionActive(decision))
+  }
+
+  matchingDecision(body = {}) {
+    this.pruneDecisions()
+    const profile = String(body.profile || 'guard')
+    const host = sanitizeTlsHost(body.host || '')
+    const method = String(body.method || '')
+    const requestPath = String(body.path || '')
+    const launcherApp = String(body.launcherApp || '')
+    const launcherProcess = String(body.launcherProcess || '')
+    if (!host) return null
+    return this.decisions.find((decision) => {
+      if (decision.profile !== profile || decision.host !== host) return false
+      if (decision.method && decision.method !== method) return false
+      if (decision.path && decision.path !== requestPath) return false
+      if (decision.launcherApp && decision.launcherApp !== launcherApp) return false
+      if (decision.launcherProcess && decision.launcherProcess !== launcherProcess) return false
+      return true
+    }) || null
+  }
+
+  rememberDecision(event) {
+    if (!event || event.duration === 'once' || event.rulePersisted === true) return
+    const expiresAt = this.decisionExpiresAt(event.duration)
+    this.decisions = this.decisions.filter((decision) =>
+      !(decision.profile === event.profile &&
+        decision.host === event.host &&
+        String(decision.method || '') === String(event.method || '') &&
+        String(decision.path || '') === String(event.path || '') &&
+        String(decision.launcherApp || '') === String(event.launcherApp || '') &&
+        String(decision.launcherProcess || '') === String(event.launcherProcess || '')),
+    )
+    this.decisions.push({
+      profile: event.profile,
+      host: event.host,
+      port: event.port,
+      method: event.method || '',
+      path: event.path || '',
+      launcherApp: event.launcherApp || '',
+      launcherProcess: event.launcherProcess || '',
+      launcherPid: event.launcherPid || 0,
+      parentChain: event.parentChain || '',
+      action: event.action,
+      duration: event.duration,
+      expiresAt,
+      ruleId: event.ruleId || '',
+      createdAt: event.at || new Date().toISOString(),
+    })
+    this.persist()
+  }
+
+  temporaryRules() {
+    this.pruneDecisions()
+    return this.decisions.map((decision) => ({
+      schemaVersion: 1,
+      id: decision.ruleId || alertRuleId(decision),
+      field: decision.method || decision.path ? 'network.httpRules' : (decision.action === 'deny' ? 'network.deniedDomains' : 'network.allowedDomains'),
+      layer: decision.method || decision.path ? 'http' : 'destination',
+      action: decision.action,
+      scope: decision.method || decision.path
+        ? `${decision.method || '*'} ${decision.host}${decision.path ? ` ${decision.path}` : ''}`
+        : `${decision.host}${decision.port ? `:${decision.port}` : ''}`,
+      value: {
+        profile: decision.profile,
+        host: decision.host,
+        port: decision.port || 0,
+        method: decision.method || '',
+        path: decision.path || '',
+      },
+      source: 'alert-decision',
+      enabled: true,
+      lifetime: decision.duration || 'session',
+      approvalState: 'approved',
+      notes: 'Temporary/session rule from a Guard alert decision.',
+      processIdentity: {
+        launcherApp: decision.launcherApp || '',
+        launcherProcess: decision.launcherProcess || '',
+        launcherPid: decision.launcherPid || 0,
+        parentChain: decision.parentChain || '',
+      },
+      createdAt: decision.createdAt || '',
+      updatedAt: decision.createdAt || '',
+      expiresAt: decision.expiresAt || '',
+      auditHistory: [],
+    }))
   }
 
   create(body = {}) {
@@ -2340,6 +2656,10 @@ class PendingAlertQueue {
       command: String(body.command || ''),
       projectDir: String(body.projectDir || ''),
       runDir: String(body.runDir || ''),
+      launcherApp: String(body.launcherApp || ''),
+      launcherProcess: String(body.launcherProcess || ''),
+      launcherPid: Number.isInteger(Number(body.launcherPid)) ? Number(body.launcherPid) : 0,
+      parentChain: String(body.parentChain || ''),
       reason: body.reason || 'pending-alert',
       suggestedAction: body.suggestedAction || '',
       suggestedDuration: body.suggestedDuration || '',
@@ -2423,8 +2743,11 @@ class PendingAlertQueue {
     alert.decision = {
       action: decision.action,
       duration: decision.duration,
+      expiresAt: decision.expiresAt || '',
       rulePersisted: decision.rulePersisted === true,
       ruleId: decision.ruleId || '',
+      launcherApp: decision.launcherApp || '',
+      launcherProcess: decision.launcherProcess || '',
     }
     this.persist()
     this.emit({
@@ -2451,24 +2774,92 @@ const alertResolveId = (url) => {
   }
 }
 
+const alertRuleId = (event) => {
+  const key = stableJson({
+    profile: event.profile || '',
+    host: event.host || '',
+    port: event.port || 0,
+    method: event.method || '',
+    path: event.path || '',
+    launcherApp: event.launcherApp || '',
+    launcherProcess: event.launcherProcess || '',
+  })
+  return `rule_${crypto.createHash('sha256').update(key).digest('hex').slice(0, 16)}`
+}
+
+const alertDecisionExpiresAt = (duration) => {
+  const value = String(duration || 'once').toLowerCase()
+  if (value === 'forever' || value === 'session' || value === 'once') return ''
+  const amount = Number.parseInt(value, 10)
+  const unit = value.replace(/^\d+/, '')
+  const unitMs = unit === 'm' ? 60_000 : unit === 'h' ? 3_600_000 : unit === 'd' ? 86_400_000 : 0
+  if (!amount || !unitMs) return ''
+  return new Date(Date.now() + amount * unitMs).toISOString()
+}
+
+const wildcardPathFor = (requestPath) => {
+  const parts = String(requestPath || '/').split('/').filter(Boolean)
+  if (parts.length <= 1) return '/*'
+  return `/${parts.slice(0, -1).join('/')}/*`
+}
+
+const alertHttpRuleForScope = ({ host, method, requestPath, scope }) => {
+  const normalizedMethod = String(method || 'GET').toUpperCase()
+  const pathValue = String(requestPath || '/')
+  switch (String(scope || '').toLowerCase()) {
+  case 'exact':
+  case 'allow-exact':
+    return { host, methods: [normalizedMethod], paths: [pathValue] }
+  case 'path':
+  case 'allow-path':
+    return { host, methods: [normalizedMethod], paths: [wildcardPathFor(pathValue)] }
+  case 'api-group':
+  case 'allow-api-group': {
+    const parts = pathValue.split('/').filter(Boolean)
+    const group = parts.length > 0 ? `/${parts[0]}/*` : '/*'
+    return { host, methods: [normalizedMethod], paths: [group] }
+  }
+  case 'domain':
+  case 'host':
+  case 'allow-domain':
+    return { host }
+  default:
+    return null
+  }
+}
+
 const alertDecision = ({ body, policyStore, eventLogPath, tail }) => {
   const profile = String(body.profile || 'guard')
   const host = sanitizeTlsHost(body.host || '')
   const action = String(body.action || 'deny').toLowerCase()
   const duration = String(body.duration || 'once').toLowerCase()
+  const method = String(body.method || '')
+  const requestPath = String(body.path || '')
+  const scope = String(body.scope || body.ruleScope || '')
   if (!['allow', 'deny'].includes(action)) throw new Error(`unsupported alert action: ${action}`)
-  if (!['once', 'session', 'forever'].includes(duration)) throw new Error(`unsupported alert duration: ${duration}`)
+  if (!['once', 'session', '5m', '1h', '2d', '5d', 'forever'].includes(duration)) throw new Error(`unsupported alert duration: ${duration}`)
   if (!host) throw new Error('alert decision requires host')
-  const field = action === 'allow' ? 'network.allowedDomains' : 'network.deniedDomains'
+  const httpRule = action === 'allow' ? alertHttpRuleForScope({ host, method, requestPath, scope }) : null
+  const field = httpRule && duration === 'forever' ? 'network.httpRules' : action === 'allow' ? 'network.allowedDomains' : 'network.deniedDomains'
+  const launcherApp = String(body.launcherApp || '')
+  const launcherProcess = String(body.launcherProcess || '')
+  const launcherScoped = Boolean(launcherApp || launcherProcess)
   let mutation = null
-  if (duration === 'forever') {
-    mutation = policyStore.mutateArrayRule({
-      profile,
-      action: 'add',
-      field,
-      value: host,
-      ifMatch: body.ifMatch || body.version || body.expectedVersion,
-    })
+  if (duration === 'forever' && !launcherScoped) {
+    mutation = httpRule
+      ? policyStore.mutateHttpRule({
+          profile,
+          action: 'add',
+          rule: httpRule,
+          ifMatch: body.ifMatch || body.version || body.expectedVersion,
+        })
+      : policyStore.mutateArrayRule({
+          profile,
+          action: 'add',
+          field,
+          value: host,
+          ifMatch: body.ifMatch || body.version || body.expectedVersion,
+        })
   }
   const event = {
     schemaVersion: 1,
@@ -2480,18 +2871,25 @@ const alertDecision = ({ body, policyStore, eventLogPath, tail }) => {
     port: Number.isInteger(Number(body.port)) ? Number(body.port) : 0,
     alertId: body.alertId || '',
     resolvedAt: body.alertId ? new Date().toISOString() : '',
-    expiresAt: body.expiresAt || '',
-    method: body.method || '',
-    path: body.path || '',
+    expiresAt: alertDecisionExpiresAt(duration),
+    method,
+    path: requestPath,
+    scope,
+    suggestedRule: httpRule || null,
+    launcherApp,
+    launcherProcess,
+    launcherPid: Number.isInteger(Number(body.launcherPid)) ? Number(body.launcherPid) : 0,
+    parentChain: String(body.parentChain || ''),
     action,
     duration,
     allowed: action === 'allow',
-    rulePersisted: duration === 'forever',
-    field: duration === 'forever' ? field : '',
+    rulePersisted: duration === 'forever' && !launcherScoped,
+    field: duration === 'forever' && !launcherScoped ? field : '',
     ruleId: mutation?.ruleId || '',
     version: mutation?.version || '',
     reason: body.reason || 'user-alert-decision',
   }
+  event.ruleId ||= alertRuleId(event)
   appendJsonLine(eventLogPath, event)
   tail.push(event)
   return {
@@ -2502,9 +2900,10 @@ const alertDecision = ({ body, policyStore, eventLogPath, tail }) => {
   }
 }
 
-const createServer = ({ tail, policyStore, startedAt, apiToken, eventLogPath, stateDir = resolveGuardStateDir() }) => {
+const createServer = ({ tail, policyStore, projectRegistry, startedAt, apiToken, eventLogPath, stateDir = resolveGuardStateDir() }) => {
   const authState = createAuthState(apiToken)
   const pendingAlerts = new PendingAlertQueue({ eventLogPath, tail, stateDir })
+  const projects = projectRegistry || new ProjectRegistry({ stateDir, policyRoot: policyStore.policyRoot })
   return http.createServer(async (request, response) => {
     const url = new URL(request.url || '/', 'http://guardd.local')
 
@@ -2553,6 +2952,25 @@ const createServer = ({ tail, policyStore, startedAt, apiToken, eventLogPath, st
           })
         } catch (error) {
           writeJson(response, 400, { error: 'evaluate_failed', message: error.message })
+        }
+        return
+      }
+
+      if (url.pathname === '/projects') {
+        try {
+          const body = await readRequestJson(request)
+          const project = projects.add({
+            root: body.root || body.path || body.projectDir,
+            label: body.label || '',
+          })
+          writeJson(response, 200, {
+            schemaVersion: 1,
+            changed: true,
+            project,
+            projects: projects.list(),
+          })
+        } catch (error) {
+          writeJson(response, 400, { error: 'project_add_failed', message: error.message })
         }
         return
       }
@@ -2719,6 +3137,25 @@ const createServer = ({ tail, policyStore, startedAt, apiToken, eventLogPath, st
       if (url.pathname === '/alerts/pending') {
         try {
           const body = await readRequestJson(request)
+          const cached = pendingAlerts.matchingDecision(body)
+          if (cached) {
+            writeJson(response, 200, {
+              action: 'alert-decision',
+              changed: false,
+              cached: true,
+              decision: {
+                action: cached.action,
+                duration: cached.duration,
+                expiresAt: cached.expiresAt || '',
+                ruleId: cached.ruleId || '',
+                launcherApp: cached.launcherApp || '',
+                launcherProcess: cached.launcherProcess || '',
+              },
+              alert: null,
+              pending: pendingAlerts.list({ limit: 50 }),
+            })
+            return
+          }
           const alert = pendingAlerts.create(body)
           writeJson(response, 201, {
             action: 'alert-pending',
@@ -2750,6 +3187,10 @@ const createServer = ({ tail, policyStore, startedAt, apiToken, eventLogPath, st
               port: body.port ?? pending.port,
               method: body.method || pending.method,
               path: body.path || pending.path,
+              launcherApp: body.launcherApp || pending.launcherApp,
+              launcherProcess: body.launcherProcess || pending.launcherProcess,
+              launcherPid: body.launcherPid ?? pending.launcherPid,
+              parentChain: body.parentChain || pending.parentChain,
               expiresAt: pending.expiresAt,
               reason: body.reason || 'pending-alert-resolved',
             },
@@ -2758,6 +3199,7 @@ const createServer = ({ tail, policyStore, startedAt, apiToken, eventLogPath, st
             tail,
           })
           const alert = pendingAlerts.resolve({ id: resolveAlertId, decision: result.decision })
+          pendingAlerts.rememberDecision(result.decision)
           writeJson(response, 200, {
             ...result,
             action: 'alert-resolve',
@@ -2793,10 +3235,21 @@ const createServer = ({ tail, policyStore, startedAt, apiToken, eventLogPath, st
               writeJson(response, 409, { error: 'alert_not_pending', message: `pending alert is ${pending.status}`, alert: pending })
               return
             }
+            body.profile ||= pending.profile
+            body.host ||= pending.host
+            body.port ??= pending.port
+            body.method ||= pending.method
+            body.path ||= pending.path
+            body.launcherApp ||= pending.launcherApp
+            body.launcherProcess ||= pending.launcherProcess
+            body.launcherPid ??= pending.launcherPid
+            body.parentChain ||= pending.parentChain
+            body.expiresAt ||= pending.expiresAt
           }
           const result = alertDecision({ body, policyStore, eventLogPath, tail })
           if (body.alertId) {
             const alert = pendingAlerts.resolve({ id: body.alertId, decision: result.decision })
+            pendingAlerts.rememberDecision(result.decision)
             writeJson(response, 200, { ...result, alert, pending: pendingAlerts.list({ limit: 50 }) })
           } else {
             writeJson(response, 200, result)
@@ -2930,6 +3383,15 @@ const createServer = ({ tail, policyStore, startedAt, apiToken, eventLogPath, st
       return
     }
 
+    if (url.pathname === '/projects') {
+      writeJson(response, 200, {
+        schemaVersion: 1,
+        statePath: projects.statePath,
+        projects: projects.list(),
+      })
+      return
+    }
+
     if (url.pathname === '/auth/token') {
       writeJson(response, 200, authTokenMetadata(authState))
       return
@@ -3055,7 +3517,30 @@ const createServer = ({ tail, policyStore, startedAt, apiToken, eventLogPath, st
           repoRoot: policyStore.repoRoot,
           profile,
           effective: true,
+          typedRules: buildTypedRules(policy.config, { source: policy.source || 'effective-profile' }),
+          temporaryRules: pendingAlerts.temporaryRules().filter((rule) => rule.value?.profile === profile),
           ...policy,
+        })
+      })
+      return
+    }
+
+    if (url.pathname === '/rules') {
+      handleReadEndpoint(response, () => {
+        const profile = url.searchParams.get('profile') || 'guard'
+        const policy = policyStore.getEffectivePolicy(profile)
+        if (!policy) {
+          writeJson(response, 404, { error: 'profile_not_found', profile })
+          return
+        }
+        const temporaryRules = pendingAlerts.temporaryRules()
+          .filter((rule) => rule.value?.profile === profile)
+        writeJson(response, 200, {
+          schemaVersion: 1,
+          profile,
+          version: policy.effectiveVersion || policy.version,
+          typedRules: buildTypedRules(policy.config, { source: policy.source || 'effective-profile' }),
+          temporaryRules,
         })
       })
       return
@@ -3082,7 +3567,11 @@ const createServer = ({ tail, policyStore, startedAt, apiToken, eventLogPath, st
           return
         }
         response.setHeader('etag', `"${profile.version}"`)
-        writeJson(response, 200, profile)
+        writeJson(response, 200, {
+          ...profile,
+          typedRules: buildTypedRules(profile.config || {}, { source: profile.source || 'profile' }),
+          temporaryRules: pendingAlerts.temporaryRules(),
+        })
       })
       return
     }
@@ -3149,9 +3638,11 @@ const main = () => {
 
   const tail = new EventTail(config)
   const policyStore = new PolicyStore(config)
+  const projectRegistry = new ProjectRegistry(config)
   const server = createServer({
     tail,
     policyStore,
+    projectRegistry,
     startedAt: new Date().toISOString(),
     apiToken: config.apiToken,
     eventLogPath: config.eventLogPath,

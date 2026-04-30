@@ -95,6 +95,73 @@ const expectDenied = (result) => {
   assert.match(`${result.stderr}\n${result.stdout}`, /EPERM|operation not permitted|permission/i)
 }
 
+test('scan npm reports URL and domain literals from a project', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-npm-scan-'))
+  try {
+    mkdirSync(join(tempRoot, 'src'), { recursive: true })
+    writeFileSync(join(tempRoot, 'package.json'), JSON.stringify({ name: 'scan-fixture' }))
+    writeFileSync(
+      join(tempRoot, 'src', 'client.mjs'),
+      [
+        'const api = "https://api.example.com/v1/responses"',
+        'const docs = "docs.example.net"',
+        'const email = "security@example.org"',
+      ].join('\n'),
+    )
+
+    const result = spawnSync(guard, ['scan', 'npm', '--dir', tempRoot, '--json'], {
+      cwd: appRoot,
+      encoding: 'utf8',
+      env: { ...process.env, GUARD_QUIET: '1' },
+    })
+    expectOk(result)
+    const report = JSON.parse(result.stdout)
+    assert.equal(report.type, 'npm-static-network-scan')
+    assert.equal(report.packageJson, join(tempRoot, 'package.json'))
+    assert.deepEqual(
+      report.domains.map((item) => item.host),
+      ['api.example.com', 'docs.example.net'],
+    )
+    assert.equal(report.domains.find((item) => item.host === 'api.example.com').urls[0], 'https://api.example.com/v1/responses')
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('scan npm skips node_modules unless requested', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-npm-scan-modules-'))
+  try {
+    mkdirSync(join(tempRoot, 'node_modules', 'dep'), { recursive: true })
+    writeFileSync(join(tempRoot, 'package.json'), JSON.stringify({ name: 'scan-fixture' }))
+    writeFileSync(join(tempRoot, 'node_modules', 'dep', 'index.js'), 'fetch("https://dep.example.com")')
+
+    const defaultResult = spawnSync(guard, ['scan', 'npm', '--dir', tempRoot, '--json'], {
+      cwd: appRoot,
+      encoding: 'utf8',
+      env: { ...process.env, GUARD_QUIET: '1' },
+    })
+    expectOk(defaultResult)
+    assert.deepEqual(JSON.parse(defaultResult.stdout).domains, [])
+
+    const includeResult = spawnSync(
+      guard,
+      ['scan', 'npm', '--dir', tempRoot, '--include-node-modules', '--json'],
+      {
+        cwd: appRoot,
+        encoding: 'utf8',
+        env: { ...process.env, GUARD_QUIET: '1' },
+      },
+    )
+    expectOk(includeResult)
+    assert.deepEqual(
+      JSON.parse(includeResult.stdout).domains.map((item) => item.host),
+      ['dep.example.com'],
+    )
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
 const networkProfileConfig = ({
   allowedDomains = ['localhost'],
   deniedDomains = [],
@@ -656,7 +723,7 @@ test('buildProxyEnv exposes reusable SOCKS and SSH proxy environment', () => {
   assert.ok(env.includes("GIT_SSH_COMMAND=ssh -o ProxyCommand='nc -X 5 -x localhost:19090 %h %p'"))
 })
 
-test('allowLoopbackHighPorts emits the macOS ephemeral range only', () => {
+test('allowLoopbackHighPorts emits wildcard localhost outbound for sandbox performance', () => {
   const profile = generateProfile(
     {
       network: {
@@ -666,10 +733,8 @@ test('allowLoopbackHighPorts emits the macOS ephemeral range only', () => {
     { cwd: appRoot },
   )
 
-  assert.match(profile, /\(allow network-outbound \(remote ip "localhost:49152"\)\)/)
-  assert.match(profile, /\(allow network-outbound \(remote ip "localhost:65535"\)\)/)
-  assert.doesNotMatch(profile, /\(allow network-outbound \(remote ip "localhost:49151"\)\)/)
-  assert.doesNotMatch(profile, /\(allow network-outbound \(remote ip "localhost:\*"\)\)/)
+  assert.match(profile, /\(allow network-outbound \(remote ip "localhost:\*"\)\)/)
+  assert.doesNotMatch(profile, /\(allow network-outbound \(remote ip "localhost:49152"\)\)/)
 })
 
 test('version probes keep filesystem sandbox while skipping expensive high-port network rules', () => {
@@ -902,6 +967,54 @@ test('native manager emits extension rules only when explicitly enabled', () => 
     profile,
     /\(iokit-user-client-class "AGXDeviceUserClient"\)/,
   )
+})
+
+test('process.allowedExecutables emits a process exec allowlist', () => {
+  const profile = generateProfile(
+    {
+      process: {
+        allowedExecutables: ['/bin/echo', '/opt/homebrew/bin/node*'],
+      },
+      network: {},
+    },
+    { cwd: appRoot },
+  )
+
+  assert.match(profile, /\(allow process-exec[\s\S]*\(literal "\/usr\/bin\/env"\)/)
+  assert.match(profile, /\(allow process-exec[\s\S]*\(literal "\/bin\/echo"\)/)
+  assert.ok(profile.includes('(regex "^/opt/homebrew/bin/node[^/]*$")'))
+  assert.doesNotMatch(profile, /\(allow process-exec\)\n/)
+})
+
+test('process.allowedExecutables is enforced by sandbox-exec', { skip: process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec') }, () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-process-policy-'))
+  const profilePath = join(tempRoot, 'profile.sb')
+  try {
+    const profile = generateProfile(
+      {
+        process: {
+          allowedExecutables: ['/bin/echo'],
+        },
+        network: {},
+      },
+      { cwd: appRoot },
+    )
+    writeFileSync(profilePath, profile)
+
+    const allowed = spawnSync('/usr/bin/sandbox-exec', ['-f', profilePath, '/bin/echo', 'ok'], {
+      encoding: 'utf8',
+    })
+    expectOk(allowed)
+    assert.equal(allowed.stdout, 'ok\n')
+
+    const denied = spawnSync('/usr/bin/sandbox-exec', ['-f', profilePath, '/bin/ls'], {
+      encoding: 'utf8',
+    })
+    assert.notEqual(denied.status, 0)
+    assert.match(denied.stderr, /Operation not permitted|permission denied/i)
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
 })
 
 test('accepts -- as a command separator', () => {
@@ -1566,7 +1679,7 @@ test('iron-proxy backend supports fetch, curl, npm, and pnpm clients', async () 
   }
 })
 
-test('network ask filter prompts once and caches allowed hosts for the run', async () => {
+test('network ask filter caches decisions by host and port for the run', async () => {
   const prompts = []
   const filter = createDomainFilter(
     {
@@ -1582,8 +1695,12 @@ test('network ask filter prompts once and caches allowed hosts for the run', asy
   )
 
   assert.equal(await filter('LOCALHOST', 8080), true)
+  assert.equal(await filter('localhost', 8080), true)
   assert.equal(await filter('localhost', 9090), true)
-  assert.deepEqual(prompts, [{ host: 'localhost', port: 8080 }])
+  assert.deepEqual(prompts, [
+    { host: 'localhost', port: 8080 },
+    { host: 'localhost', port: 9090 },
+  ])
 })
 
 test('network ask does not prompt for denied domains', async () => {
@@ -2209,6 +2326,35 @@ test('WebSocket clients can connect through the guard HTTP proxy', async () => {
   }
 })
 
+test('WebSocket proxy upstream failures return a proxy error', async () => {
+  const closedServer = createHttpServer()
+  const closedPort = await listenLoopback(closedServer)
+  await closeServer(closedServer)
+
+  const proxy = await startHttpProxy({
+    filter: async () => true,
+  })
+  const socket = await connectSocket({ host: '127.0.0.1', port: proxy.port })
+
+  try {
+    socket.write(
+      [
+        `GET ws://localhost:${closedPort}/socket HTTP/1.1`,
+        `Host: localhost:${closedPort}`,
+        'Upgrade: websocket',
+        'Connection: Upgrade',
+        '',
+        '',
+      ].join('\r\n'),
+    )
+    const response = await readUntil(socket, Buffer.from('\r\n\r\n'))
+    assert.match(response.toString('utf8'), /^HTTP\/1\.[01] 502 Upstream Unavailable\b/)
+  } finally {
+    socket.destroy()
+    await proxy.close()
+  }
+})
+
 test('npm, pnpm, git, and curl clients use the guard proxy environment', async () => {
   const npmBin = firstExisting([
     process.env.GUARD_REAL_NPM,
@@ -2428,6 +2574,14 @@ test('iron-proxy backend reuses guardd local TLS CA and warms host certificate c
     assert.equal(warmed.backend, 'iron-proxy')
     assert.equal(warmed.globalTrustManaged, false)
     assert.equal(warmed.warmed.some((entry) => entry.host === 'localhost'), true)
+    const flow = events.find((event) =>
+      event.type === 'network.flow' &&
+      event.backend === 'iron-proxy' &&
+      String(event.host || '').startsWith('localhost') &&
+      event.path === '/warm')
+    assert.equal(flow?.transport, 'iron-proxy')
+    assert.equal(flow?.status, 'allowed')
+    assert.equal(flow?.statusCode, 200)
   } finally {
     rmSync(profilePath, { force: true })
     rmSync(tempRoot, { recursive: true, force: true })
@@ -2742,6 +2896,10 @@ test('profile mutations persist stable rule metadata sidecars', () => {
     assert.equal(cfg.ruleMetadata[domainResult.metadataKey].field, 'network.allowedDomains')
     assert.match(cfg.ruleMetadata[domainResult.metadataKey].valueHash, /^sha256:[0-9a-f]{64}$/)
     assert.equal(cfg.ruleMetadata[domainResult.metadataKey].source, 'cli')
+    assert.equal(cfg.ruleMetadata[domainResult.metadataKey].layer, 'destination')
+    assert.equal(cfg.ruleMetadata[domainResult.metadataKey].action, 'allow')
+    assert.equal(cfg.ruleMetadata[domainResult.metadataKey].lifetime, 'persistent')
+    assert.equal(cfg.ruleMetadata[domainResult.metadataKey].approvalState, 'approved')
 
     const httpRule = spawnSync(
       guard,
@@ -2779,6 +2937,8 @@ test('profile mutations persist stable rule metadata sidecars', () => {
     assert.equal(cfg.ruleMetadata[httpResult.metadataKey].field, 'network.httpRules')
     assert.match(cfg.ruleMetadata[httpResult.metadataKey].valueHash, /^sha256:[0-9a-f]{64}$/)
     assert.equal(cfg.ruleMetadata[httpResult.metadataKey].source, 'cli')
+    assert.equal(cfg.ruleMetadata[httpResult.metadataKey].layer, 'http')
+    assert.match(cfg.ruleMetadata[httpResult.metadataKey].scope, /POST api\.openai\.com/)
 
     const rawTcpRule = spawnSync(
       guard,
@@ -2818,6 +2978,7 @@ test('profile mutations persist stable rule metadata sidecars', () => {
     assert.equal(cfg.ruleMetadata[rawTcpResult.metadataKey].field, 'network.allowedRawTcp')
     assert.match(cfg.ruleMetadata[rawTcpResult.metadataKey].valueHash, /^sha256:[0-9a-f]{64}$/)
     assert.equal(cfg.ruleMetadata[rawTcpResult.metadataKey].source, 'cli')
+    assert.equal(cfg.ruleMetadata[rawTcpResult.metadataKey].layer, 'raw-tcp')
 
     const removeRawTcpRule = spawnSync(
       guard,
@@ -3486,6 +3647,17 @@ test('guardd state, TLS CA scaffold, and bounded event log truncation stay local
     assert.equal(resolvedPendingJson.alert.status, 'resolved')
     assert.equal(resolvedPendingJson.alert.decision.action, 'allow')
 
+    const sessionRules = await fetch(`${daemon.base}/rules?profile=guard`, { headers })
+    assert.equal(sessionRules.status, 200)
+    const sessionRulesJson = await sessionRules.json()
+    assert.equal(sessionRulesJson.schemaVersion, 1)
+    assert.equal(Array.isArray(sessionRulesJson.typedRules), true)
+    assert.equal(sessionRulesJson.temporaryRules.some((rule) =>
+      rule.lifetime === 'session' &&
+      rule.layer === 'http' &&
+      rule.scope === 'POST pending.example.com /v1/responses'
+    ), true)
+
     const resolvedList = await fetch(`${daemon.base}/alerts/pending?status=resolved&limit=5`, { headers })
     assert.equal(resolvedList.status, 200)
     const resolvedListJson = await resolvedList.json()
@@ -3521,6 +3693,28 @@ test('guardd state, TLS CA scaffold, and bounded event log truncation stay local
     const alertForeverJson = await alertForever.json()
     assert.equal(alertForeverJson.decision.rulePersisted, true)
     assert.equal(alertForeverJson.mutation.field, 'network.deniedDomains')
+
+    const httpScopeDecision = await fetch(`${daemon.base}/alerts/decision`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        profile: 'guard',
+        host: 'api.openai.com',
+        method: 'POST',
+        path: '/v1/responses',
+        action: 'allow',
+        duration: 'forever',
+        scope: 'path',
+      }),
+    })
+    assert.equal(httpScopeDecision.status, 200)
+    const httpScopeDecisionJson = await httpScopeDecision.json()
+    assert.equal(httpScopeDecisionJson.decision.field, 'network.httpRules')
+    assert.deepEqual(httpScopeDecisionJson.mutation.value, {
+      host: 'api.openai.com',
+      methods: ['POST'],
+      paths: ['/v1/*'],
+    })
 
     const alerts = await fetch(`${daemon.base}/alerts?limit=5`, { headers })
     assert.equal(alerts.status, 200)
@@ -3609,6 +3803,9 @@ test('guardd state, TLS CA scaffold, and bounded event log truncation stay local
     const syncStateJson = await syncState.json()
     assert.equal(syncStateJson.manifest.sequence, syncJson.sequence)
     assert.equal(syncStateJson.validPolicyDigest, true)
+    assert.equal(syncStateJson.status.installed, true)
+    assert.equal(syncStateJson.status.running, true)
+    assert.equal(syncStateJson.status.fallbackMode, 'strict-deny')
 
     const invalidateSync = await fetch(`${daemon.base}/extension/sync`, {
       method: 'POST',
