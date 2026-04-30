@@ -88,6 +88,18 @@ Wrangler can reuse and refresh an existing OAuth login.
 
 Prefer `CLOUDFLARE_API_TOKEN` for CI or repeatable non-interactive deploys.
 
+## Child Process Policy
+
+Add `process.allowedExecutables` when a project should only launch a reviewed
+set of child processes. The list is path based and supports globs. If the field
+is omitted, Guard keeps the default `sandbox-exec` behavior and allows process
+exec. If the field is present, Guard automatically includes `/usr/bin/env` for
+its own launcher and then only allows the listed executable paths.
+
+Include interpreters explicitly. A shell script needs `/bin/sh` or its shebang
+interpreter, and a Node project normally needs the real Node binary plus any
+project-local tools under `node_modules/.bin`.
+
 ## Why These Defaults
 
 - `denyRead` blocks all user home directories, mounted external/network/vault

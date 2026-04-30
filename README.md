@@ -199,6 +199,29 @@ for SSH to hosts such as `ec2.packetsafari.com`, use the injected
 Guard's SOCKS proxy. A future Network Extension backend is the right place for
 exact external raw TCP rules.
 
+Use `process.allowedExecutables` to constrain which binaries the guarded run
+may launch. When the field is absent, Guard keeps the current permissive
+`process-exec` behavior. When present, Guard emits exact executable path or
+glob-backed `process-exec` allow rules and the sandbox default deny blocks
+other child process launches:
+
+```json
+{
+  "process": {
+    "allowedExecutables": [
+      "/bin/sh",
+      "/opt/homebrew/bin/node",
+      "${GUARD_PROJECT_DIR}/node_modules/.bin/*"
+    ]
+  }
+}
+```
+
+The initial Guard sandbox uses `/usr/bin/env`, so Guard allows that launcher
+automatically when an executable allowlist is active. Profiles still need to
+include the actual command binary and any interpreters used by scripts or
+shebangs, such as `/bin/sh`, `python3`, or `node`.
+
 When `ask` is enabled, unknown requests trigger an interactive prompt that can
 allow an exact API path or a generated wildcard path for the current run.
 Set `GUARD_ASK_NETWORK_UI=dialog` to use native macOS dialogs for ask decisions
@@ -337,6 +360,7 @@ guard doctor [tool] [--json]
 guard audit [--json]
 guard settings [--json]
 guard tls status [--json]
+guard scan npm [--dir DIR] [--include-node-modules] [--json]
 guard app-summary --profile NAME [--json]
 guard daemon [guardd options...]
 guard ui [--dir DIR]
@@ -378,6 +402,9 @@ guard init [template] [--force]
 - `guard audit`: print risky policy choices for the selected profile
 - `guard settings`: print monitor, prompt, daemon, and TLS inspection settings
 - `guard tls status`: print the effective TLS inspection policy for a profile
+- `guard scan npm`: statically scan an npm project for URL and domain literals.
+  The scanner skips `node_modules` and common build/cache folders by default;
+  pass `--include-node-modules` when dependency code should be included.
 - `guard app-summary`: print the permission summary used by native launchers
 - `guard daemon`: run the local `guardd` prototype for health and recent event
   APIs

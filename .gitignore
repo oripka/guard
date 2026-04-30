@@ -2,3 +2,5 @@ node_modules/
 .DS_Store
 samples/node-app/.guard-test/
 native/macos-launcher/.build/
+native/GuardMacApp/.build/
+samples/node-app/samples/**/.guard/tmp-*.json

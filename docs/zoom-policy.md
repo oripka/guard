@@ -13,6 +13,18 @@ Or use the convenience launcher:
 bin/guard-zoom
 ```
 
+If the locked profile stalls during sign-in, use the temporary discovery profile
+to confirm whether Zoom needs native direct networking or broader macOS service
+access before tightening the locked policy:
+
+```sh
+guard --profile zoom-discovery -- /Applications/zoom.us.app/Contents/MacOS/zoom.us
+```
+
+`zoom-discovery` keeps the same Zoom app bundle and filesystem deny baseline,
+but intentionally enables unrestricted network egress and broader WebKit/macOS
+service access. Do not treat it as the final policy.
+
 If `bin/guard` is symlinked into `~/.local/bin`, `guard-zoom` can be symlinked
 the same way:
 

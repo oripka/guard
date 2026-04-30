@@ -1,0 +1,61 @@
+{
+  "imports": [
+    "./zoom.json"
+  ],
+  "metadata": {
+    "description": "Temporary high-risk discovery profile for making Zoom launch and sign-in usable while collecting the narrow rules needed by the locked profile.",
+    "risk": "high",
+    "launcher": "guard-zoom-discovery",
+    "appBundle": "/Applications/zoom.us.app",
+    "status": "discovery"
+  },
+  "networkUnrestricted": true,
+  "network": {
+    "allowLocalBinding": true,
+    "allowLoopbackConnections": true,
+    "allowLoopbackHighPorts": true,
+    "allowUnixSockets": [
+      "${GUARD_RUN_DIR}",
+      "${GUARD_REAL_TMPDIR}",
+      "/private/tmp",
+      "/private/var/run/mDNSResponder",
+      "/private/var/run/syslog"
+    ],
+    "allowMachLookup": [
+      "com.apple.*",
+      "us.zoom.*"
+    ]
+  },
+  "filesystem": {
+    "allowRead": [
+      "${GUARD_REAL_HOME}/Library/Application Support/zoom.us",
+      "${GUARD_REAL_HOME}/Library/Caches",
+      "${GUARD_REAL_HOME}/Library/Containers",
+      "${GUARD_REAL_HOME}/Library/Cookies",
+      "${GUARD_REAL_HOME}/Library/Group Containers",
+      "${GUARD_REAL_HOME}/Library/HTTPStorages",
+      "${GUARD_REAL_HOME}/Library/Preferences",
+      "${GUARD_REAL_HOME}/Library/Saved Application State",
+      "${GUARD_REAL_HOME}/Library/WebKit",
+      "${GUARD_REAL_TMPDIR}"
+    ],
+    "allowWrite": [
+      "${GUARD_REAL_HOME}/Library/Application Support/zoom.us",
+      "${GUARD_REAL_HOME}/Library/Caches",
+      "${GUARD_REAL_HOME}/Library/Caches/us.zoom.xos",
+      "${GUARD_REAL_HOME}/Library/Containers",
+      "${GUARD_REAL_HOME}/Library/Cookies",
+      "${GUARD_REAL_HOME}/Library/Group Containers",
+      "${GUARD_REAL_HOME}/Library/HTTPStorages",
+      "${GUARD_REAL_HOME}/Library/Logs/zoom.us",
+      "${GUARD_REAL_HOME}/Library/Preferences",
+      "${GUARD_REAL_HOME}/Library/Preferences/us.zoom.*.plist",
+      "${GUARD_REAL_HOME}/Library/Preferences/ZoomChat.plist",
+      "${GUARD_REAL_HOME}/Library/Saved Application State",
+      "${GUARD_REAL_HOME}/Library/Saved Application State/us.zoom.xos.savedState",
+      "${GUARD_REAL_HOME}/Library/WebKit",
+      "${GUARD_REAL_HOME}/Library/WebKit/us.zoom.xos",
+      "${GUARD_REAL_TMPDIR}"
+    ]
+  }
+}
