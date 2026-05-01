@@ -2852,6 +2852,10 @@ const alertHttpRuleForScope = ({ host, method, requestPath, scope }) => {
   case 'host':
   case 'allow-domain':
     return { host }
+  case 'all':
+  case 'all-network':
+  case 'allow-all-network':
+    return {}
   default:
     return null
   }

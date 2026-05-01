@@ -948,22 +948,34 @@ enum GuardPromptChoice {
     case allowExact
     case allowPath
     case allowDomain
+    case allowWildcardDomain
+    case allowAllNetwork
+}
+
+struct GuardPromptAction {
+    let title: String
+    let choice: GuardPromptChoice
+    let duration: String?
+    let isDefault: Bool
+    let tint: NSColor?
 }
 
 final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
+    let promptControlWidth: CGFloat = 430
     let titleText: String
     let actor: String
     let destination: String
     let context: String
     let scopeRows: [(String, String)]
     let detailRows: [(String, String)]
-    let actions: [(String, GuardPromptChoice, Bool)]
+    let actions: [GuardPromptAction]
     let scopeOptions: [(String, GuardPromptChoice)]
     let lifetimeOptions: [(String, String)]
     let methodOptions: [(String, [String]?)]
     let editablePath: String?
     var selectedChoice: GuardPromptChoice = .deny
-    var scopePopup: NSPopUpButton?
+    var selectedActionDuration: String?
+    var selectedScopeChoice: GuardPromptChoice?
     var lifetimePopup: NSPopUpButton?
     var methodPopup: NSPopUpButton?
     var pathField: NSTextField?
@@ -977,7 +989,7 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         context: String,
         scopeRows: [(String, String)],
         detailRows: [(String, String)],
-        actions: [(String, GuardPromptChoice, Bool)],
+        actions: [GuardPromptAction],
         scopeOptions: [(String, GuardPromptChoice)] = [],
         lifetimeOptions: [(String, String)] = [],
         methodOptions: [(String, [String]?)] = [],
@@ -1011,9 +1023,11 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         panel.isMovableByWindowBackground = true
         panel.level = .floating
         panel.delegate = self
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
 
         let background = NSVisualEffectView()
-        background.material = .windowBackground
+        background.material = .hudWindow
         background.blendingMode = .behindWindow
         background.state = .active
         background.translatesAutoresizingMaskIntoConstraints = false
@@ -1071,14 +1085,22 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
 
     @objc func chooseAction(_ sender: NSButton) {
         if sender.tag >= 0 && sender.tag < actions.count {
-            selectedChoice = actions[sender.tag].1
+            let action = actions[sender.tag]
+            selectedChoice = action.choice
+            selectedActionDuration = action.duration
         } else {
             selectedChoice = .deny
+            selectedActionDuration = nil
         }
-        if selectedChoice != .deny, let scopePopup, scopePopup.indexOfSelectedItem >= 0, scopePopup.indexOfSelectedItem < scopeOptions.count {
-            selectedChoice = scopeOptions[scopePopup.indexOfSelectedItem].1
+        if selectedChoice != .deny, let selectedScopeChoice {
+            selectedChoice = selectedScopeChoice
         }
         NSApp.stopModal()
+    }
+
+    @objc func chooseScope(_ sender: NSButton) {
+        guard sender.tag >= 0 && sender.tag < scopeOptions.count else { return }
+        selectedScopeChoice = scopeOptions[sender.tag].1
     }
 
     @objc func toggleDetails(_ sender: NSButton) {
@@ -1187,16 +1209,6 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
 
         let heading = promptLabel("Decision", size: 12, weight: .semibold, color: .secondaryLabelColor)
         stack.addArrangedSubview(heading)
-        if !scopeOptions.isEmpty {
-            let popup = NSPopUpButton()
-            popup.addItems(withTitles: scopeOptions.map { $0.0 })
-            popup.controlSize = .regular
-            popup.font = NSFont.systemFont(ofSize: 13, weight: .medium)
-            popup.translatesAutoresizingMaskIntoConstraints = false
-            popup.widthAnchor.constraint(equalToConstant: 430).isActive = true
-            scopePopup = popup
-            stack.addArrangedSubview(makeControlLine("Scope", popup))
-        }
         if !lifetimeOptions.isEmpty {
             let popup = NSPopUpButton()
             popup.addItems(withTitles: lifetimeOptions.map { $0.0 })
@@ -1204,7 +1216,7 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
             popup.controlSize = .regular
             popup.font = NSFont.systemFont(ofSize: 13, weight: .medium)
             popup.translatesAutoresizingMaskIntoConstraints = false
-            popup.widthAnchor.constraint(equalToConstant: 220).isActive = true
+            popup.widthAnchor.constraint(equalToConstant: promptControlWidth).isActive = true
             lifetimePopup = popup
             stack.addArrangedSubview(makeControlLine("Lifetime", popup))
         }
@@ -1214,9 +1226,13 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
             popup.controlSize = .regular
             popup.font = NSFont.systemFont(ofSize: 13, weight: .medium)
             popup.translatesAutoresizingMaskIntoConstraints = false
-            popup.widthAnchor.constraint(equalToConstant: 220).isActive = true
+            popup.widthAnchor.constraint(equalToConstant: promptControlWidth).isActive = true
             methodPopup = popup
             stack.addArrangedSubview(makeControlLine("Methods", popup))
+        }
+        if !scopeOptions.isEmpty {
+            selectedScopeChoice = selectedScopeChoice ?? scopeOptions.first?.1
+            stack.addArrangedSubview(makeScopeRadioGroup())
         }
         if let editablePath {
             let field = NSTextField(string: editablePath)
@@ -1224,7 +1240,7 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
             field.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
             field.lineBreakMode = .byTruncatingMiddle
             field.translatesAutoresizingMaskIntoConstraints = false
-            field.widthAnchor.constraint(equalToConstant: 430).isActive = true
+            field.widthAnchor.constraint(equalToConstant: promptControlWidth).isActive = true
             pathField = field
             stack.addArrangedSubview(makePathControlLine(field))
         }
@@ -1262,16 +1278,16 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         row.addArrangedSubview(spacer)
 
         for (index, action) in actions.enumerated() {
-            let button = NSButton(title: action.0, target: self, action: #selector(chooseAction(_:)))
-            button.bezelStyle = action.2 ? .rounded : .regularSquare
+            let button = NSButton(title: action.title, target: self, action: #selector(chooseAction(_:)))
+            button.bezelStyle = .rounded
             button.tag = index
             button.controlSize = .regular
             button.setContentHuggingPriority(.required, for: .horizontal)
-            if action.2 {
+            if action.isDefault {
                 button.keyEquivalent = "\r"
                 button.keyEquivalentModifierMask = []
             }
-            if action.1 == .deny {
+            if action.choice == .deny {
                 button.hasDestructiveAction = true
                 button.keyEquivalent = "\u{1b}"
                 button.keyEquivalentModifierMask = []
@@ -1279,6 +1295,26 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
             row.addArrangedSubview(button)
         }
         return row
+    }
+
+    func makeScopeRadioGroup() -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 5
+
+        for (index, option) in scopeOptions.enumerated() {
+            let radio = NSButton(radioButtonWithTitle: option.0, target: self, action: #selector(chooseScope(_:)))
+            radio.tag = index
+            radio.controlSize = .regular
+            radio.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+            radio.state = index == 0 ? .on : .off
+            radio.translatesAutoresizingMaskIntoConstraints = false
+            radio.widthAnchor.constraint(lessThanOrEqualToConstant: promptControlWidth).isActive = true
+            stack.addArrangedSubview(radio)
+        }
+
+        return makeControlLine("Rule", stack)
     }
 
     func makeKeyValueLine(_ key: String, _ value: String, strong: Bool) -> NSView {
@@ -1331,6 +1367,9 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
     }
 
     var selectedDuration: String {
+        if let selectedActionDuration {
+            return selectedActionDuration
+        }
         guard let lifetimePopup, lifetimePopup.indexOfSelectedItem >= 0, lifetimePopup.indexOfSelectedItem < lifetimeOptions.count else {
             return "run"
         }
@@ -1356,8 +1395,8 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         view.wantsLayer = true
         view.layer?.cornerRadius = 6
         view.layer?.cornerCurve = .continuous
-        view.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.22).cgColor
-        view.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.12).cgColor
+        view.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.12).cgColor
+        view.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.18).cgColor
         view.layer?.borderWidth = 0.5
         return view
     }
@@ -1399,25 +1438,26 @@ func runAskNetworkPanel(input: GuardAskNetworkInput) -> GuardAskDecision {
         destination: target,
         context: "Choose the narrowest network rule that fits this request.",
         scopeRows: [
-            ("Type", "Destination only"),
-            ("TLS", "Not inspected; path and query are not visible here"),
             ("Profile", input.profile ?? "guard")
         ],
         detailRows: [
             ("Host", input.host),
             ("Port", input.port.map { "\($0)" } ?? "default"),
+            ("Type", "Destination only"),
+            ("TLS", "Not inspected; path and query are not visible here"),
             ("Launched By", input.launcherApp?.isEmpty == false ? input.launcherApp! : "Not recorded"),
             ("Visibility", "Host and port before TLS handshake"),
             ("Project", input.projectDir ?? "Unknown"),
             ("Run", input.runDir ?? "Unknown")
         ],
         actions: [
-            ("Deny", .deny, false),
-            ("Allow", .allowOnce, true)
+            GuardPromptAction(title: "Deny", choice: .deny, duration: nil, isDefault: false, tint: nil),
+            GuardPromptAction(title: "Allow", choice: .allowOnce, duration: nil, isDefault: true, tint: nil)
         ],
         scopeOptions: [
             ("Exact host: \(input.host)", .allowDomain),
-            ("Subdomains: \(wildcard)", .allowPath)
+            ("Wildcard domain: \(wildcard)", .allowPath),
+            ("All hosts for this app", .allowAllNetwork)
         ],
         lifetimeOptions: promptLifetimeOptions()
     )
@@ -1435,21 +1475,28 @@ func runAskHttpPolicyPanel(input: GuardAskHttpPolicyInput) -> GuardAskDecision {
     let actor = input.launcherApp?.isEmpty == false ? "\(actorCommand) via \(input.launcherApp!)" : actorCommand
     let suggestedPaths = input.suggestedRule.paths?.joined(separator: ", ") ?? "Any path"
     let suggestedMethods = input.suggestedRule.methods?.joined(separator: ", ") ?? "Any method"
+    let wildcardHost = wildcardDomainForHost(request.host)
+    var scopeOptions: [(String, GuardPromptChoice)] = [
+        ("Exact path on \(request.host)", .allowExact),
+        ("All paths on \(request.host)", .allowDomain)
+    ]
+    if let wildcardHost {
+        scopeOptions.append(("All paths on \(wildcardHost)", .allowWildcardDomain))
+    }
+    scopeOptions.append(("All hosts for this app", .allowAllNetwork))
     let controller = GuardConnectionPromptController(
         titleText: "HTTP Policy Request",
         actor: actor,
         destination: "\(request.method) \(request.host)\(request.path)",
         context: "Choose the narrowest HTTP rule that fits this request.",
-        scopeRows: [
-            ("Type", "HTTP request"),
-            ("TLS", "Inspected by iron-proxy for this guarded process"),
-            ("Suggested", "\(suggestedMethods) \(suggestedPaths)"),
-            ("Host", request.host)
-        ],
+        scopeRows: [],
         detailRows: [
             ("Host", request.host),
             ("Method", request.method),
             ("Path", request.path),
+            ("Type", "HTTP request"),
+            ("TLS", "Inspected by iron-proxy for this guarded process"),
+            ("Suggested", "\(suggestedMethods) \(suggestedPaths)"),
             ("Launched By", input.launcherApp?.isEmpty == false ? input.launcherApp! : "Not recorded"),
             ("Visibility", "Method, path, and query visible after TLS interception"),
             ("Profile", input.profile ?? "guard"),
@@ -1457,14 +1504,10 @@ func runAskHttpPolicyPanel(input: GuardAskHttpPolicyInput) -> GuardAskDecision {
             ("Run", input.runDir ?? "Unknown")
         ],
         actions: [
-            ("Deny", .deny, false),
-            ("Allow", .allowExact, true)
+            GuardPromptAction(title: "Deny", choice: .deny, duration: nil, isDefault: false, tint: nil),
+            GuardPromptAction(title: "Allow", choice: .allowExact, duration: nil, isDefault: true, tint: nil)
         ],
-        scopeOptions: [
-            ("Exact path", .allowExact),
-            ("Path group: \(suggestedPaths)", .allowPath),
-            ("Entire host: \(request.host)", .allowDomain)
-        ],
+        scopeOptions: scopeOptions,
         lifetimeOptions: promptLifetimeOptions(),
         methodOptions: [
             ("All methods", nil),
@@ -1495,6 +1538,18 @@ func runAskHttpPolicyPanel(input: GuardAskHttpPolicyInput) -> GuardAskDecision {
             rule: GuardHttpPolicyRule(host: request.host, cidr: nil, methods: nil, paths: nil),
             duration: controller.selectedDuration
         )
+    case .allowWildcardDomain:
+        return GuardAskDecision(
+            action: "allow",
+            rule: GuardHttpPolicyRule(host: wildcardHost ?? request.host, cidr: nil, methods: nil, paths: nil),
+            duration: controller.selectedDuration
+        )
+    case .allowAllNetwork:
+        return GuardAskDecision(
+            action: "allow",
+            rule: GuardHttpPolicyRule(host: nil, cidr: nil, methods: nil, paths: nil),
+            duration: controller.selectedDuration
+        )
     default:
         return GuardAskDecision(action: "deny", rule: nil, duration: controller.selectedDuration)
     }
@@ -1509,6 +1564,12 @@ func promptLifetimeOptions() -> [(String, String)] {
         ("5 days", "5d"),
         ("Forever", "forever")
     ]
+}
+
+func wildcardDomainForHost(_ host: String) -> String? {
+    let parts = host.split(separator: ".").map(String.init)
+    guard parts.count > 2 else { return nil }
+    return "*." + parts.dropFirst().joined(separator: ".")
 }
 
 func runCliAskModeIfNeeded() -> Bool {
@@ -3048,14 +3109,15 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         parent?.loadDaemonPolicyState(profile: selectedProfile)
         rows = parent?.ruleRows ?? rows
         renderRows()
-        statusLabel.stringValue = "Loaded \(rows.count) rules for \(selectedProfile)."
+        statusLabel.stringValue = "Loaded \(rows.count) profile rules and \(recentDecisionRows().count) recent decisions."
     }
 
     func renderRows() {
         let search = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let filter = filterControl.selectedSegment
         let selectedSection = sidebar.selectedRow >= 0 ? sidebarSections[safe: sidebar.selectedRow] ?? "All Rules" : "All Rules"
-        renderedRows = rows.filter { row in
+        let sourceRows = combinedRuleRows()
+        renderedRows = sourceRows.filter { row in
             let text = [row.kind, row.action, row.scope, row.detail, row.source].joined(separator: " ").lowercased()
             let matchesSearch = search.isEmpty || text.contains(search)
             let matchesFilter: Bool
@@ -3087,9 +3149,62 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         }
         sidebar.reloadData()
         renderInspector()
-        statusLabel.stringValue = rows.isEmpty
-            ? "No rules are loaded for \(selectedProfile). Connect guardd or select another profile."
-            : "\(renderedRows.count) visible of \(rows.count) rules."
+        statusLabel.stringValue = sourceRows.isEmpty
+            ? "No profile rules or recent decisions are available yet."
+            : "\(renderedRows.count) visible of \(sourceRows.count) rules and recent decisions."
+    }
+
+    func combinedRuleRows() -> [MonitorRuleRow] {
+        var seen = Set<String>()
+        var combined: [MonitorRuleRow] = []
+        for row in rows + recentDecisionRows() {
+            let key = row.id.isEmpty ? "\(row.kind)|\(row.action)|\(row.scope)|\(row.detail)|\(row.lifetime)" : row.id
+            guard !seen.contains(key) else { continue }
+            seen.insert(key)
+            combined.append(row)
+        }
+        return combined
+    }
+
+    func recentDecisionRows() -> [MonitorRuleRow] {
+        guard let events = parent?.events else { return [] }
+        return events
+            .filter { event in
+                !event.host.isEmpty &&
+                (event.type == "network.decision" || event.type == "guard.alert.decision")
+            }
+            .prefix(200)
+            .map { event in
+                let action = event.result == "deny" || event.result == "denied" ? "deny" : "allow"
+                let lifetime = recentDecisionLifetime(event)
+                let scope = event.host
+                let detail = [event.detail.isEmpty ? nil : event.detail, event.profile.isEmpty ? nil : "profile \(event.profile)"]
+                    .compactMap { $0 }
+                    .joined(separator: " · ")
+                return MonitorRuleRow(
+                    id: event.id.isEmpty ? "\(event.at)-\(event.host)-\(event.result)" : "event:\(event.id)",
+                    kind: event.detail.lowercased().contains("/") || event.type == "guard.alert.decision" ? "HTTP" : "Domain",
+                    action: action,
+                    scope: scope,
+                    detail: detail.isEmpty ? "Recent policy decision" : detail,
+                    enabled: true,
+                    source: "recent decision",
+                    field: "",
+                    value: event.host,
+                    layer: event.type,
+                    lifetime: lifetime,
+                    approvalState: event.rulePersisted ? "approved" : "unapproved",
+                    notes: event.rulePersisted ? "Persisted from prompt" : "Runtime decision; review before making persistent",
+                    expiresAt: event.expiresAt
+                )
+            }
+    }
+
+    func recentDecisionLifetime(_ event: GuardMonitorEvent) -> String {
+        let duration = event.duration.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if event.rulePersisted || duration == "forever" { return "persistent" }
+        if duration.isEmpty { return "temporary" }
+        return duration
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
@@ -3207,13 +3322,15 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
     }
 
     func sidebarCount(for title: String) -> Int {
+        let sourceRows = combinedRuleRows()
         switch title {
-        case "Active": return rows.filter { $0.enabled }.count
-        case "Deny": return rows.filter { $0.action == "deny" }.count
-        case "Temporary": return rows.filter { $0.lifetime != "persistent" }.count
-        case "Unapproved": return rows.filter { $0.approvalState != "approved" }.count
-        case "Blocklists": return rows.filter { $0.action == "deny" && $0.kind == "Domain" }.count
-        default: return rows.count
+        case "Active": return sourceRows.filter { $0.enabled }.count
+        case "Deny": return sourceRows.filter { $0.action == "deny" }.count
+        case "Recent Changes": return recentDecisionRows().count
+        case "Temporary": return sourceRows.filter { $0.lifetime != "persistent" }.count
+        case "Unapproved": return sourceRows.filter { $0.approvalState != "approved" }.count
+        case "Blocklists": return sourceRows.filter { $0.action == "deny" && $0.kind == "Domain" }.count
+        default: return sourceRows.count
         }
     }
 
@@ -7759,24 +7876,26 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 actor: command,
                 destination: "\(method.isEmpty ? "HTTP" : method) \(host)\(path)",
                 context: "Choose the narrowest HTTP rule that fits this request.",
-                scopeRows: [
-                    ("Type", "HTTP request"),
-                    ("TLS", "Inspected by iron-proxy for this guarded process"),
-                    ("Host", host)
-                ],
+                scopeRows: [],
                 detailRows: [
                     ("Host", host),
                     ("Method", method.isEmpty ? "GET" : method),
                     ("Path", path.isEmpty ? "/" : path),
+                    ("Type", "HTTP request"),
+                    ("TLS", "Inspected by iron-proxy for this guarded process"),
                     ("Profile", profile),
                     ("Project", projectDir),
                     ("Run", runDir)
                 ],
-                actions: [("Deny", .deny, false), ("Allow", .allowExact, true)],
+                actions: [
+                    GuardPromptAction(title: "Deny", choice: .deny, duration: nil, isDefault: false, tint: nil),
+                    GuardPromptAction(title: "Allow", choice: .allowExact, duration: nil, isDefault: true, tint: nil)
+                ],
                 scopeOptions: [
-                    ("Exact method and path", .allowExact),
-                    ("Path group", .allowPath),
-                    ("Entire host: \(host)", .allowDomain)
+                    ("Exact host: \(host)", .allowDomain),
+                    ("Exact method and path on \(host)", .allowExact),
+                    ("Path group on \(host)", .allowPath),
+                    ("All hosts for this app", .allowAllNetwork)
                 ],
                 lifetimeOptions: promptLifetimeOptions(),
                 editablePath: path.isEmpty ? "/" : path
@@ -7790,21 +7909,25 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 destination: "\(host)\(port > 0 ? ":\(port)" : "")",
                 context: "Choose the narrowest network rule that fits this request.",
                 scopeRows: [
-                    ("Type", "Destination only"),
-                    ("TLS", "Not inspected; path and query are not visible here"),
                     ("Profile", profile)
                 ],
                 detailRows: [
                     ("Host", host),
                     ("Port", port > 0 ? "\(port)" : "default"),
+                    ("Type", "Destination only"),
+                    ("TLS", "Not inspected; path and query are not visible here"),
                     ("Visibility", "Host and port before TLS handshake"),
                     ("Project", projectDir),
                     ("Run", runDir)
                 ],
-                actions: [("Deny", .deny, false), ("Allow", .allowOnce, true)],
+                actions: [
+                    GuardPromptAction(title: "Deny", choice: .deny, duration: nil, isDefault: false, tint: nil),
+                    GuardPromptAction(title: "Allow", choice: .allowOnce, duration: nil, isDefault: true, tint: nil)
+                ],
                 scopeOptions: [
                     ("Exact host: \(host)", .allowDomain),
-                    ("Subdomains: \(wildcard)", .allowPath)
+                    ("Wildcard domain: \(wildcard)", .allowPath),
+                    ("All hosts for this app", .allowAllNetwork)
                 ],
                 lifetimeOptions: promptLifetimeOptions()
             )
@@ -7827,6 +7950,8 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         case .allowExact: return "exact"
         case .allowPath: return "path"
         case .allowDomain: return "domain"
+        case .allowWildcardDomain: return "domain"
+        case .allowAllNetwork: return "all-network"
         case .allowOnce: return "once"
         case .deny: return ""
         }
