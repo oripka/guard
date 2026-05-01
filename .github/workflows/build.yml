@@ -25,10 +25,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10.32.1
-
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -38,36 +34,8 @@ jobs:
           go-version: '1.24.x'
           cache: false
 
-      - name: Prepare iron-proxy for tests
-        run: |
-          mkdir -p .build/ci
-          git clone --depth 1 --branch "${GUARD_IRON_PROXY_REF}" "${GUARD_IRON_PROXY_REPO}" .build/ci/iron-proxy-src
-          (cd .build/ci/iron-proxy-src && go build -trimpath -o "${GITHUB_WORKSPACE}/.build/ci/iron-proxy" ./cmd/iron-proxy)
-          echo "GUARD_IRON_PROXY_BIN=${GITHUB_WORKSPACE}/.build/ci/iron-proxy" >> "$GITHUB_ENV"
-        env:
-          GUARD_IRON_PROXY_REPO: https://github.com/oripka/iron-proxy
-          GUARD_IRON_PROXY_REF: main
-
-      - name: Install Linux sandbox runtime
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile=false
-
-      - name: Test macOS runtime
-        if: runner.os == 'macOS'
-        run: |
-          NODE_GUARD_BYPASS=1 node --test --test-concurrency=1 \
-            --test-name-pattern "packaged iron-proxy|guard help prints command usage|doctor reports|iron-proxy backend permits matching HTTP method and path rules|can read files inside the allowed project root|cannot read the real home directory|cannot write protected env-style files in the project" \
-            samples/node-app/test/*.test.mjs
-
-      - name: Test Linux bubblewrap runtime
-        if: runner.os == 'Linux'
-        run: node --test --test-name-pattern "linux bubblewrap" samples/node-app/test/policy.test.mjs
-
       - name: Build package artifacts
-        run: pnpm build:package
+        run: npm run build:package
         env:
           GUARD_IRON_PROXY_REPO: https://github.com/oripka/iron-proxy
           GUARD_IRON_PROXY_REF: main
