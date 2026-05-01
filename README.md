@@ -63,13 +63,47 @@ Run the common developer workflow by prefixing the command with `guard`:
 ```sh
 guard pnpm run dev
 guard --ask-network pnpm run dev
+guard bash
 ```
 
 Guard starts the run with filesystem policy, subprocess policy, and network
 policy active. In ask mode, the deep `iron-proxy` path can prompt on the actual
 HTTP/S shape, such as host, method, and path, instead of only asking for a broad
-domain allow. When Guard prompts for a new destination, approve the narrowest
-useful scope. To add a reviewed rule explicitly:
+domain allow.
+
+A guarded shell makes the boundary visible before you run anything risky:
+
+```text
+$ guard bash
++ guard policy ------------------------------------------------------------------------------------+
+| ok           no dangerous defaults detected  net ask active  secrets protected                   |
+| run          /private/tmp/guard/run-190268f05fdbbf4e                                             |
+| cwd          /private/tmp/guard/run-190268f05fdbbf4e                                             |
++ filesystem --------------------------------------------------------------------------------------+
+| policy       read allow-overrides-deny; write deny-overrides-allow                               |
+| + read       <run>                             | x read       /Users /Volumes /Applications      |
+| + write      <run>                             |              /cores /home                       |
+|                                                | x write      .env .env.* secrets/ *.key *.pem   |
++ network -----------------------------------------------------------------------------------------+
+| policy       default-deny ask                                                                    |
+| + host       -                                 | x host       telemetry and analytics presets    |
+| local        bind=no loopback=no pty=yes unix=<run>                                              |
++ subprocesses ------------------------------------------------------------------------------------+
+| policy       children allowed, risky tools blocked                                               |
+| + child      -                                 | x exec       curl nc netcat osascript perl      |
+|                                                |              python python3 ruby wget           |
++--------------------------------------------------------------------------------------------------+
+bash-3.2$ curl https://example.com
+bash: /usr/bin/curl: Operation not permitted
+```
+
+The banner is the contract for that run: broad filesystem reads are closed,
+secret writes are blocked, direct network egress is denied unless routed through
+Guard policy, and risky child tools stay blocked even from an otherwise
+interactive shell.
+
+When Guard prompts for a new destination, approve the narrowest useful scope.
+To add a reviewed rule explicitly:
 
 ```sh
 guard profile add-http-rule --host api.openai.com --method POST --path /v1/responses
