@@ -69,5 +69,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${GITHUB_REF_NAME}" release-upload/* \
+            --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
             --notes "Alpha Guard build artifacts. CLI tarballs are the easiest install path; daemon and desktop editions are experimental."
