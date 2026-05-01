@@ -89,6 +89,25 @@ Prefer `CLOUDFLARE_API_TOKEN` for CI or repeatable non-interactive deploys.
 
 ## Child Process Policy
 
+For dependency installation or unknown package review, enable:
+
+```json
+{
+  "supplyChain": {
+    "installHardening": true,
+    "sanitizeEnvironment": true
+  }
+}
+```
+
+That adds package-install oriented default denies for common stagers and
+persistence paths: shells, `curl`/`wget`, `gh`, `git`, package-manager
+subprocesses, Python/Ruby/Perl helpers, `.github/workflows`, Git hooks, shell
+startup files, package credentials, and Python `.pth` startup files. Guard also
+injects package-manager environment defaults such as
+`NPM_CONFIG_IGNORE_SCRIPTS=true` and clears the inherited environment unless
+`supplyChain.sanitizeEnvironment` is set to `false`.
+
 Add `process.denyByDefault` when a project should only launch the initial
 command plus a reviewed set of child processes. Add
 `process.allowedExecutables` for the extra helpers, interpreters, and

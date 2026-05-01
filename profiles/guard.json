@@ -5,6 +5,10 @@
     "status": "locked"
   },
   "allowPty": true,
+  "supplyChain": {
+    "installHardening": true,
+    "sanitizeEnvironment": true
+  },
   "workingDirectory": "${GUARD_RUN_DIR}",
   "network": {
     "allowedDomains": [],

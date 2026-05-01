@@ -718,6 +718,32 @@ test('allowedRawTcp rejects exact external raw TCP under sandbox-exec', () => {
   )
 })
 
+test('supply-chain install hardening denies package persistence writes and risky children', () => {
+  const profile = generateProfile(
+    {
+      supplyChain: {
+        installHardening: true,
+      },
+      network: {},
+      filesystem: {
+        allowWrite: ['${GUARD_PROJECT_DIR}', '${GUARD_RUN_DIR}'],
+      },
+    },
+    {
+      cwd: appRoot,
+      projectDir: appRoot,
+      guardRunDir: join(appRoot, '.guard-run-test'),
+    },
+  )
+
+  assert.match(profile, /\(deny process-exec[\s\S]*\(literal "\/bin\/zsh"\)/)
+  assert.match(profile, /\(deny process-exec[\s\S]*\(literal "\/usr\/bin\/curl"\)/)
+  assert.match(profile, /\(deny process-exec[\s\S]*\(literal "\/usr\/bin\/gh"\)/)
+  assert.match(profile, /\(deny file-write\*[\s\S]*\.github\/workflows/)
+  assert.match(profile, /\(deny file-write\*[\s\S]*site-packages\/[^"]*\.pth/)
+  assert.match(profile, /\(deny file-write\*[\s\S]*\.zshrc/)
+})
+
 test('buildProxyEnv exposes reusable SOCKS and SSH proxy environment', () => {
   const env = buildProxyEnv({ httpPort: 18080, socksPort: 19090 })
 
@@ -4420,6 +4446,15 @@ test('sandbox denial sensitivity classifies canaries and credentials without ale
       severity: 'high',
       sensitivity: 'credential-file',
       reason: 'credential-file-read',
+      notify: true,
+    },
+  )
+  assert.deepEqual(
+    classifySandboxDenialSensitivity({ operation: 'file-read-data', target: '/Users/example/Documents/passwords.kdbx' }),
+    {
+      severity: 'high',
+      sensitivity: 'credential-database',
+      reason: 'credential-database-read',
       notify: true,
     },
   )
