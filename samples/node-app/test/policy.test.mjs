@@ -11,6 +11,7 @@ import { connect as tlsConnect } from 'node:tls'
 import { fileURLToPath } from 'node:url'
 
 import { generateProfile } from '../../../lib/guard-manager.mjs'
+import { classifySandboxDenialSensitivity, parseSandboxDenialMessage } from '../../../lib/guard-sandbox-log.mjs'
 import {
   createDomainFilter,
   buildProxyEnv,
@@ -176,7 +177,6 @@ const networkProfileConfig = ({
     deniedDomains,
     allowLocalBinding: false,
     allowLoopbackConnections: false,
-    allowLoopbackHighPorts: false,
     allowLoopbackPorts: [],
     allowUnixSockets: ['${GUARD_RUN_DIR}'],
     allowMachLookup: [
@@ -546,7 +546,6 @@ test('generates the expected effective sandbox config', () => {
   assert.deepEqual(cfg.network.allowedDomains, [])
   assert.equal(cfg.network.allowLocalBinding, true)
   assert.equal(cfg.network.allowLoopbackConnections, false)
-  assert.equal(cfg.network.allowLoopbackHighPorts, false)
   assert.deepEqual(cfg.network.allowLoopbackPorts, [3000, 3001, 4983])
   assert.match(cfg.network.allowUnixSockets[0], /\/guard\/run-/)
 })
@@ -727,28 +726,13 @@ test('buildProxyEnv exposes reusable SOCKS and SSH proxy environment', () => {
   assert.ok(env.includes("GIT_SSH_COMMAND=ssh -o ProxyCommand='nc -X 5 -x localhost:19090 %h %p'"))
 })
 
-test('allowLoopbackHighPorts emits wildcard localhost outbound for sandbox performance', () => {
-  const profile = generateProfile(
-    {
-      network: {
-        allowLoopbackHighPorts: true,
-      },
-    },
-    { cwd: appRoot },
-  )
-
-  assert.match(profile, /\(allow network-outbound \(remote ip "localhost:\*"\)\)/)
-  assert.doesNotMatch(profile, /\(allow network-outbound \(remote ip "localhost:49152"\)\)/)
-})
-
-test('version probes keep filesystem sandbox while skipping expensive high-port network rules', () => {
-  const profilePath = writeGuardProfile('version-probe-high-ports', {
+test('version probes keep filesystem sandbox while skipping loopback port network rules', () => {
+  const profilePath = writeGuardProfile('version-probe-loopback-ports', {
     ...networkProfileConfig({
       allowedDomains: ['example.com'],
     }),
     network: {
       ...networkProfileConfig({ allowedDomains: ['example.com'] }).network,
-      allowLoopbackHighPorts: true,
       allowLoopbackPorts: [3000],
     },
   })
@@ -764,7 +748,7 @@ test('version probes keep filesystem sandbox while skipping expensive high-port 
     ]) {
       const result = spawnSync(
         guard,
-        ['--profile', 'version-probe-high-ports', ...command],
+        ['--profile', 'version-probe-loopback-ports', ...command],
         {
           cwd: appRoot,
           encoding: 'utf8',
@@ -1904,7 +1888,13 @@ test('--daemon-policy sends normal proxy decisions through guardd pending alerts
   const eventLog = resolve(tempRoot, 'events.jsonl')
   const profilePath = writeGuardProfile(
     'network-daemon-policy',
-    networkProfileConfig({ allowedDomains: [] }),
+    {
+      ...networkProfileConfig({ allowedDomains: [] }),
+      network: {
+        ...networkProfileConfig({ allowedDomains: [] }).network,
+        backend: 'guard',
+      },
+    },
   )
   const server = createHttpServer((req, res) => {
     res.writeHead(200, { 'content-type': 'text/plain' })
@@ -1988,7 +1978,9 @@ test('--daemon-policy fails closed when guardd is unavailable', async () => {
 })
 
 test('HTTPS CONNECT tunnels are filtered by allowedDomains', async () => {
-  const profilePath = writeGuardProfile('network-connect', networkProfileConfig())
+  const cfg = networkProfileConfig()
+  cfg.network.backend = 'guard'
+  const profilePath = writeGuardProfile('network-connect', cfg)
   const server = createHttpServer((req, res) => {
     res.writeHead(200, { 'content-type': 'text/plain' })
     res.end('connect-ok\n')
@@ -2178,7 +2170,6 @@ test('allowLoopbackListeningHighPorts allows already-listening high loopback por
     ])
     expectOk(configResult)
     const runtimeCfg = JSON.parse(configResult.stdout)
-    assert.equal(runtimeCfg.network.allowLoopbackHighPorts, false)
     assert.ok(runtimeCfg.network.allowLoopbackPorts.includes(port))
 
     const connectResult = await runGuardCommandAsync([
@@ -2854,7 +2845,7 @@ test('list profile can emit machine-readable JSON', () => {
   expectOk(result)
   const listed = JSON.parse(result.stdout)
   const names = listed.profiles.map((profile) => profile.name)
-  assert.deepEqual(names, ['guard', 'teams', 'webex', 'zoom'])
+  assert.deepEqual(names, ['guard', 'teams', 'webex', 'zoom-discovery', 'zoom'])
   assert.equal(
     listed.profiles.find((profile) => profile.name === 'teams').launcher,
     'guard-teams',
@@ -2999,11 +2990,12 @@ test('install-app all creates every native macOS wrapper bundle', () => {
     )
 
     expectOk(result)
-    assert.match(result.stdout, /Installed 3 Guard native apps/)
+    assert.match(result.stdout, /Installed 4 Guard native apps/)
     for (const [appName, label] of [
       ['webex', 'Webex'],
       ['teams', 'Teams'],
       ['zoom', 'Zoom'],
+      ['zoom-discovery', 'Zoom Discovery'],
     ]) {
       const appPath = join(targetDir, `Guard ${label}.app`)
       const configPath = join(appPath, 'Contents/Resources/GuardAppConfig.json')
@@ -4359,6 +4351,234 @@ test('monitor-log summarizes persistent guard events', () => {
   assert.equal(summary.recent[0].type, 'network.decision')
 })
 
+test('sandbox denial log parser extracts file and process denials tagged by Guard', () => {
+  const fileEvent = parseSandboxDenialMessage(
+    [
+      'Sandbox: cat(33929) deny(1) file-read-data /Users/example/.ssh/id_rsa',
+      'guard:test-tag',
+    ].join('\n'),
+    'guard:test-tag',
+  )
+  assert.equal(fileEvent.category, 'filesystem')
+  assert.equal(fileEvent.operation, 'file-read-data')
+  assert.equal(fileEvent.actor, 'cat')
+  assert.equal(fileEvent.pid, 33929)
+  assert.equal(fileEvent.path, '/Users/example/.ssh/id_rsa')
+  assert.equal(fileEvent.result, 'deny')
+  assert.equal(fileEvent.severity, 'high')
+  assert.equal(fileEvent.sensitivity, 'ssh-private-key')
+  assert.equal(fileEvent.notificationRecommended, true)
+
+  const processEvent = parseSandboxDenialMessage(
+    [
+      'Sandbox: node(34055) deny(1) process-exec /bin/bash',
+      'guard:test-tag',
+    ].join('\n'),
+    'guard:test-tag',
+  )
+  assert.equal(processEvent.category, 'process')
+  assert.equal(processEvent.operation, 'process-exec')
+  assert.equal(processEvent.executablePath, '/bin/bash')
+
+  assert.equal(
+    parseSandboxDenialMessage('Sandbox: cat(1) deny(1) file-read-data /tmp/x', 'guard:test-tag'),
+    null,
+  )
+})
+
+test('sandbox denial sensitivity classifies canaries and credentials without alerting on ordinary env files', () => {
+  assert.deepEqual(
+    classifySandboxDenialSensitivity({ operation: 'file-read-data', target: '/tmp/.guard-canary/aws-token' }),
+    {
+      severity: 'high',
+      sensitivity: 'canary-file',
+      reason: 'canary-file-access',
+      notify: true,
+    },
+  )
+  assert.deepEqual(
+    classifySandboxDenialSensitivity({ operation: 'file-read-data', target: '/Users/example/.aws/credentials' }),
+    {
+      severity: 'high',
+      sensitivity: 'credential-file',
+      reason: 'credential-file-read',
+      notify: true,
+    },
+  )
+  assert.deepEqual(
+    classifySandboxDenialSensitivity({ operation: 'file-read-data', target: '/Users/example/.config/gh/hosts.yml' }),
+    {
+      severity: 'high',
+      sensitivity: 'credential-file',
+      reason: 'credential-file-read',
+      notify: true,
+    },
+  )
+  assert.deepEqual(
+    classifySandboxDenialSensitivity({ operation: 'file-read-data', target: '/Users/example/.terraform.d/credentials.tfrc.json' }),
+    {
+      severity: 'high',
+      sensitivity: 'credential-file',
+      reason: 'credential-file-read',
+      notify: true,
+    },
+  )
+  assert.deepEqual(
+    classifySandboxDenialSensitivity({ operation: 'file-read-data', target: '/Users/example/project/.env' }),
+    {
+      severity: 'medium',
+      sensitivity: 'env-file',
+      reason: 'env-file-access',
+      notify: false,
+    },
+  )
+})
+
+test('guard records tagged macOS sandbox denial events without log polling', {
+  skip: process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec') || !existsSync('/usr/bin/log'),
+}, async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-sandbox-denial-'))
+  const projectRoot = resolve(tempRoot, 'project')
+  const secretRoot = resolve(tempRoot, 'secret')
+  mkdirSync(resolve(projectRoot, '.guard'), { recursive: true })
+  mkdirSync(secretRoot, { recursive: true })
+  const profilePath = resolve(projectRoot, '.guard/guard.json')
+  const eventLog = resolve(tempRoot, 'events.jsonl')
+  const blocked = resolve(secretRoot, '.guard-canary-secret.txt')
+  writeFileSync(blocked, 'secret\n')
+  const blockedReal = realpathSync(blocked)
+  writeFileSync(
+    profilePath,
+    JSON.stringify({
+      networkUnrestricted: true,
+      filesystem: {
+        allowRead: [projectRoot],
+        allowWrite: [projectRoot],
+        denyRead: [blocked],
+        denyWrite: [],
+      },
+    }),
+  )
+
+  try {
+    const result = spawnSync(
+      guard,
+      ['/bin/cat', blocked],
+      {
+        cwd: projectRoot,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GUARD_EVENT_LOG: eventLog,
+          GUARD_SANDBOX_LOG_TAG: 'guard:test-denial-event',
+          GUARD_SANDBOX_DENIAL_LOG_STARTUP_MS: '500',
+          GUARD_BANNER: 'compact',
+          GUARD_QUIET: '',
+        },
+        timeout: 15000,
+      },
+    )
+    assert.notEqual(result.status, 0)
+    assert.match(`${result.stderr}\n${result.stdout}`, /Operation not permitted|permission/i)
+
+    const deadline = Date.now() + 5000
+    let events = []
+    while (Date.now() < deadline) {
+      if (existsSync(eventLog)) {
+        events = readFileSync(eventLog, 'utf8')
+          .split(/\r?\n/)
+          .filter(Boolean)
+          .map((line) => JSON.parse(line))
+      }
+      if (events.some((event) =>
+        event.type === 'sandbox.denial' &&
+        event.operation === 'file-read-data' &&
+        event.path === blockedReal &&
+        event.severity === 'high' &&
+        event.notificationRecommended === true &&
+        event.ruleTag === 'guard:test-denial-event'
+      )) {
+        return
+      }
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 100))
+    }
+    assert.fail(`missing sandbox.denial event in ${eventLog}\n${JSON.stringify(events, null, 2)}`)
+  } finally {
+    rmSync(tempRoot, { force: true, recursive: true })
+  }
+})
+
+test('guard records tagged macOS subprocess denial events without an extension', {
+  skip: process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec') || !existsSync('/usr/bin/log'),
+}, async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-sandbox-exec-denial-'))
+  const projectRoot = resolve(tempRoot, 'project')
+  mkdirSync(resolve(projectRoot, '.guard'), { recursive: true })
+  writeFileSync(
+    resolve(projectRoot, '.guard/guard.json'),
+    JSON.stringify({
+      networkUnrestricted: true,
+      filesystem: {
+        allowRead: [projectRoot],
+        allowWrite: [projectRoot],
+        denyRead: [],
+        denyWrite: [],
+      },
+      process: {
+        denyByDefault: true,
+        allowedExecutables: ['/bin/sh'],
+        blockRiskyChildExecutables: false,
+      },
+    }),
+  )
+  const eventLog = resolve(tempRoot, 'events.jsonl')
+
+  try {
+    const result = spawnSync(
+      guard,
+      ['/bin/sh', '-c', '/bin/date'],
+      {
+        cwd: projectRoot,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          GUARD_EVENT_LOG: eventLog,
+          GUARD_SANDBOX_LOG_TAG: 'guard:test-exec-denial-event',
+          GUARD_SANDBOX_DENIAL_LOG_STARTUP_MS: '500',
+          GUARD_BANNER: 'compact',
+          GUARD_QUIET: '',
+        },
+        timeout: 15000,
+      },
+    )
+    assert.notEqual(result.status, 0)
+
+    const deadline = Date.now() + 5000
+    let events = []
+    while (Date.now() < deadline) {
+      if (existsSync(eventLog)) {
+        events = readFileSync(eventLog, 'utf8')
+          .split(/\r?\n/)
+          .filter(Boolean)
+          .map((line) => JSON.parse(line))
+      }
+      if (events.some((event) =>
+        event.type === 'sandbox.denial' &&
+        event.category === 'process' &&
+        String(event.operation || '').startsWith('process-exec') &&
+        event.executablePath === '/bin/date' &&
+        event.ruleTag === 'guard:test-exec-denial-event'
+      )) {
+        return
+      }
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 100))
+    }
+    assert.fail(`missing process sandbox.denial event in ${eventLog}\n${JSON.stringify(events, null, 2)}`)
+  } finally {
+    rmSync(tempRoot, { force: true, recursive: true })
+  }
+})
+
 test('discover runs with temporary discovery reporting', () => {
   const tempRoot = mkdtempSync(join(tmpdir(), 'guard-discover-'))
   const reportPath = resolve(tempRoot, 'report.md')
@@ -4406,7 +4626,7 @@ test('GUARD_BANNER controls policy banner rendering', () => {
     },
   })
   expectOk(compact)
-  assert.match(compact.stderr, /^guard ok  net none  secrets protected  run=/)
+  assert.match(compact.stderr, /^guard ok  net ask active  process children allowed, risky tools blocked  secrets protected  run=/)
   assert.doesNotMatch(compact.stderr, /guard policy/)
   assert.doesNotMatch(compact.stderr, /✓ read/)
 
@@ -4467,6 +4687,7 @@ test('audit reports risky policy choices', () => {
   const profilePath = writeGuardProfile('audit-risk', {
     networkUnrestricted: true,
     network: {
+      allowLoopbackHighPorts: true,
       allowUnixSockets: ['/', '/var/run/docker.sock'],
       allowMachLookup: ['com.apple.*'],
     },
@@ -4487,6 +4708,7 @@ test('audit reports risky policy choices', () => {
     assert.match(result.stdout, /volumes-access/)
     assert.match(result.stdout, /docker-socket-access/)
     assert.match(result.stdout, /network-unrestricted/)
+    assert.match(result.stdout, /removed-loopback-high-ports/)
     assert.match(result.stdout, /broad-unix-socket-access/)
     assert.match(result.stdout, /broad-mach-lookup/)
   } finally {

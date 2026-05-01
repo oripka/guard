@@ -15,6 +15,16 @@ extension String {
     }
 }
 
+func compactMiddle(_ value: String, limit: Int) -> String {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.count > limit, limit > 8 else { return trimmed }
+    let headCount = max(4, (limit - 1) / 2)
+    let tailCount = max(4, limit - headCount - 1)
+    let headEnd = trimmed.index(trimmed.startIndex, offsetBy: headCount)
+    let tailStart = trimmed.index(trimmed.endIndex, offsetBy: -tailCount)
+    return "\(trimmed[..<headEnd])...\(trimmed[tailStart...])"
+}
+
 struct GuardAppConfig: Decodable {
     let mode: String?
     let profile: String
@@ -88,7 +98,6 @@ struct GuardNetworkSummary: Decodable {
     let tlsInspection: GuardTlsInspection?
     let allowLocalBinding: Bool?
     let allowLoopbackConnections: Bool?
-    let allowLoopbackHighPorts: Bool?
     let allowLoopbackListeningHighPorts: Bool?
     let allowLoopbackListeningHighPortProcesses: [String]?
     let allowLoopbackPorts: [Int]?
@@ -203,9 +212,29 @@ final class GuardApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNot
                 ],
                 intentIdentifiers: [],
                 options: []
+            ),
+            UNNotificationCategory(
+                identifier: "GUARD_SANDBOX_DENIAL",
+                actions: [
+                    UNNotificationAction(identifier: "OPEN_GUARD", title: "Open Guard", options: [.foreground])
+                ],
+                intentIdentifiers: [],
+                options: []
             )
         ])
-        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        let options: UNAuthorizationOptions
+        if #available(macOS 12.0, *) {
+            options = [.alert, .sound, .timeSensitive]
+        } else {
+            options = [.alert, .sound]
+        }
+        center.requestAuthorization(options: options) { granted, error in
+            if let error {
+                NSLog("Guard notification authorization failed: \(error.localizedDescription)")
+            } else {
+                NSLog("Guard notification authorization granted=\(granted)")
+            }
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -253,6 +282,13 @@ final class GuardApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNot
         return true
     }
 
+    @discardableResult
+    func revealMonitorEvent(userInfo: [AnyHashable: Any]) -> Bool {
+        guard revealMonitor(), let controller = monitorController else { return false }
+        controller.revealNotificationEvent(userInfo: userInfo)
+        return true
+    }
+
     @objc func showRules(_ sender: Any?) {
         monitorController?.openRulesWindow(sender)
     }
@@ -270,9 +306,22 @@ final class GuardApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNot
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+        let userInfo = response.notification.request.content.userInfo
         await MainActor.run {
-            showMonitor(nil)
+            if !revealMonitorEvent(userInfo: userInfo) {
+                showMonitor(nil)
+            }
         }
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        if #available(macOS 11.0, *) {
+            return [.banner, .list, .sound]
+        }
+        return [.alert, .sound]
     }
 }
 
@@ -295,6 +344,8 @@ final class GuardStatusItemController: NSObject {
     let deniedRow = NSButton()
     let popoverContentWidth: CGFloat = 286
     var lastNotifiedPendingCount = 0
+    var seenSandboxDenialKeys: Set<String> = []
+    var didPrimeSandboxDenials = false
 
     init(monitor: MonitorWindowController) {
         self.monitor = monitor
@@ -657,6 +708,7 @@ final class GuardStatusItemController: NSObject {
         }
         let recentEvents = monitor.events.filter { event in
             event.type == "network.decision" ||
+                event.type == "sandbox.denial" ||
                 event.type.hasPrefix("guard.alert.") ||
                 (!event.host.isEmpty && event.result != "inactive")
         }.prefix(4)
@@ -672,6 +724,7 @@ final class GuardStatusItemController: NSObject {
             notifyPendingAlerts(count: pending)
         }
         lastNotifiedPendingCount = pending
+        notifyNewSandboxDenials(from: monitor.events)
     }
 
     func statusItemTintColor(active: Bool) -> NSColor {
@@ -726,13 +779,15 @@ final class GuardStatusItemController: NSObject {
         text.widthAnchor.constraint(equalToConstant: popoverContentWidth - 28).isActive = true
         let title = NSTextField(labelWithString: compactActorLabel(for: event))
         title.font = NSFont.systemFont(ofSize: 12.5, weight: .semibold)
-        title.lineBreakMode = .byTruncatingTail
+        title.maximumNumberOfLines = 2
+        title.lineBreakMode = .byWordWrapping
         title.alignment = .left
         title.translatesAutoresizingMaskIntoConstraints = false
         title.widthAnchor.constraint(equalToConstant: popoverContentWidth - 28).isActive = true
         let detail = NSTextField(labelWithString: compactDestinationLabel(for: event))
         detail.font = NSFont.systemFont(ofSize: 11)
         detail.textColor = denied ? .systemRed : .secondaryLabelColor
+        detail.maximumNumberOfLines = 2
         detail.lineBreakMode = .byTruncatingMiddle
         detail.alignment = .left
         detail.translatesAutoresizingMaskIntoConstraints = false
@@ -770,21 +825,31 @@ final class GuardStatusItemController: NSObject {
     }
 
     func compactActorLabel(for event: GuardMonitorEvent) -> String {
-        if !event.launcherApp.isEmpty { return event.launcherApp }
-        if !event.launcherProcess.isEmpty { return event.launcherProcess }
-        if !event.command.isEmpty {
-            return (event.command as NSString).lastPathComponent
+        let label: String
+        if event.type == "sandbox.denial", !event.actor.isEmpty {
+            if !event.launcherApp.isEmpty {
+                label = "\(event.actor) via \(event.launcherApp)"
+            } else {
+                label = event.actor
+            }
+        } else if !event.launcherApp.isEmpty {
+            label = event.launcherApp
+        } else if !event.launcherProcess.isEmpty {
+            label = event.launcherProcess
+        } else if !event.command.isEmpty {
+            label = (event.command as NSString).lastPathComponent
+        } else if !event.processPath.isEmpty {
+            label = (event.processPath as NSString).lastPathComponent
+        } else {
+            label = event.type.isEmpty ? "Guard" : event.type
         }
-        if !event.processPath.isEmpty {
-            return (event.processPath as NSString).lastPathComponent
-        }
-        return event.type.isEmpty ? "Guard" : event.type
+        return compactMiddle(label, limit: 42)
     }
 
     func compactDestinationLabel(for event: GuardMonitorEvent) -> String {
         let destination = event.host.isEmpty ? event.target : event.host
         let result = event.result.isEmpty ? "" : "\(event.result) "
-        return destination.isEmpty ? event.type : "\(result)\(destination)"
+        return compactMiddle(destination.isEmpty ? event.type : "\(result)\(destination)", limit: 72)
     }
 
     func notifyPendingAlerts(count: Int) {
@@ -794,7 +859,108 @@ final class GuardStatusItemController: NSObject {
         content.sound = .default
         content.categoryIdentifier = "GUARD_PENDING_ALERT"
         let request = UNNotificationRequest(identifier: "dev.guard.pending-alerts", content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error {
+                NSLog("Guard pending alert notification failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func sandboxDenialKey(_ event: GuardMonitorEvent) -> String {
+        [
+            event.at,
+            "\(event.pid)",
+            event.target,
+            event.detail
+        ].joined(separator: "|")
+    }
+
+    func notifyNewSandboxDenials(from events: [GuardMonitorEvent]) {
+        let denials = events.filter { $0.type == "sandbox.denial" }
+        let keys = Set(denials.map(sandboxDenialKey))
+        guard didPrimeSandboxDenials else {
+            seenSandboxDenialKeys = keys
+            didPrimeSandboxDenials = true
+            return
+        }
+
+        let fresh = denials
+            .filter { !seenSandboxDenialKeys.contains(sandboxDenialKey($0)) }
+            .sorted { $0.at < $1.at }
+        seenSandboxDenialKeys.formUnion(keys)
+        let worthy = fresh.filter(isNotificationWorthySandboxDenial)
+        let processDenials = worthy.filter { $0.detail.localizedCaseInsensitiveContains("process-exec") }
+        guard let newest = processDenials.last ?? worthy.last else { return }
+        notifySandboxDenial(newest, extraCount: max(0, worthy.count - 1))
+    }
+
+    func isNotificationWorthySandboxDenial(_ event: GuardMonitorEvent) -> Bool {
+        let detail = event.detail.lowercased()
+        let target = event.target.lowercased()
+
+        if event.severity == "high" || event.notificationRecommended {
+            return true
+        }
+        if detail.contains("process-exec") {
+            return true
+        }
+        if detail.contains("network") {
+            return !target.hasPrefix("/") && !target.contains("syslog")
+        }
+        return false
+    }
+
+    func notifySandboxDenial(_ event: GuardMonitorEvent, extraCount: Int) {
+        let content = UNMutableNotificationContent()
+        let detail = event.detail.lowercased()
+        if event.sensitivity == "canary-file" {
+            content.title = "Guard canary file was touched"
+        } else if event.severity == "high" && detail.contains("file-read") {
+            content.title = "Guard blocked sensitive file access"
+        } else if detail.contains("process-exec") {
+            content.title = "Guard blocked a subprocess"
+        } else if detail.contains("file-read") {
+            content.title = "Guard blocked a file read"
+        } else if detail.contains("file-write") {
+            content.title = "Guard blocked a file write"
+        } else if detail.contains("network") {
+            content.title = "Guard blocked direct network access"
+        } else {
+            content.title = "Guard blocked a sandbox operation"
+        }
+        let actor = compactActorLabel(for: event)
+        let target = compactMiddle(event.target.isEmpty ? event.type : event.target, limit: 80)
+        let suffix = extraCount > 0 ? " (+\(extraCount) more)" : ""
+        content.body = "\(actor) tried \(target)\(suffix)"
+        content.sound = .default
+        content.categoryIdentifier = "GUARD_SANDBOX_DENIAL"
+        if #available(macOS 12.0, *), event.severity == "high" || event.notificationRecommended {
+            content.interruptionLevel = .timeSensitive
+        }
+        content.userInfo = [
+            "guardEventType": event.type,
+            "guardEventAt": event.at,
+            "guardEventPid": event.pid,
+            "guardEventTarget": event.target,
+            "guardEventDetail": event.detail,
+            "guardEventFilter": event.type == "sandbox.denial" && (
+                event.detail.localizedCaseInsensitiveContains("filesystem") ||
+                    event.detail.localizedCaseInsensitiveContains("file-read") ||
+                    event.detail.localizedCaseInsensitiveContains("file-write")
+            ) ? "files" : "denied"
+        ]
+        let request = UNNotificationRequest(
+            identifier: "dev.guard.sandbox-denial.\(sandboxDenialKey(event).hashValue)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error {
+                NSLog("Guard sandbox denial notification failed: \(error.localizedDescription)")
+            } else {
+                NSLog("Guard sandbox denial notification submitted: \(content.title) \(content.body)")
+            }
+        }
     }
 
     @objc func togglePopover(_ sender: Any?) {
@@ -2204,6 +2370,7 @@ struct GuardMonitorEvent {
     let runDir: String
     let command: String
     let processPath: String
+    let actor: String
     let launcherApp: String
     let launcherProcess: String
     let launcherPid: Int
@@ -2215,6 +2382,9 @@ struct GuardMonitorEvent {
     let host: String
     let target: String
     let result: String
+    let severity: String
+    let sensitivity: String
+    let notificationRecommended: Bool
     let detail: String
     let status: String
     let expiresAt: String
@@ -4220,7 +4390,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             }
         }
         let refreshTimer = Timer(timeInterval: 8.0, target: self, selector: #selector(reloadEvents(_:)), userInfo: nil, repeats: true)
-        let pendingAlertTimer = Timer(timeInterval: 0.05, target: self, selector: #selector(pollPendingAlerts(_:)), userInfo: nil, repeats: true)
+        let pendingAlertTimer = Timer(timeInterval: 1.0, target: self, selector: #selector(pollPendingAlerts(_:)), userInfo: nil, repeats: true)
         self.refreshTimer = refreshTimer
         self.pendingAlertTimer = pendingAlertTimer
         RunLoop.main.add(refreshTimer, forMode: .common)
@@ -5023,6 +5193,8 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 ("Write", compactPolicyList(summary.filesystem.allowWrite)),
                 ("Denied", compactPolicyList(summary.filesystem.denyRead + summary.filesystem.denyWrite))
             ]))
+            inspectorSummaryStack.addArrangedSubview(inspectorSection("Default Canary Alerts"))
+            inspectorSummaryStack.addArrangedSubview(detailKeyValueBlock(defaultCanaryAlertRows()))
             inspectorSummaryStack.addArrangedSubview(inspectorSection("Rule Editing"))
             inspectorSummaryStack.addArrangedSubview(detailBlock([
                 daemonConnected
@@ -5147,10 +5319,30 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         for value in summary.filesystem.denyWrite {
             rows.append(policyLeaf(parentKey: parentKey, kind: "policy-deny-write", label: value, destination: "Deny write", activity: "", decision: "deny", event: event))
         }
+        rows.append(policyLeaf(
+            parentKey: parentKey,
+            kind: "policy-default-canaries",
+            label: "Default Canary Alerts",
+            destination: "High severity",
+            activity: "Canaries, SSH keys, cloud credentials, token files, and private key material",
+            decision: "review",
+            event: event
+        ))
         if rows.isEmpty {
             rows.append(policyLeaf(parentKey: parentKey, kind: "policy-empty", label: "No filesystem rules", destination: "", activity: "", decision: "active", event: event))
         }
         return rows
+    }
+
+    func defaultCanaryAlertRows() -> [(String, String)] {
+        [
+            ("Canary names", ".guard-canary*, guard-canary*, canary/..."),
+            ("SSH private keys", "~/.ssh/id_rsa, id_ed25519, id_ecdsa, id_dsa, identity"),
+            ("Cloud credentials", "~/.aws/credentials, ~/.azure, ~/.config/gcloud, ~/.kube/config"),
+            ("Developer tokens", "~/.config/gh/hosts.yml, ~/.npmrc, ~/.pypirc, ~/.netrc"),
+            ("Build/deploy secrets", "~/.terraform.d/credentials.tfrc.json, ~/.cargo/credentials*, ~/.gem/credentials"),
+            ("Key material", "*.pem, *.key, *.p12, *.pfx, GnuPG private keys")
+        ]
     }
 
     func proxyPolicyTreeRows(_ summary: GuardAppSummary, parentKey: String, event: GuardMonitorEvent?) -> [MonitorActivityRow] {
@@ -5285,7 +5477,6 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     func formatLoopbackPorts(_ network: GuardNetworkSummary) -> String {
         var parts: [String] = []
         if network.allowLoopbackConnections == true { parts.append("loopback connections") }
-        if network.allowLoopbackHighPorts == true { parts.append("high ports") }
         if network.allowLoopbackListeningHighPorts == true {
             let processes = network.allowLoopbackListeningHighPortProcesses ?? []
             parts.append(processes.isEmpty ? "listening high ports" : "listening high ports: \(processes.joined(separator: ", "))")
@@ -5472,7 +5663,6 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 tlsInspection: decodeObject(GuardTlsInspection.self, from: network["tlsInspection"]),
                 allowLocalBinding: network["allowLocalBinding"] as? Bool,
                 allowLoopbackConnections: network["allowLoopbackConnections"] as? Bool,
-                allowLoopbackHighPorts: network["allowLoopbackHighPorts"] as? Bool,
                 allowLoopbackListeningHighPorts: network["allowLoopbackListeningHighPorts"] as? Bool,
                 allowLoopbackListeningHighPortProcesses: network["allowLoopbackListeningHighPortProcesses"] as? [String],
                 allowLoopbackPorts: network["allowLoopbackPorts"] as? [Int]
@@ -5523,7 +5713,6 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 tlsInspection: decodeObject(GuardTlsInspection.self, from: network["tlsInspection"]),
                 allowLocalBinding: network["allowLocalBinding"] as? Bool,
                 allowLoopbackConnections: network["allowLoopbackConnections"] as? Bool,
-                allowLoopbackHighPorts: network["allowLoopbackHighPorts"] as? Bool,
                 allowLoopbackListeningHighPorts: network["allowLoopbackListeningHighPorts"] as? Bool,
                 allowLoopbackListeningHighPortProcesses: network["allowLoopbackListeningHighPortProcesses"] as? [String],
                 allowLoopbackPorts: network["allowLoopbackPorts"] as? [Int]
@@ -7126,6 +7315,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             "Scope",
             "App: \(appLabel(for: event))",
             event.host.isEmpty ? nil : "Destination: \(hostPortLabel(for: event))",
+            event.host.isEmpty && !event.target.isEmpty ? "Target: \(event.target)" : nil,
             event.command.isEmpty ? nil : "Command: \(event.command)",
             event.projectDir.isEmpty ? nil : "Project: \(event.projectDir)"
         ].compactMap { $0 }
@@ -7550,6 +7740,40 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         (NSApp.delegate as? GuardApplicationDelegate)?.statusController?.refresh()
     }
 
+    func revealNotificationEvent(userInfo: [AnyHashable: Any]) {
+        let requestedFilter = userInfo["guardEventFilter"] as? String ?? ""
+        if requestedFilter == "files" {
+            monitorFilterControl.selectedSegment = 3
+        } else if requestedFilter == "denied" {
+            monitorFilterControl.selectedSegment = 2
+        }
+        reloadEvents(nil)
+        guard selectEventFromNotification(userInfo: userInfo) else { return }
+        renderSelectedInspectorIfNeeded(force: true)
+        tableView.scrollRowToVisible(tableView.selectedRow)
+    }
+
+    @discardableResult
+    func selectEventFromNotification(userInfo: [AnyHashable: Any]) -> Bool {
+        let type = userInfo["guardEventType"] as? String ?? ""
+        let at = userInfo["guardEventAt"] as? String ?? ""
+        let target = userInfo["guardEventTarget"] as? String ?? ""
+        let detail = userInfo["guardEventDetail"] as? String ?? ""
+        let pid = Int("\(userInfo["guardEventPid"] ?? "")") ?? 0
+        guard !type.isEmpty, !at.isEmpty else { return false }
+        guard let row = activityRows.first(where: { row in
+            guard let event = row.event else { return false }
+            return event.type == type &&
+                event.at == at &&
+                event.target == target &&
+                event.detail == detail &&
+                (pid == 0 || event.pid == pid)
+        }) else {
+            return false
+        }
+        return selectActivityRow(rowKey: row.rowKey)
+    }
+
     @objc func focusSearch(_ sender: Any?) {
         if let toolbarSearchField {
             window?.makeFirstResponder(toolbarSearchField)
@@ -7697,9 +7921,10 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     func updateTrafficSummary() {
         let decisionEvents = events.filter { $0.type == "network.decision" }
         let networkEvents = events.filter { $0.type == "network.decision" || $0.type == "network.flow" }
+        let sandboxDenials = events.filter { $0.type == "sandbox.denial" }
         let proxyEvents = events.filter { $0.type == "proxy.started" }
         recentAllowedCount = decisionEvents.filter { $0.result == "allow" }.count
-        recentDeniedCount = networkEvents.filter { isDeniedTraffic($0) }.count
+        recentDeniedCount = networkEvents.filter { isDeniedTraffic($0) }.count + sandboxDenials.count
         var counts: [String: Int] = [:]
         for event in networkEvents where !event.host.isEmpty {
             counts[event.host, default: 0] += 1
@@ -7829,6 +8054,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                     runDir: "",
                     command: "\(label) \(name)",
                     processPath: profile["path"] as? String ?? "",
+                    actor: "",
                     launcherApp: "",
                     launcherProcess: "",
                     launcherPid: 0,
@@ -7840,6 +8066,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                     host: "",
                     target: name,
                     result: "inactive",
+                    severity: "",
+                    sensitivity: "",
+                    notificationRecommended: false,
                     detail: [description, "\(allowed) allowed domains", "\(denied) denied domains"].filter { !$0.isEmpty }.joined(separator: " · "),
                     status: "inactive",
                     expiresAt: "",
@@ -8306,7 +8535,6 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         for key in [
             "allowLocalBinding",
             "allowLoopbackConnections",
-            "allowLoopbackHighPorts",
             "allowLoopbackListeningHighPorts"
         ] {
             if let enabled = network[key] as? Bool {
@@ -8576,11 +8804,14 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         } else {
             proxyTarget = ""
         }
-        let target = host.isEmpty ? (proxyTarget.isEmpty ? command : proxyTarget) : "\(host)\(port.isEmpty ? "" : ":\(port)")"
+        let sandboxTarget = json["target"] as? String ?? json["path"] as? String ?? json["executablePath"] as? String ?? ""
+        let target = host.isEmpty ? (proxyTarget.isEmpty ? (sandboxTarget.isEmpty ? command : sandboxTarget) : proxyTarget) : "\(host)\(port.isEmpty ? "" : ":\(port)")"
         let status = json["status"] as? String ?? json["phase"] as? String ?? ""
         let result: String
         if type == "network.decision" {
             result = (json["allowed"] as? Bool ?? false) ? "allow" : "deny"
+        } else if type == "sandbox.denial" {
+            result = "deny"
         } else if type.hasPrefix("guard.alert.") {
             result = (json["action"] as? String) ?? status
         } else if let code = json["code"] {
@@ -8593,6 +8824,11 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             json["reason"] as? String,
             status.isEmpty ? nil : "status=\(status)",
             proxyTarget.isEmpty ? nil : proxyTarget,
+            json["category"] as? String,
+            json["operation"] as? String,
+            json["severity"].map { "severity=\($0)" },
+            json["sensitivity"] as? String,
+            json["ruleTag"] as? String,
             json["method"] as? String,
             json["path"] as? String
         ].compactMap { $0 }.filter { !$0.isEmpty }
@@ -8606,6 +8842,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             runDir: json["runDir"] as? String ?? "",
             command: command,
             processPath: json["processPath"] as? String ?? json["executablePath"] as? String ?? "",
+            actor: json["actor"] as? String ?? "",
             launcherApp: json["launcherApp"] as? String ?? "",
             launcherProcess: json["launcherProcess"] as? String ?? "",
             launcherPid: Int("\(json["launcherPid"] ?? 0)") ?? 0,
@@ -8617,6 +8854,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             host: host,
             target: target,
             result: result,
+            severity: json["severity"] as? String ?? "",
+            sensitivity: json["sensitivity"] as? String ?? "",
+            notificationRecommended: json["notificationRecommended"] as? Bool ?? false,
             detail: detailParts.joined(separator: " "),
             status: status,
             expiresAt: json["expiresAt"] as? String ?? "",
@@ -8984,7 +9224,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
         if lower == "pnpm" || lower == "npm" || lower == "yarn" {
             if let runIndex = parts.firstIndex(of: "run"), runIndex + 1 < parts.count {
-                return "\(base) run \(parts[runIndex + 1])"
+                return compactMiddle("\(base) run \(parts[runIndex + 1])", limit: 48)
             }
             return base
         }
@@ -8997,14 +9237,19 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         if lower == "bash" || lower == "zsh" || lower == "sh" {
             if let script = parts.dropFirst().first(where: { !$0.hasPrefix("-") }) {
                 let scriptName = URL(fileURLWithPath: script).lastPathComponent
-                return scriptName.isEmpty ? base : "\(base) \(scriptName)"
+                return compactMiddle(scriptName.isEmpty ? base : "\(base) \(scriptName)", limit: 48)
             }
             return base
         }
-        return base
+        return compactMiddle(base, limit: 48)
     }
 
     func isFileActivity(_ event: GuardMonitorEvent) -> Bool {
+        if event.type == "sandbox.denial" {
+            return event.detail.localizedCaseInsensitiveContains("filesystem") ||
+                event.detail.localizedCaseInsensitiveContains("file-read") ||
+                event.detail.localizedCaseInsensitiveContains("file-write")
+        }
         let value = "\(event.type) \(event.detail)".lowercased()
         return value.contains("file") || value.contains("sandbox") || value.contains("read") || value.contains("write")
     }
@@ -9044,6 +9289,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     func primaryText(for event: GuardMonitorEvent) -> String {
         if !event.host.isEmpty { return hostListLabel(for: event) }
+        if event.type == "sandbox.denial" {
+            return event.target.isEmpty ? "Sandbox denial" : event.target
+        }
         if isFileActivity(event) {
             return "Filesystem policy"
         }
@@ -9072,6 +9320,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     }
 
     func decisionLabel(for event: GuardMonitorEvent) -> String {
+        if event.type == "sandbox.denial" {
+            return "blocked"
+        }
         if event.type == "network.flow" {
             if isDeniedTraffic(event) { return "denied" }
             return event.status == "error" ? "error" : "proxied"
@@ -9719,11 +9970,19 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         if event.type == "network.flow" {
             return event.status == "error" ? "Proxy flow failed" : "Proxy flow"
         }
+        if event.type == "sandbox.denial" {
+            if event.detail.localizedCaseInsensitiveContains("process-exec") { return "Blocked subprocess" }
+            if event.detail.localizedCaseInsensitiveContains("file-read") { return "Blocked file read" }
+            if event.detail.localizedCaseInsensitiveContains("file-write") { return "Blocked file write" }
+            if event.detail.localizedCaseInsensitiveContains("network") { return "Blocked direct network attempt" }
+            return "Blocked sandbox operation"
+        }
         if event.type == "proxy.started" { return "Proxy ready" }
         if event.type == "process.started" { return "Command started" }
         if event.type == "process.exited" {
             return event.result == "exit 0" ? "Command finished" : "Command failed"
         }
+        if event.type == "sandbox.denial" { return activityLabel(for: event) }
         if event.type == "guard.project.profile" { return "Inactive configuration" }
         if event.type == "sandbox.profile_written" { return "Sandbox applied" }
         if event.type == "guard.alert.pending" { return "Needs a decision" }
@@ -9751,13 +10010,13 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         let lower = trimmed.lowercased()
         if lower.contains("pnpm") {
             if let range = trimmed.range(of: " run ") {
-                return "pnpm run \(trimmed[range.upperBound...])"
+                return compactMiddle("pnpm run \(trimmed[range.upperBound...])", limit: 56)
             }
             return "pnpm"
         }
         if lower.contains("npm") {
             if let range = trimmed.range(of: " run ") {
-                return "npm run \(trimmed[range.upperBound...])"
+                return compactMiddle("npm run \(trimmed[range.upperBound...])", limit: 56)
             }
             return "npm"
         }
@@ -9771,7 +10030,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         let parts = trimmed.split(separator: " ").map(String.init)
         guard let first = parts.first else { return "Command" }
         let executable = URL(fileURLWithPath: first).lastPathComponent
-        return ([executable] + parts.dropFirst().prefix(2)).joined(separator: " ")
+        return compactMiddle(([executable] + parts.dropFirst().prefix(2)).joined(separator: " "), limit: 56)
     }
 
     func shortTime(_ value: String) -> String {

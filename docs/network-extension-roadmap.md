@@ -13,6 +13,10 @@ not system-wide interception of arbitrary unguarded apps.
   routed through Guard's proxy.
 - Guard writes persistent monitor events to
   `~/Library/Application Support/guard/events.jsonl` by default.
+- On macOS, guarded runs start one filtered unified-log stream scoped to the
+  run's sandbox `with message` tag. This best-effort bridge records
+  `sandbox.denial` events for denied file, subprocess, and other sandbox
+  operations without polling the system log.
 - `guard monitor-log` and `Guard Monitor.app` read that event stream.
 - `Guard Monitor.app` can turn selected network events into project-local
   domain allow/deny rules through `guard profile add`.
@@ -50,6 +54,7 @@ adapters can evolve without breaking the monitor. Current event types:
 - `proxy.started`
 - `process.started`
 - `process.exited`
+- `sandbox.denial`
 - `network.decision`
 
 Future Network Extension events should use the same JSONL stream with a

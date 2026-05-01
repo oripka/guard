@@ -530,12 +530,23 @@ location with `GUARD_STATE_DIR` or
 
 On macOS, each guarded run tags its generated sandbox profile with a unique
 `with message` value and starts one filtered `log stream` process for that run.
-This avoids polling the unified log and lets Guard surface denied file reads,
-denied file writes, denied subprocess launches, and denied direct sandbox
-operations as `sandbox.denial` monitor events when macOS emits them. Set
+This avoids polling the unified log and lets Guard surface actionable
+`sandbox.denial` monitor events when macOS emits them. By default Guard records
+subprocess blocks, meaningful direct network blocks, and sensitive file events
+such as canary files, SSH private keys, cloud credentials, and key material;
+ordinary low-signal sandbox chatter stays out of the event log. Set
+`GUARD_SANDBOX_DENIAL_LOGS=all` for verbose diagnostics, or
 `GUARD_SANDBOX_DENIAL_LOG=0` to disable this best-effort bridge. It is useful
 local telemetry for simple per-run mode, not a replacement for a future Endpoint
 Security or Network Extension backend.
+
+Default high-severity file alerts are intentionally low false-positive:
+`.guard-canary*` / `guard-canary*` / `canary/...` paths, SSH private keys,
+cloud and cluster credentials (`~/.aws/credentials`, `~/.config/gcloud`,
+`~/.azure`, `~/.kube/config`), developer token files (`~/.config/gh/hosts.yml`,
+`~/.npmrc`, `~/.pypirc`, `~/.netrc`), Terraform/Cargo/Gem credentials, GnuPG
+private keys, and private key material such as `*.pem`, `*.key`, `*.p12`, and
+`*.pfx`. Guard Monitor shows this default watchlist under Filesystem Policy.
 
 The same data is available without opening the app:
 
