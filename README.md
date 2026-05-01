@@ -372,9 +372,9 @@ aliases or tool-specific wrapper scripts.
 ## Commands
 
 ```text
-guard [--profile NAME] [--ask-network] [--deep-egress] [--daemon-policy] [--deny-subprocesses|--allow-subprocesses] <command> [args...]
-guard [--profile NAME] [--ask-network] [--deep-egress] [--daemon-policy] [--deny-subprocesses|--allow-subprocesses] -- <command> [args...]
-guard [--profile NAME] [--ask-network] [--deep-egress] [--daemon-policy] [--deny-subprocesses|--allow-subprocesses]
+guard [options] <command> [args...]
+guard [options] -- <command> [args...]
+guard [options]
 guard off <command> [args...]
 guard unprotected <command> [args...]
 guard help
@@ -424,6 +424,15 @@ guard init [template] [--force]
 - `--allow-subprocesses`: force permissive child process execution for this
   run, overriding a strict profile. Aliases are `--allow-child-processes` and
   `--allow-children`
+- `--allow-read PATH`, `--allow-write PATH`, `--deny-read PATH`, and
+  `--deny-write PATH`: add one-run filesystem path rules
+- `--allow-domain HOST` and `--deny-domain HOST`: add one-run domain rules
+- `--allow-exec PATH`: add one executable to the one-run subprocess allowlist
+- `--allow-loopback` and `--allow-loopback-port PORT`: add one-run loopback
+  network exceptions
+- `--no-network` and `--network-unrestricted`: force no egress or unrestricted
+  egress for this run
+- `--proxy-logs` and `--quiet-proxy-logs`: show or quiet proxy logs for this run
 - `guard` with no command: show the resolved policy banner
 - `guard run`: launch a built-in app profile by name
 - `guard doctor`: inspect current resolution and profile state
