@@ -212,17 +212,17 @@ for SSH to hosts such as `ec2.packetsafari.com`, use the injected
 Guard's SOCKS proxy. A future Network Extension backend is the right place for
 exact external raw TCP rules.
 
-Use `process.allowedExecutables` to constrain which binaries the guarded run
-may launch. When the field is absent, Guard keeps the current permissive
-`process-exec` behavior. When present, Guard emits exact executable path or
-glob-backed `process-exec` allow rules and the sandbox default deny blocks
-other child process launches:
+Use `process.denyByDefault` or `process.allowedExecutables` to constrain which
+binaries the guarded run may launch. When both fields are absent, Guard keeps
+the current permissive `process-exec` behavior. With `denyByDefault`, Guard
+automatically allows `/usr/bin/env` and the command you launched, then the
+sandbox default deny blocks other child process launches unless they are listed:
 
 ```json
 {
   "process": {
+    "denyByDefault": true,
     "allowedExecutables": [
-      "/bin/sh",
       "/opt/homebrew/bin/node",
       "${GUARD_PROJECT_DIR}/node_modules/.bin/*"
     ]
@@ -230,10 +230,12 @@ other child process launches:
 }
 ```
 
-The initial Guard sandbox uses `/usr/bin/env`, so Guard allows that launcher
-automatically when an executable allowlist is active. Profiles still need to
-include the actual command binary and any interpreters used by scripts or
-shebangs, such as `/bin/sh`, `python3`, or `node`.
+Profiles still need to include interpreters and helper tools spawned by the
+initial command, such as `/bin/sh`, `python3`, package-manager shims, or
+project-local binaries. On denial, `sandbox-exec` usually reports the attempted
+exec to the process as `Operation not permitted`; Guard's profile rules include
+a sandbox message tag for system-log correlation, but the portable CLI signal is
+the command failure line from the blocked process.
 
 When `ask` is enabled, unknown requests trigger an interactive prompt that can
 allow an exact API path or a generated wildcard path for the current run.

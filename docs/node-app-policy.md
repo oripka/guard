@@ -90,11 +90,14 @@ Prefer `CLOUDFLARE_API_TOKEN` for CI or repeatable non-interactive deploys.
 
 ## Child Process Policy
 
-Add `process.allowedExecutables` when a project should only launch a reviewed
-set of child processes. The list is path based and supports globs. If the field
-is omitted, Guard keeps the default `sandbox-exec` behavior and allows process
-exec. If the field is present, Guard automatically includes `/usr/bin/env` for
-its own launcher and then only allows the listed executable paths.
+Add `process.denyByDefault` when a project should only launch the initial
+command plus a reviewed set of child processes. Add
+`process.allowedExecutables` for the extra helpers, interpreters, and
+project-local tools the command may spawn. The list is path based and supports
+globs. If both fields are omitted, Guard keeps the default `sandbox-exec`
+behavior and allows process exec. When child-process deny mode is active, Guard
+automatically includes `/usr/bin/env` and the launched command, then only allows
+the listed executable paths.
 
 Include interpreters explicitly. A shell script needs `/bin/sh` or its shebang
 interpreter, and a Node project normally needs the real Node binary plus any
