@@ -212,11 +212,16 @@ for SSH to hosts such as `ec2.packetsafari.com`, use the injected
 Guard's SOCKS proxy. A future Network Extension backend is the right place for
 exact external raw TCP rules.
 
-Use `process.denyByDefault` or `process.allowedExecutables` to constrain which
-binaries the guarded run may launch. When both fields are absent, Guard keeps
-the current permissive `process-exec` behavior. With `denyByDefault`, Guard
-automatically allows `/usr/bin/env` and the command you launched, then the
-sandbox default deny blocks other child process launches unless they are listed:
+Use `--deny-subprocesses`, `process.denyByDefault`, or
+`process.allowedExecutables` to constrain which binaries the guarded run may
+launch. When these are absent, Guard keeps the current permissive
+`process-exec` behavior. With `denyByDefault`, Guard automatically allows
+`/usr/bin/env` and the command you launched, then the sandbox default deny
+blocks other child process launches unless they are listed:
+
+```sh
+guard --deny-subprocesses bash
+```
 
 ```json
 {
@@ -367,9 +372,9 @@ aliases or tool-specific wrapper scripts.
 ## Commands
 
 ```text
-guard [--profile NAME] [--ask-network] [--deep-egress] [--daemon-policy] <command> [args...]
-guard [--profile NAME] [--ask-network] [--deep-egress] [--daemon-policy] -- <command> [args...]
-guard [--profile NAME] [--ask-network] [--deep-egress] [--daemon-policy]
+guard [--profile NAME] [--ask-network] [--deep-egress] [--daemon-policy] [--deny-subprocesses|--allow-subprocesses] <command> [args...]
+guard [--profile NAME] [--ask-network] [--deep-egress] [--daemon-policy] [--deny-subprocesses|--allow-subprocesses] -- <command> [args...]
+guard [--profile NAME] [--ask-network] [--deep-egress] [--daemon-policy] [--deny-subprocesses|--allow-subprocesses]
 guard off <command> [args...]
 guard unprotected <command> [args...]
 guard help
@@ -414,6 +419,11 @@ guard init [template] [--force]
 - `--daemon-policy`: route unknown proxied network decisions through `guardd`
   pending alerts for this run. Alias flags are `--guardd-policy` and
   `--use-guardd`
+- `--deny-subprocesses`: deny child process execution by default for this run.
+  Aliases are `--no-child-processes` and `--deny-children`
+- `--allow-subprocesses`: force permissive child process execution for this
+  run, overriding a strict profile. Aliases are `--allow-child-processes` and
+  `--allow-children`
 - `guard` with no command: show the resolved policy banner
 - `guard run`: launch a built-in app profile by name
 - `guard doctor`: inspect current resolution and profile state
