@@ -43,14 +43,23 @@ not signed, notarized, installer-ready, or suitable for production enforcement.
 
 ## Quick Start
 
-Install Guard from the latest release tarball. This path bundles `iron-proxy`,
-so users do not need Go, npm, pnpm, or a separate proxy checkout.
+Install the latest CLI release. This is the normal path for macOS users and it
+bundles `iron-proxy`.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/oripka/guard/main/install.sh | sh
 ```
 
-Initialize a project profile from the repo you want to run:
+If `~/.local/bin` is not already on your `PATH`, add the line printed by the
+installer to your shell profile, then open a new terminal.
+
+Check the install:
+
+```sh
+guard doctor
+```
+
+Start in the repo you want to run:
 
 ```sh
 cd ~/code/my-project
@@ -58,7 +67,7 @@ guard init
 guard doctor
 ```
 
-Run the common developer workflow by prefixing the command with `guard`:
+Run commands by putting `guard` first:
 
 ```sh
 guard pnpm run dev
@@ -66,51 +75,17 @@ guard --ask-network pnpm run dev
 guard bash
 ```
 
-Guard starts the run with filesystem policy, subprocess policy, and network
-policy active. In ask mode, the deep `iron-proxy` path can prompt on the actual
-HTTP/S shape, such as host, method, and path, instead of only asking for a broad
-domain allow.
-
-A guarded shell makes the boundary visible before you run anything risky:
-
-```text
-$ guard bash
-+ guard policy ------------------------------------------------------------------------------------+
-| ok           no dangerous defaults detected  net ask active  secrets protected                   |
-| run          /private/tmp/guard/run-190268f05fdbbf4e                                             |
-| cwd          /private/tmp/guard/run-190268f05fdbbf4e                                             |
-+ filesystem --------------------------------------------------------------------------------------+
-| policy       read allow-overrides-deny; write deny-overrides-allow                               |
-| + read       <run>                             | x read       /Users /Volumes /Applications      |
-| + write      <run>                             |              /cores /home                       |
-|                                                | x write      .env .env.* secrets/ *.key *.pem   |
-+ network -----------------------------------------------------------------------------------------+
-| policy       default-deny ask                                                                    |
-| + host       -                                 | x host       telemetry and analytics presets    |
-| local        bind=no loopback=no pty=yes unix=<run>                                              |
-+ subprocesses ------------------------------------------------------------------------------------+
-| policy       children allowed, risky tools blocked                                               |
-| + child      -                                 | x exec       curl nc netcat osascript perl      |
-|                                                |              python python3 ruby wget           |
-+--------------------------------------------------------------------------------------------------+
-bash-3.2$ curl https://example.com
-bash: /usr/bin/curl: Operation not permitted
-```
-
-The banner is the contract for that run: broad filesystem reads are closed,
-secret writes are blocked, direct network egress is denied unless routed through
-Guard policy, and risky child tools stay blocked even from an otherwise
-interactive shell.
-
-When Guard prompts for a new destination, approve the narrowest useful scope.
-To add a reviewed rule explicitly:
+`guard --ask-network` uses the bundled `iron-proxy` backend for HTTP/S decisions
+so prompts can be scoped to a host, method, and path. When Guard prompts for a
+new destination, approve the narrowest useful scope. To add reviewed rules
+explicitly:
 
 ```sh
 guard profile add-http-rule --host api.openai.com --method POST --path /v1/responses
 guard profile add network.allowedDomains registry.npmjs.org
 ```
 
-The second common workflow is launching a guarded native app profile:
+Launch a guarded native app profile:
 
 ```sh
 guard run zoom
@@ -120,9 +95,8 @@ guard install-apps
 ```
 
 `guard`, `guard --ask-network`, and `guard --deep-egress --ask-network` are
-per-run flows. They do not require `guardd`, Guard.app, a launch agent, or a
-Network Extension. The daemon and native monitor add richer policy storage,
-alerts, and review UI when you opt into them.
+daemon-free per-run flows. They do not require `guardd`, Guard.app, a launch
+agent, or a Network Extension.
 
 ## What It Protects
 
@@ -147,49 +121,96 @@ permissive.
 
 ## Install
 
+### macOS CLI Install
+
 Requirements:
 
-- macOS with the native `sandbox-exec` runtime
-- Node.js 20 or newer
-- `~/.local/bin` or another user-writable bin directory on `PATH`
-- Xcode Command Line Tools only if you want optional native `.app` wrappers
-
-Recommended install from GitHub Releases:
+- macOS on Apple Silicon
+- Node.js 20 or newer, for example `brew install node`
+- `~/.local/bin` on `PATH`
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/oripka/guard/main/install.sh | sh
 ```
 
-The installer detects the current OS/CPU, downloads the matching
-`guard-cli-<version>-<platform>-<arch>.tar.gz` release asset, unpacks it to
-`~/.local/guard`, links `guard` and bundled `iron-proxy` into `~/.local/bin`,
-and runs `guard setup` non-interactively. Override defaults when needed:
+The script downloads this release asset:
+
+```text
+guard-cli-0.1.0-darwin-arm64.tar.gz
+```
+
+It installs into `~/.local/guard`, links `guard` and bundled `iron-proxy` into
+`~/.local/bin`, and runs onboarding setup. Users do not need to download
+`iron-proxy-darwin-arm64` separately.
+
+Install a specific release:
 
 ```sh
-GUARD_VERSION=v0.1.0 GUARD_PREFIX=/opt/guard \
+GUARD_VERSION=v0.1.0 \
   sh -c "$(curl -fsSL https://raw.githubusercontent.com/oripka/guard/main/install.sh)"
 ```
 
-Package-manager and source installs do not bundle `iron-proxy`. Use them only
-when you already have `iron-proxy` on `PATH`, set
-`GUARD_IRON_PROXY_BIN=/absolute/path/to/iron-proxy`, or keep an
-`../iron-proxy` checkout next to this repo.
-
-Package-manager install from GitHub:
+Use a different install prefix:
 
 ```sh
-pnpm add -g github:oripka/guard
-guard setup
+GUARD_PREFIX=/opt/guard \
+  sh -c "$(curl -fsSL https://raw.githubusercontent.com/oripka/guard/main/install.sh)"
 ```
 
-Or clone and link directly from the repo:
+If Guard is already installed, the installer exits without replacing it. To
+replace an existing release install or overwrite release links:
 
 ```sh
-git clone https://github.com/oripka/guard.git ~/src/guard
-~/src/guard/bin/guard setup
+GUARD_FORCE=1 \
+  sh -c "$(curl -fsSL https://raw.githubusercontent.com/oripka/guard/main/install.sh)"
 ```
 
-`guard setup` can be run before or after `guard install`. It shows the current
+If the installer finds a developer checkout or Guard shim already on `PATH`, it
+keeps it in place and tells you what it found. Use `GUARD_FORCE=1` only when you
+want the release install to take over the `guard` link.
+
+For a private repo or private release, clone the repo first and run the local
+script with a token that can read releases:
+
+```sh
+GH_TOKEN=... sh ./install.sh
+```
+
+### Uninstall
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/oripka/guard/main/uninstall.sh | sh
+```
+
+This removes `~/.local/guard` plus the `guard` and `iron-proxy` links from
+`~/.local/bin`. It keeps `~/.config/guard` so project policy and local settings
+are not deleted accidentally.
+
+Remove config and local policy state too:
+
+```sh
+GUARD_REMOVE_CONFIG=1 \
+  sh -c "$(curl -fsSL https://raw.githubusercontent.com/oripka/guard/main/uninstall.sh)"
+```
+
+### Manual Install
+
+If you already downloaded `guard-cli-0.1.0-darwin-arm64.tar.gz`:
+
+```sh
+mkdir -p ~/.local/guard ~/.local/bin
+tar -xzf guard-cli-0.1.0-darwin-arm64.tar.gz -C ~/.local/guard --strip-components=1
+ln -sfn ~/.local/guard/bin/guard ~/.local/bin/guard
+ln -sfn ~/.local/guard/bin/iron-proxy ~/.local/bin/iron-proxy
+~/.local/guard/bin/guard setup --yes --bin-dir ~/.local/bin --code-root ~/code --force --no-shims
+```
+
+### Developer Installs
+
+Package-manager and source installs are for contributors. They do not bundle
+`iron-proxy`.
+
+`guard setup` can be run before or after a source install. It shows the current
 managed root, config file, install directory, PATH status, and installed
 entrypoint/shim links, then asks for the managed code root, install directory,
 and whether to install PATH shims. For non-interactive shells, pass explicit
@@ -240,7 +261,7 @@ The same command also emits edition tarballs:
   CLI, `guardd`, native sources, the built `GuardMacApp` binary, and
   `iron-proxy`.
 
-Each edition includes `install.sh`. After unpacking, run:
+Each edition includes `install.sh` and `uninstall.sh`. After unpacking, run:
 
 ```sh
 ./install.sh
@@ -254,7 +275,7 @@ default, then runs Guard's normal onboarding setup so users do not need to set
 ./install.sh /opt/guard
 ```
 
-Tagged pushes such as `v0.1.0-alpha.1` publish a GitHub Release with both
+Tagged pushes such as `v0.1.0` publish a GitHub Release with both
 macOS and Linux edition tarballs plus SHA256 checksum files. Users should only
 need the matching `guard-cli-<version>-<platform>-<arch>.tar.gz` asset for a
 CLI install; it already includes `iron-proxy`. The release notes label the CLI

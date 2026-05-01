@@ -22,6 +22,7 @@
     "scripts",
     "templates",
     "install.sh",
+    "uninstall.sh",
     "LICENSE",
     "README.md"
   ],

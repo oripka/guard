@@ -7,6 +7,7 @@ prefix="${GUARD_PREFIX:-$HOME/.local}"
 install_root="${GUARD_INSTALL_ROOT:-$prefix/guard}"
 bin_dir="${GUARD_BIN_DIR:-$prefix/bin}"
 code_root="${GUARD_CODE_ROOT:-$HOME/code}"
+force="${GUARD_FORCE:-0}"
 
 need() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -19,6 +20,42 @@ need curl
 need tar
 need uname
 
+link_target() {
+  path="$1"
+  if [ -L "$path" ]; then
+    readlink "$path" || printf ''
+  else
+    printf ''
+  fi
+}
+
+is_guard_shim() {
+  path="$1"
+  [ -n "$path" ] || return 1
+  target=$(link_target "$path")
+  case "$path:$target" in
+    */guard/bin/guard:*|*:*/guard/bin/guard|*/code/guard/bin/guard:*|*:*/code/guard/bin/guard)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+find_node() {
+  for candidate in "${GUARD_NODE_BIN:-}" /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node "$(command -v node 2>/dev/null || true)"; do
+    [ -n "$candidate" ] || continue
+    [ -x "$candidate" ] || continue
+    if is_guard_shim "$candidate"; then
+      continue
+    fi
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
+}
+
 fetch() {
   if [ -n "${GH_TOKEN:-}" ]; then
     curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$@"
@@ -27,15 +64,19 @@ fetch() {
   fi
 }
 
-if ! command -v node >/dev/null 2>&1; then
+node_bin=$(find_node || true)
+if [ -z "$node_bin" ]; then
   printf '%s\n' "guard installer: Node.js 20 or newer is required." >&2
   printf '%s\n' "Install Node.js first, for example: brew install node" >&2
+  if is_guard_shim "$(command -v node 2>/dev/null || true)"; then
+    printf '%s\n' "guard installer: found a Guard node shim on PATH; set GUARD_NODE_BIN=/absolute/path/to/node if needed." >&2
+  fi
   exit 127
 fi
 
-node_major=$(node -p "Number(process.versions.node.split('.')[0])" 2>/dev/null || printf '0')
+node_major=$("$node_bin" -p "Number(process.versions.node.split('.')[0])" 2>/dev/null || printf '0')
 if [ "$node_major" -lt 20 ]; then
-  printf '%s\n' "guard installer: Node.js 20 or newer is required; found $(node -v)." >&2
+  printf '%s\n' "guard installer: Node.js 20 or newer is required; found $("$node_bin" -v)." >&2
   exit 1
 fi
 
@@ -64,9 +105,45 @@ if [ "$platform" = "linux" ]; then
   printf '%s\n' "guard installer: Linux support is experimental; macOS is the supported alpha platform." >&2
 fi
 
+bin_guard="$bin_dir/guard"
+existing_guard=$(command -v guard 2>/dev/null || true)
+
+if [ -x "$install_root/bin/guard" ] && [ "$force" != "1" ]; then
+  printf '%s\n' "guard installer: Guard already appears installed at $install_root" >&2
+  printf '%s\n' "Run GUARD_FORCE=1 sh ./install.sh to replace it, or run uninstall.sh first." >&2
+  exit 0
+fi
+
+if [ -e "$bin_guard" ] || [ -L "$bin_guard" ]; then
+  target=$(link_target "$bin_guard")
+  case "$target" in
+    "$install_root"/*) ;;
+    *)
+      if [ "$force" != "1" ]; then
+        printf '%s\n' "guard installer: $bin_guard already exists and does not point to $install_root." >&2
+        printf '%s\n' "Existing target: ${target:-not a symlink}" >&2
+        printf '%s\n' "This may be a source checkout or developer install. Set GUARD_FORCE=1 to replace the link." >&2
+        exit 1
+      fi
+      ;;
+  esac
+fi
+
+if [ -n "$existing_guard" ] && is_guard_shim "$existing_guard" && [ "$force" != "1" ]; then
+  existing_target=$(link_target "$existing_guard")
+  case "$existing_target" in
+    "$install_root"/*) ;;
+    *)
+  printf '%s\n' "guard installer: found an existing Guard developer shim on PATH: $existing_guard" >&2
+  printf '%s\n' "Keeping it unchanged. Set GUARD_FORCE=1 to install release links into $bin_dir." >&2
+  exit 1
+      ;;
+  esac
+fi
+
 if [ "$version" = "latest" ]; then
   release_json=$(fetch "https://api.github.com/repos/$repo/releases/latest")
-  version=$(printf '%s\n' "$release_json" | node -e 'let s=""; process.stdin.on("data", d => s += d); process.stdin.on("end", () => { const j = JSON.parse(s); process.stdout.write(j.tag_name || ""); });')
+  version=$(printf '%s\n' "$release_json" | "$node_bin" -e 'let s=""; process.stdin.on("data", d => s += d); process.stdin.on("end", () => { const j = JSON.parse(s); process.stdout.write(j.tag_name || ""); });')
   if [ -z "$version" ]; then
     printf '%s\n' "guard installer: could not resolve latest release for $repo" >&2
     exit 1
@@ -88,7 +165,7 @@ archive="$tmp_dir/guard-cli.tar.gz"
 
 printf '%s\n' "Downloading Guard CLI from $release_url"
 if [ -n "${GH_TOKEN:-}" ]; then
-  asset_id=$(printf '%s\n' "$release_json" | ASSET_NAME="$asset_name" node -e 'let s=""; process.stdin.on("data", d => s += d); process.stdin.on("end", () => { const j = JSON.parse(s); const a = (j.assets || []).find(asset => asset.name === process.env.ASSET_NAME); process.stdout.write(a ? String(a.id) : ""); });')
+  asset_id=$(printf '%s\n' "$release_json" | ASSET_NAME="$asset_name" "$node_bin" -e 'let s=""; process.stdin.on("data", d => s += d); process.stdin.on("end", () => { const j = JSON.parse(s); const a = (j.assets || []).find(asset => asset.name === process.env.ASSET_NAME); process.stdout.write(a ? String(a.id) : ""); });')
   if [ -z "$asset_id" ]; then
     printf '%s\n' "guard installer: could not find release asset: $asset_name" >&2
     exit 1
