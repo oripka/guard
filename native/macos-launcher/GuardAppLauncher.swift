@@ -3109,7 +3109,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         parent?.loadDaemonPolicyState(profile: selectedProfile)
         rows = parent?.ruleRows ?? rows
         renderRows()
-        statusLabel.stringValue = "Loaded \(rows.count) profile rules and \(recentDecisionRows().count) recent decisions."
+        statusLabel.stringValue = "Loaded \(rows.count) profile rules, \(temporaryHttpDecisionRows().count) temporary rules, and \(recentDecisionRows().count) recent decisions."
     }
 
     func renderRows() {
@@ -3157,13 +3157,77 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
     func combinedRuleRows() -> [MonitorRuleRow] {
         var seen = Set<String>()
         var combined: [MonitorRuleRow] = []
-        for row in rows + recentDecisionRows() {
+        for row in rows + temporaryHttpDecisionRows() + recentDecisionRows() {
             let key = row.id.isEmpty ? "\(row.kind)|\(row.action)|\(row.scope)|\(row.detail)|\(row.lifetime)" : row.id
             guard !seen.contains(key) else { continue }
             seen.insert(key)
             combined.append(row)
         }
         return combined
+    }
+
+    func temporaryHttpDecisionRows() -> [MonitorRuleRow] {
+        let file = temporaryHttpDecisionFilePath()
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: file)),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let decisions = object["decisions"] as? [[String: Any]] else {
+            return []
+        }
+        let now = Date()
+        return decisions.compactMap { decision in
+            let expiresAt = decision["expiresAt"] as? String ?? ""
+            guard let expires = iso8601Date(expiresAt), expires > now else { return nil }
+            let profile = decision["profile"] as? String ?? ""
+            if !selectedProfile.isEmpty && !profile.isEmpty && profile != selectedProfile { return nil }
+            let action = decision["action"] as? String ?? "allow"
+            let rule = decision["rule"] as? [String: Any] ?? [:]
+            let host = rule["host"] as? String ?? decision["host"] as? String ?? ""
+            let methods = (rule["methods"] as? [String] ?? []).joined(separator: ", ")
+            let paths = (rule["paths"] as? [String] ?? []).joined(separator: ", ")
+            let scope = host.isEmpty ? "All hosts for this app" : host
+            let detail = [
+                methods.isEmpty ? nil : methods,
+                paths.isEmpty ? nil : paths,
+                profile.isEmpty ? nil : "profile \(profile)"
+            ].compactMap { $0 }.joined(separator: " · ")
+            return MonitorRuleRow(
+                id: decision["id"] as? String ?? "temporary:\(scope):\(detail)",
+                kind: "HTTP",
+                action: action,
+                scope: scope,
+                detail: detail.isEmpty ? "Temporary HTTP decision" : detail,
+                enabled: true,
+                source: "temporary decision",
+                field: "network.httpRules",
+                value: rule,
+                layer: "http",
+                lifetime: decision["duration"] as? String ?? "temporary",
+                approvalState: "approved",
+                notes: "Timed HTTP decision active until \(expiresAt).",
+                expiresAt: expiresAt
+            )
+        }
+    }
+
+    func temporaryHttpDecisionFilePath() -> String {
+        let env = ProcessInfo.processInfo.environment
+        if let explicit = env["GUARD_TEMP_HTTP_DECISIONS"], !explicit.isEmpty {
+            return NSString(string: explicit).expandingTildeInPath
+        }
+        if let stateDir = env["GUARD_STATE_DIR"], !stateDir.isEmpty {
+            return NSString(string: stateDir).expandingTildeInPath + "/temporary-http-decisions.json"
+        }
+        let eventPath = parent?.eventLogPath() ?? NSString(string: "~/Library/Application Support/guard/events.jsonl").expandingTildeInPath
+        return URL(fileURLWithPath: eventPath).deletingLastPathComponent().appendingPathComponent("temporary-http-decisions.json").path
+    }
+
+    func iso8601Date(_ value: String) -> Date? {
+        guard !value.isEmpty else { return nil }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: value) { return date }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: value)
     }
 
     func recentDecisionRows() -> [MonitorRuleRow] {
