@@ -223,6 +223,13 @@ blocks other child process launches unless they are listed:
 guard --deny-subprocesses bash
 ```
 
+Even when child processes are otherwise allowed, Guard blocks child executions
+of commonly abused download/script tools such as `curl`, `wget`, `python`,
+`ruby`, `perl`, `osascript`, and `nc` by default. The explicit command still
+works, so `guard curl https://example.com` is allowed, but a shell or install
+script spawning `curl` is blocked unless the profile or run uses
+`--allow-risky-child-tools`.
+
 ```json
 {
   "process": {
@@ -428,6 +435,10 @@ guard init [template] [--force]
   `--deny-write PATH`: add one-run filesystem path rules
 - `--allow-domain HOST` and `--deny-domain HOST`: add one-run domain rules
 - `--allow-exec PATH`: add one executable to the one-run subprocess allowlist
+- `--allow-risky-child-tools`: permit child executions of commonly abused tools
+  such as `curl`, `wget`, `python`, `ruby`, `perl`, `osascript`, and `nc` for
+  this run. Use `--block-risky-child-tools` to force the default blocklist back
+  on if a profile disables it
 - `--allow-loopback` and `--allow-loopback-port PORT`: add one-run loopback
   network exceptions
 - `--no-network` and `--network-unrestricted`: force no egress or unrestricted
