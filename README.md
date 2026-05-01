@@ -7,7 +7,8 @@ The goal is simple: when you open an unfamiliar repo, install dependencies, run
 a dev server, or launch a high-risk app profile, the process should not get
 implicit access to your whole home directory, mounted volumes, secrets, or
 arbitrary network destinations. `guard` makes that access explicit and
-reviewable through project and app profiles.
+reviewable through project and app profiles, with policy checks for filesystem
+access, subprocess launches, and network egress.
 
 It supports two main workflows:
 
@@ -24,10 +25,70 @@ For guarded runs, the default network backend is the deep `iron-proxy` path so
 HTTP/TLS requests can be reviewed by host, method, path, and selected headers.
 Guard is macOS-focused and does not depend on a remote service.
 
+That gives Guard three practical review surfaces today:
+
+- **Filesystem**: deny broad home, volume, application, and secret paths unless
+  the profile reopens them.
+- **Subprocesses**: optionally deny child process launches by default and block
+  common download/script helper tools from install scripts.
+- **Network**: constrain direct raw egress, route cooperative clients through
+  HTTP/SOCKS proxy variables, and use `iron-proxy` for deeper HTTP/TLS policy.
+
 Guard is not currently a system-wide Little Snitch replacement. Apps that are
 not launched through Guard are outside Guard's enforcement boundary unless they
 voluntarily use Guard's proxy settings. Future Network Extension or Endpoint
 Security support is entitlement-gated and tracked only as future planning.
+
+## Quick Start
+
+Install Guard, choose the managed code root, and install the optional PATH
+shims:
+
+```sh
+pnpm add -g github:oripka/guard
+guard setup --yes --code-root ~/code --bin-dir ~/.local/bin
+guard install --code-root ~/code
+```
+
+Initialize a project profile from the repo you want to run:
+
+```sh
+cd ~/code/my-project
+guard init
+guard doctor
+```
+
+Run the common developer workflow by prefixing the command with `guard`:
+
+```sh
+guard pnpm run dev
+guard --ask-network pnpm run dev
+```
+
+Guard starts the run with filesystem policy, subprocess policy, and network
+policy active. In ask mode, the deep `iron-proxy` path can prompt on the actual
+HTTP/S shape, such as host, method, and path, instead of only asking for a broad
+domain allow. When Guard prompts for a new destination, approve the narrowest
+useful scope. To add a reviewed rule explicitly:
+
+```sh
+guard profile add-http-rule --host api.openai.com --method POST --path /v1/responses
+guard profile add network.allowedDomains registry.npmjs.org
+```
+
+The second common workflow is launching a guarded native app profile:
+
+```sh
+guard run zoom
+guard run teams
+guard run webex
+guard install-apps
+```
+
+`guard`, `guard --ask-network`, and `guard --deep-egress --ask-network` are
+per-run flows. They do not require `guardd`, Guard.app, a launch agent, or a
+Network Extension. The daemon and native monitor add richer policy storage,
+alerts, and review UI when you opt into them.
 
 ## What It Protects
 
@@ -115,102 +176,15 @@ From a project that contains `.guard/guard.json`, prefix commands with `guard`:
 ```sh
 guard pnpm run dev
 guard --ask-network pnpm run dev
-guard --daemon-policy pnpm run dev
 ```
 
 Guard uses the deep `iron-proxy` backend by default for guarded runs. Guard
 starts `iron-proxy` for the run, injects proxy and CA environment variables,
-keeps the sandboxed process limited to the local proxy, and enables ask-and-learn
-HTTP policy by default. Exact `network.httpRules` allow silently. Existing
-`network.allowedDomains` still work as compatibility allows, but interactive
-runs ask whether to save a narrower path rule. Once a path rule is saved, Guard
-does not ask again for that request shape.
-
-```json
-{
-  "network": {
-    "backend": "iron-proxy",
-    "ask": true,
-    "learnHttpRules": true,
-    "upgradeDomainAllows": true,
-    "allowedDomains": ["registry.npmjs.org"],
-    "httpRules": [
-      {
-        "host": "api.openai.com",
-        "methods": ["POST"],
-        "paths": ["/v1/responses", "/v1/oripka/*"]
-      }
-    ],
-    "secretInjection": [
-      {
-        "name": "OPENAI_API_KEY",
-        "source": { "type": "env", "var": "OPENAI_API_KEY" },
-        "proxyValue": "guard-proxy-openai-token",
-        "matchHeaders": ["Authorization"],
-        "require": true,
-        "rules": [
-          {
-            "host": "api.openai.com",
-            "methods": ["POST"],
-            "paths": ["/v1/responses"]
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-Secret injection is boundary-side only. The guarded process sends the proxy
-token, for example `Authorization: Bearer guard-proxy-openai-token`; Guard
-renders an `iron-proxy` `secrets` transform that swaps it for the real
-environment secret only on matching host/method/path rules. Profile JSON stores
-secret names and proxy tokens, not real secret values, and monitor UI surfaces
-secret routes as redacted rows.
-
-Both the default Guard proxy backend and the `iron-proxy` backend expose an
-HTTP proxy and a SOCKS proxy to the guarded process. Guard sets common proxy
-environment variables, plus `GUARD_SOCKS_PROXY` and
-`GUARD_SSH_PROXY_COMMAND`, so helper scripts can route SSH through the per-run
-SOCKS listener without learning backend-specific details.
-
-Use `--daemon-policy` to keep the per-run sandbox/proxy launcher but delegate
-unknown network decisions to `guardd` pending alerts instead of prompting in the
-current terminal. This is opt-in and fail-closed: set `GUARD_DAEMON_URL` or
-`GUARDD_URL`, plus `GUARD_DAEMON_TOKEN` or `GUARDD_API_TOKEN` when the daemon is
-authenticated. Guard enqueues `guard.alert.pending`, waits for Guard.app or a
-daemon client to resolve it, then allows or denies the current proxied request.
-The default `guard` and `guard --ask-network` paths remain daemon-free.
-
-Use `network.allowedRawTcp` only for narrow loopback tools that cannot use proxy
-environment variables. Host rules must opt into launch-time DNS resolution, and
-Guard renders supported loopback results as exact sandbox egress rules for the
-current run:
-
-```json
-{
-  "network": {
-    "allowedRawTcp": [
-      {
-        "host": "localhost",
-        "resolveAtLaunch": true,
-        "port": 8976,
-        "reason": "local OAuth callback helper"
-      }
-    ]
-  }
-}
-```
-
-Prefer the proxy path when possible. `allowedRawTcp` is intentionally separate
-from `allowedDomains`: domain rules constrain traffic through Guard's proxy
-policy, while raw TCP rules are exact sandbox exceptions for non-proxyable
-clients and should stay host/IP plus port scoped. Current macOS
-`sandbox-exec` profiles do not support exact external `IP:port` egress rules;
-for SSH to hosts such as `ec2.packetsafari.com`, use the injected
-`GUARD_SSH_PROXY_COMMAND` or `GIT_SSH_COMMAND` so the traffic goes through
-Guard's SOCKS proxy. A future Network Extension backend is the right place for
-exact external raw TCP rules.
+keeps the sandboxed process limited to the local proxy, and asks before
+unknown proxied HTTP/S requests when ask mode is enabled. Exact
+`network.httpRules` allow silently. Existing `network.allowedDomains` still
+work as compatibility allows, but interactive runs can upgrade them to narrower
+path rules.
 
 Use `--deny-subprocesses`, `process.denyByDefault`, or
 `process.allowedExecutables` to constrain which binaries the guarded run may
@@ -515,9 +489,19 @@ guard install-monitor
 
 `Guard Monitor.app` reads the persistent event log at
 `~/Library/Application Support/guard/events.jsonl` by default. Guard writes
-process lifecycle, sandbox profile, proxy startup, and network decision events
-there as JSON lines. Override the location with `GUARD_STATE_DIR` or
+process lifecycle, sandbox profile, proxy startup, network decision, and
+best-effort macOS sandbox denial events there as JSON lines. Override the
+location with `GUARD_STATE_DIR` or
 `GUARD_EVENT_LOG` before launching guarded commands or installing the monitor.
+
+On macOS, each guarded run tags its generated sandbox profile with a unique
+`with message` value and starts one filtered `log stream` process for that run.
+This avoids polling the unified log and lets Guard surface denied file reads,
+denied file writes, denied subprocess launches, and denied direct sandbox
+operations as `sandbox.denial` monitor events when macOS emits them. Set
+`GUARD_SANDBOX_DENIAL_LOG=0` to disable this best-effort bridge. It is useful
+local telemetry for simple per-run mode, not a replacement for a future Endpoint
+Security or Network Extension backend.
 
 The same data is available without opening the app:
 
@@ -780,6 +764,59 @@ The same mode can be enabled in a profile:
 This applies to traffic that goes through guard's HTTP/SOCKS proxy support.
 Direct raw TCP remains controlled by the native sandbox profile.
 
+### Advanced Network Policy
+
+The default Guard proxy backend and the `iron-proxy` backend expose the same
+client-facing proxy contract. Guard sets common HTTP proxy variables,
+`GUARD_SOCKS_PROXY`, and `GUARD_SSH_PROXY_COMMAND`, so helper scripts can route
+SSH through the per-run SOCKS listener without learning backend-specific
+internals.
+
+`iron-proxy` profile rules can combine compatibility domain allows, narrower
+method/path rules, and boundary-side secret injection:
+
+```json
+{
+  "network": {
+    "backend": "iron-proxy",
+    "ask": true,
+    "learnHttpRules": true,
+    "upgradeDomainAllows": true,
+    "allowedDomains": ["registry.npmjs.org"],
+    "httpRules": [
+      {
+        "host": "api.openai.com",
+        "methods": ["POST"],
+        "paths": ["/v1/responses", "/v1/oripka/*"]
+      }
+    ],
+    "secretInjection": [
+      {
+        "name": "OPENAI_API_KEY",
+        "source": { "type": "env", "var": "OPENAI_API_KEY" },
+        "proxyValue": "guard-proxy-openai-token",
+        "matchHeaders": ["Authorization"],
+        "require": true,
+        "rules": [
+          {
+            "host": "api.openai.com",
+            "methods": ["POST"],
+            "paths": ["/v1/responses"]
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Secret injection is boundary-side only. The guarded process sends the proxy
+token, for example `Authorization: Bearer guard-proxy-openai-token`; Guard
+renders an `iron-proxy` `secrets` transform that swaps it for the real
+environment secret only on matching host/method/path rules. Profile JSON stores
+secret names and proxy tokens, not real secret values, and monitor UI surfaces
+secret routes as redacted rows.
+
 `guard --daemon-policy <command>` is the daemon-backed variant. It forces
 ask-style proxy decisions, writes `network.decisionMode: "guardd"` into the
 temporary runtime config, and posts unknown destinations to `POST
@@ -787,6 +824,36 @@ temporary runtime config, and posts unknown destinations to `POST
 `POST /alerts/:id/resolve` or `POST /alerts/decision`; unresolved or unreachable
 daemon decisions are denied. This works with both the normal Guard proxy and
 `guard --deep-egress` / `network.backend: "iron-proxy"`.
+
+Use `network.allowedRawTcp` only for narrow loopback tools that cannot use proxy
+environment variables. Host rules must opt into launch-time DNS resolution, and
+Guard renders supported loopback results as exact sandbox egress rules for the
+current run:
+
+```json
+{
+  "network": {
+    "allowedRawTcp": [
+      {
+        "host": "localhost",
+        "resolveAtLaunch": true,
+        "port": 8976,
+        "reason": "local OAuth callback helper"
+      }
+    ]
+  }
+}
+```
+
+Prefer the proxy path when possible. `allowedRawTcp` is intentionally separate
+from `allowedDomains`: domain rules constrain traffic through Guard's proxy
+policy, while raw TCP rules are exact sandbox exceptions for non-proxyable
+clients and should stay host/IP plus port scoped. Current macOS
+`sandbox-exec` profiles do not support exact external `IP:port` egress rules;
+for SSH to hosts such as `ec2.packetsafari.com`, use the injected
+`GUARD_SSH_PROXY_COMMAND` or `GIT_SSH_COMMAND` so the traffic goes through
+Guard's SOCKS proxy. A future Network Extension backend is the right place for
+exact external raw TCP rules.
 
 `network.allowLocalBinding` is intentionally loopback-only. It permits local dev
 servers to listen on localhost without allowing direct outbound TCP, DNS, or
