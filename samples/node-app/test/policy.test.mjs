@@ -2672,9 +2672,20 @@ test('guard help prints command usage', () => {
 
   expectOk(result)
   assert.match(result.stdout, /^Usage:/)
+  assert.match(result.stdout, /guard unprotected <command> \[args\.\.\.\]/)
   assert.match(result.stdout, /guard install-apps \[--dir DIR\] \[--force\]/)
   assert.match(result.stdout, /guard monitor-log \[--json\] \[--limit N\] \[PATH\]/)
   assert.match(result.stdout, /guard install-monitor \[--dir DIR\] \[--force\]/)
+})
+
+test('guard unprotected runs command without guard runtime', () => {
+  const result = spawnSync(guard, ['unprotected', process.execPath, '-e', 'process.stdout.write(process.env.GUARD_ACTIVE || "unset")'], {
+    cwd: appRoot,
+    encoding: 'utf8',
+  })
+
+  expectOk(result)
+  assert.equal(result.stdout, 'unset')
 })
 
 test('list profile can emit machine-readable JSON', () => {

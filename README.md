@@ -319,6 +319,7 @@ npx corepack deno
 Escape hatches:
 
 ```sh
+guard unprotected npm i -g @openai/codex
 command pnpm ...
 command node ...
 PNPM_GUARD_BYPASS=1 pnpm ...
@@ -354,6 +355,7 @@ aliases or tool-specific wrapper scripts.
 guard [--profile NAME] [--ask-network] [--deep-egress] [--daemon-policy] <command> [args...]
 guard [--profile NAME] [--ask-network] [--deep-egress] [--daemon-policy] -- <command> [args...]
 guard [--profile NAME] [--ask-network] [--deep-egress] [--daemon-policy]
+guard unprotected <command> [args...]
 guard help
 guard run <webex|teams|zoom> [args...]
 guard doctor [tool] [--json]
