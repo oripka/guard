@@ -32,6 +32,17 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.24.x'
+          cache: false
+
+      - name: Prepare iron-proxy for tests
+        run: |
+          mkdir -p .build/ci
+          git clone --depth 1 --branch "${GUARD_IRON_PROXY_REF}" "${GUARD_IRON_PROXY_REPO}" .build/ci/iron-proxy-src
+          (cd .build/ci/iron-proxy-src && go build -trimpath -o "${GITHUB_WORKSPACE}/.build/ci/iron-proxy" ./cmd/iron-proxy)
+          echo "GUARD_IRON_PROXY_BIN=${GITHUB_WORKSPACE}/.build/ci/iron-proxy" >> "$GITHUB_ENV"
+        env:
+          GUARD_IRON_PROXY_REPO: https://github.com/oripka/iron-proxy
+          GUARD_IRON_PROXY_REF: main
 
       - name: Install Linux sandbox runtime
         if: runner.os == 'Linux'
