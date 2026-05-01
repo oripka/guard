@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { createServer as createHttpServer } from 'node:http'
 import { createServer as createHttpsServer } from 'node:https'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { connect as netConnect } from 'node:net'
@@ -11,6 +11,7 @@ import { connect as tlsConnect } from 'node:tls'
 import { fileURLToPath } from 'node:url'
 
 import { generateProfile } from '../../../lib/guard-manager.mjs'
+import { assertLinuxBubblewrapSupported, buildBubblewrapArgs } from '../../../lib/guard-bubblewrap.mjs'
 import { classifySandboxDenialSensitivity, parseSandboxDenialMessage } from '../../../lib/guard-sandbox-log.mjs'
 import {
   createDomainFilter,
@@ -715,6 +716,54 @@ test('allowedRawTcp rejects exact external raw TCP under sandbox-exec', () => {
         },
       ),
     /exact external IP rules are not supported/,
+  )
+})
+
+test('packaged iron-proxy is discovered next to guard bin before PATH lookup', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-packaged-iron-proxy-'))
+  const packageRoot = resolve(tempRoot, 'package')
+  const packageBin = resolve(packageRoot, 'bin')
+  const packageLib = resolve(packageRoot, 'lib')
+  mkdirSync(packageBin, { recursive: true })
+  copyFileSync(guard, resolve(packageBin, 'guard'))
+  chmodSync(resolve(packageBin, 'guard'), 0o755)
+  writeFileSync(resolve(packageBin, 'iron-proxy'), '#!/bin/sh\nexit 0\n')
+  chmodSync(resolve(packageBin, 'iron-proxy'), 0o755)
+  cpSync(resolve(repoRoot, 'lib'), packageLib, { recursive: true })
+
+  const result = spawnSync(resolve(packageBin, 'guard'), ['doctor', 'node', '--json'], {
+    cwd: appRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GUARD_QUIET: '1',
+      GUARD_SHIM_BYPASS: '1',
+      GUARD_IRON_PROXY_BIN: '',
+      PATH: `/usr/bin:/bin`,
+    },
+  })
+
+  expectOk(result)
+  const report = JSON.parse(result.stdout)
+  assert.equal(realpathSync(report.ironProxy.command), realpathSync(resolve(packageBin, 'iron-proxy')))
+})
+
+test('linux bubblewrap backend denies network when policy has no egress exceptions', { skip: process.platform !== 'linux' }, () => {
+  const args = buildBubblewrapArgs({
+    cfg: networkProfileConfig({ allowedDomains: [] }),
+    commandArgs: ['/usr/bin/true'],
+    env: ['HOME=/tmp/guard-home', 'PATH=/usr/bin:/bin'],
+    cwd: appRoot,
+  })
+
+  assert.ok(args.includes('--unshare-net'))
+  assert.deepEqual(args.slice(-2), ['/usr/bin/env', '/usr/bin/true'])
+})
+
+test('linux bubblewrap backend fails closed for proxy-routed domain policy', { skip: process.platform !== 'linux' }, () => {
+  assert.throws(
+    () => assertLinuxBubblewrapSupported(networkProfileConfig({ allowedDomains: ['example.com'] }), { proxyEnabled: true }),
+    /does not yet support Guard proxy\/domain\/httpRules enforcement/,
   )
 })
 
@@ -4897,6 +4946,43 @@ test('init can create the Cloudflare Wrangler template', () => {
   assert.equal(existsSync(created), true)
   const cfg = JSON.parse(readFileSync(created, 'utf8'))
   assert.deepEqual(cfg.imports, ['node-app-defaults', 'cloudflare-wrangler'])
+})
+
+test('init-agent creates Guard profile authoring notes for coding agents', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-init-agent-'))
+  const result = spawnSync(guard, ['init-agent'], {
+    cwd: tempRoot,
+    encoding: 'utf8',
+  })
+
+  expectOk(result)
+  const created = resolve(tempRoot, 'AGENTS.md')
+  assert.equal(existsSync(created), true)
+  const content = readFileSync(created, 'utf8')
+  assert.match(content, /Guard Profile Authoring Notes/)
+  assert.match(content, /guard profile doctor/)
+  assert.match(content, /networkUnrestricted/)
+})
+
+test('init-agent refuses to overwrite existing notes without --force', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-init-agent-existing-'))
+  const target = resolve(tempRoot, 'AGENTS.md')
+  writeFileSync(target, 'custom notes\n')
+
+  const denied = spawnSync(guard, ['init-agent'], {
+    cwd: tempRoot,
+    encoding: 'utf8',
+  })
+  assert.notEqual(denied.status, 0)
+  assert.match(denied.stderr, /refusing to overwrite/)
+  assert.equal(readFileSync(target, 'utf8'), 'custom notes\n')
+
+  const forced = spawnSync(guard, ['init-agent', '--force'], {
+    cwd: tempRoot,
+    encoding: 'utf8',
+  })
+  expectOk(forced)
+  assert.match(readFileSync(target, 'utf8'), /Guard Profile Authoring Notes/)
 })
 
 test('shim resolves the real tool from sanitized PATH instead of fixed package-manager paths', () => {

@@ -1,7 +1,7 @@
 {
   "name": "guard",
   "version": "0.1.0",
-  "description": "Local macOS developer sandbox launcher with fail-closed shims for risky toolchains.",
+  "description": "Early-alpha local macOS developer sandbox launcher with fail-closed shims for risky toolchains.",
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
@@ -19,6 +19,7 @@
     "native/macos-launcher/README.md",
     "native/network-extension",
     "profiles",
+    "scripts",
     "templates",
     "LICENSE",
     "README.md"
@@ -29,7 +30,8 @@
   "scripts": {
     "test": "PNPM_GUARD_BYPASS=1 pnpm --dir samples/node-app test",
     "doctor": "./bin/guard doctor",
-    "pack:dry-run": "npm pack --dry-run"
+    "pack:dry-run": "npm pack --dry-run",
+    "build:package": "node scripts/build-packages.mjs"
   },
   "keywords": [
     "sandbox",

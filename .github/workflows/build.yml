@@ -1,0 +1,59 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  package:
+    name: Package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-24.04]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.32.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+
+      - name: Install Linux sandbox runtime
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile=false
+
+      - name: Test macOS runtime
+        if: runner.os == 'macOS'
+        run: pnpm test
+
+      - name: Test Linux bubblewrap runtime
+        if: runner.os == 'Linux'
+        run: node --test --test-name-pattern "linux bubblewrap" samples/node-app/test/policy.test.mjs
+
+      - name: Build package artifacts
+        run: pnpm build:package
+        env:
+          GUARD_IRON_PROXY_REPO: https://github.com/oripka/iron-proxy
+          GUARD_IRON_PROXY_REF: main
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: guard-${{ runner.os }}-${{ runner.arch }}
+          path: dist/*

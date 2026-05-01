@@ -1,7 +1,8 @@
 # guard
 
 `guard` runs developer tools and selected native macOS UI apps inside a local
-macOS sandbox.
+macOS sandbox. It is an early alpha for local developer workflows, not a
+production security product or a system-wide firewall.
 
 The goal is simple: when you open an unfamiliar repo, install dependencies, run
 a dev server, or launch a high-risk app profile, the process should not get
@@ -36,13 +37,15 @@ That gives Guard three practical review surfaces today:
 
 Guard is not currently a system-wide Little Snitch replacement. Apps that are
 not launched through Guard are outside Guard's enforcement boundary unless they
-voluntarily use Guard's proxy settings. Future Network Extension or Endpoint
-Security support is entitlement-gated and tracked only as future planning.
+voluntarily use Guard's proxy settings. The native monitor, daemon, and Network
+Extension materials are prototype/planning surfaces for local testing; they are
+not signed, notarized, installer-ready, or suitable for production enforcement.
 
 ## Quick Start
 
 Install Guard, choose the managed code root, and install the optional PATH
-shims:
+shims. Source/package-manager installs require `iron-proxy` to be available
+separately; release edition tarballs bundle it.
 
 ```sh
 pnpm add -g github:oripka/guard
@@ -151,6 +154,9 @@ Requirements:
 
 - macOS with the native `sandbox-exec` runtime
 - Node.js 20 or newer
+- `iron-proxy` on `PATH`, `GUARD_IRON_PROXY_BIN=/absolute/path/to/iron-proxy`,
+  or a sibling `../iron-proxy` checkout for the default deep HTTP/S policy
+  backend
 - `~/.local/bin` or another user-writable bin directory on `PATH`
 - Xcode Command Line Tools only if you want optional native `.app` wrappers
 
@@ -160,6 +166,14 @@ Package-manager install from GitHub:
 pnpm add -g github:oripka/guard
 guard setup
 ```
+
+Package-manager and source installs do not bundle `iron-proxy`. Before running
+the default deep network backend, either put `iron-proxy` on `PATH`, set
+`GUARD_IRON_PROXY_BIN=/absolute/path/to/iron-proxy`, or keep an
+`../iron-proxy` checkout next to this repo. To give testers a one-command
+install without that prerequisite, publish the edition tarballs from
+`npm run build:package`; those tarballs include `bin/iron-proxy` and Guard
+discovers it automatically.
 
 Or clone and link directly from the repo:
 
@@ -178,6 +192,16 @@ flags:
 guard setup --yes --code-root ~/code --bin-dir ~/.local/bin
 ```
 
+Guard also ships agent-facing project guidance. In a repo where you want a
+coding agent to help maintain Guard policy, run:
+
+```sh
+guard init-agent
+```
+
+This creates `AGENTS.md` from `templates/agents/AGENTS.md` with instructions for
+generating and reviewing `.guard/guard.json` safely.
+
 To install the standard shim set into `~/.local/bin`:
 
 ```sh
@@ -190,16 +214,67 @@ To install only `guard` and the app launchers:
 guard install --code-root ~/code --no-shims
 ```
 
+## Build Artifacts
+
+`npm run build:package` is the recommended release build for GitHub alpha
+testers because it bundles the matching OS binary for the `iron-proxy` backend.
+By default it clones
+`https://github.com/oripka/iron-proxy` at `main`, builds
+`./cmd/iron-proxy`, and writes the binary into `dist/` as
+`iron-proxy-<platform>-<arch>` next to the Guard package tarball and
+`manifest.json`.
+
+The same command also emits edition tarballs:
+
+- `guard-cli-<version>-<platform>-<arch>.tar.gz`: CLI, shared policy code,
+  profiles/templates, docs, and `iron-proxy`; no `guardd` or native UI.
+- `guard-daemon-<version>-<platform>-<arch>.tar.gz`: CLI plus `guardd` and
+  `iron-proxy`; no native UI.
+- `guard-desktop-<version>-darwin-<arch>.tar.gz`: macOS desktop edition with
+  CLI, `guardd`, native sources, the built `GuardMacApp` binary, and
+  `iron-proxy`.
+
+Each edition includes `install.sh`. After unpacking, run:
+
+```sh
+./install.sh
+```
+
+The installer links `guard` and bundled `iron-proxy` into `~/.local/bin` by
+default, then runs Guard's normal onboarding setup so users do not need to set
+`GUARD_IRON_PROXY_BIN`. Pass a prefix to install links elsewhere:
+
+```sh
+./install.sh /opt/guard
+```
+
+Override the source when needed:
+
+```sh
+GUARD_IRON_PROXY_REPO=https://github.com/oripka/iron-proxy \
+GUARD_IRON_PROXY_REF=main \
+npm run build:package
+```
+
 To install into a different directory:
 
 ```sh
 guard install --bin-dir ~/bin --code-root ~/work --force
 ```
 
-`guard install` creates symlinks back to the real `guard` entrypoint. It does
-not copy wrapper scripts around your system. It also writes the managed root to
-`~/.config/guard/config.json`; set `GUARD_CODE_ROOT` to override that value for
-a single shell or CI job.
+`guard install` creates symlinks back to the real `guard` entrypoint. Packaged
+editions also include a bundled `bin/iron-proxy`, and Guard automatically
+discovers that binary when running from an unpacked edition. It also writes the
+managed root to `~/.config/guard/config.json`; set `GUARD_CODE_ROOT` to override
+that value for a single shell or CI job.
+
+### Linux Status
+
+Linux support is experimental and intentionally limited. The current
+`bubblewrap` backend can fail closed for basic filesystem containment and
+network-denied runs, but Guard proxy/domain/httpRules, loopback port
+exceptions, and `allowedRawTcp` are not supported there yet. Treat Linux as a
+future compatibility target, not a supported release platform for the alpha.
 
 ## Usage
 
@@ -509,8 +584,9 @@ Install the local monitor app:
 guard ui
 ```
 
-This builds and starts `Guard Monitor.app` as a lightweight menu-bar utility.
-It shows only the toolbar/status icon by default. On launch, the monitor
+This builds and starts the prototype `Guard Monitor.app` as a lightweight
+menu-bar utility for local testing. It shows only the toolbar/status icon by
+default. On launch, the monitor
 connects to an existing local `guardd` if one is reachable; otherwise it starts
 a temporary local daemon using the selected project when available or Guard's
 global app-support policy store by default. Use the menu-bar icon to open the
@@ -583,15 +659,17 @@ cache invalidation, policy digest validation, stale-policy fallback, and
 event-log backpressure. These controls are feature-only local development
 flows; they do not install launch agents or NetworkExtension components.
 
-The monitor UI is intentionally moving toward a Little Snitch-style native
-workflow without adding packaging or signing requirements: the header shows
-profile risk and rule status chips, a compact live allow/deny traffic graph, and
-a Focus Top Host action that opens the Rules window filtered to the busiest recent
-destination. Rules carry action, type, enabled state, and scope-risk labels so
-broad host/domain grants are easier to spot before editing. The dedicated Rules
-window supports multi-select edits, a Disable Visible bulk action, and
-optimistic profile-version checks so stale UI edits reload instead of silently
-overwriting newer CLI or daemon changes.
+The monitor UI is prototype-grade and intended for local development feedback.
+It points toward a native macOS security workflow, but it is not a signed,
+notarized, production installer and should not be described as a finished
+Little Snitch-style product. Today it provides profile risk and rule status
+chips, a compact live allow/deny traffic graph, and a Focus Top Host action
+that opens the Rules window filtered to the busiest recent destination. Rules
+carry action, type, enabled state, and scope-risk labels so broad host/domain
+grants are easier to spot before editing. The dedicated Rules window supports
+multi-select edits, a Disable Visible bulk action, and optimistic
+profile-version checks so stale UI edits reload instead of silently overwriting
+newer CLI or daemon changes.
 
 Review TLS inspection explicitly:
 
@@ -921,14 +999,25 @@ when the helper service is already listening before the guarded command starts.
 `network.allowLoopbackConnections` permits all localhost TCP ports and should be
 treated as an escape hatch.
 
-`guard` no longer depends on the external `srt` package. The current native
-runtime uses macOS `sandbox-exec` directly and keeps the policy generation local
-to this repo.
+`guard` no longer depends on the external `srt` package. The supported alpha
+runtime uses macOS `sandbox-exec` while keeping policy generation local to this
+repo. A Linux `bubblewrap` backend exists as an experimental compatibility
+target for later work.
+
+The Linux backend is intentionally narrower than the macOS backend today:
+
+- filesystem containment is built from read-only and writable bind mounts
+- network-denied runs use a private `bubblewrap` network namespace
+- `networkUnrestricted: true` uses the host network for trusted commands
+- Guard proxy/domain/httpRules, loopback port exceptions, and `allowedRawTcp`
+  fail closed on Linux until a Linux network-policy helper can enforce those
+  contracts without silently allowing bypasses
 
 The native runtime now lives in:
 
 - `lib/guard-manager.mjs`
 - `lib/guard-utils.mjs`
+- `lib/guard-bubblewrap.mjs`
 
 It also supports a few local-only policy extensions that are useful for native
 macOS apps:
