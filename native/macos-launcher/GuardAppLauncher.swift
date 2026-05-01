@@ -139,6 +139,15 @@ struct GuardFilesystemSummary: Decodable {
     let denyWrite: [String]
 }
 
+struct GuardProcessSummary: Decodable {
+    let mode: String
+    let allowChildren: Bool?
+    let denyByDefault: Bool?
+    let blockRiskyChildExecutables: Bool?
+    let allowedExecutables: [String]
+    let deniedExecutables: [String]
+}
+
 struct GuardAppSummary: Decodable {
     let profile: String
     let description: String
@@ -146,6 +155,7 @@ struct GuardAppSummary: Decodable {
     let status: String
     let appBundle: String?
     let network: GuardNetworkSummary
+    let process: GuardProcessSummary
     let filesystem: GuardFilesystemSummary
     let findings: [GuardFinding]
 }
@@ -5228,9 +5238,17 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         values.isEmpty ? empty : values.joined(separator: ", ")
     }
 
+    func processModeText(denyByDefault: Bool, allowedCount: Int, blockRisky: Bool) -> String {
+        let mode = denyByDefault
+            ? (allowedCount > 0 ? "deny-by-default +\(allowedCount)" : "deny-by-default")
+            : "children allowed"
+        return blockRisky ? "\(mode), risky tools blocked" : mode
+    }
+
     func policyRows(for summary: GuardAppSummary, appKey: String, event: GuardMonitorEvent?) -> [MonitorActivityRow] {
         let networkKey = "\(appKey)/policy:network"
         let filesKey = "\(appKey)/policy:files"
+        let processKey = "\(appKey)/policy:process"
         let proxyKey = "\(appKey)/policy:proxy"
         var rows: [MonitorActivityRow] = []
         rows.append(
@@ -5263,6 +5281,21 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             )
         )
         rows.append(contentsOf: filesystemPolicyTreeRows(summary, parentKey: filesKey, event: event))
+        rows.append(
+            MonitorActivityRow(
+                isGroup: true,
+                kind: "policy-process",
+                level: 1,
+                rowKey: processKey,
+                app: "Subprocess Policy",
+                destination: summary.process.mode,
+                activity: "",
+                decision: summary.process.denyByDefault == true ? "review" : "active",
+                time: "",
+                event: event
+            )
+        )
+        rows.append(contentsOf: processPolicyTreeRows(summary, parentKey: processKey, event: event))
         rows.append(
             MonitorActivityRow(
                 isGroup: true,
@@ -5341,8 +5374,41 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             ("Cloud credentials", "~/.aws/credentials, ~/.azure, ~/.config/gcloud, ~/.kube/config"),
             ("Developer tokens", "~/.config/gh/hosts.yml, ~/.npmrc, ~/.pypirc, ~/.netrc"),
             ("Build/deploy secrets", "~/.terraform.d/credentials.tfrc.json, ~/.cargo/credentials*, ~/.gem/credentials"),
+            ("Password vaults", "KeePass *.kdbx, *.kdb"),
             ("Key material", "*.pem, *.key, *.p12, *.pfx, GnuPG private keys")
         ]
+    }
+
+    func processPolicyTreeRows(_ summary: GuardAppSummary, parentKey: String, event: GuardMonitorEvent?) -> [MonitorActivityRow] {
+        var rows: [MonitorActivityRow] = []
+        let childrenDestination = summary.process.allowChildren == false || summary.process.denyByDefault == true
+            ? "deny by default"
+            : "allowed"
+        rows.append(policyLeaf(
+            parentKey: parentKey,
+            kind: "policy-process-mode",
+            label: "Child processes",
+            destination: childrenDestination,
+            activity: summary.process.mode,
+            decision: summary.process.denyByDefault == true ? "review" : "active",
+            event: event
+        ))
+        rows.append(policyLeaf(
+            parentKey: parentKey,
+            kind: "policy-risky-tools",
+            label: "Risky child tools",
+            destination: summary.process.blockRiskyChildExecutables == false ? "allowed" : "blocked",
+            activity: "curl, wget, python, ruby, perl, osascript, nc",
+            decision: summary.process.blockRiskyChildExecutables == false ? "review" : "deny",
+            event: event
+        ))
+        for value in summary.process.allowedExecutables {
+            rows.append(policyLeaf(parentKey: parentKey, kind: "policy-allow-exec", label: value, destination: "Allow exec", activity: "", decision: "allow", event: event))
+        }
+        for value in summary.process.deniedExecutables {
+            rows.append(policyLeaf(parentKey: parentKey, kind: "policy-deny-exec", label: value, destination: "Deny exec", activity: "", decision: "deny", event: event))
+        }
+        return rows
     }
 
     func proxyPolicyTreeRows(_ summary: GuardAppSummary, parentKey: String, event: GuardMonitorEvent?) -> [MonitorActivityRow] {
@@ -5643,6 +5709,13 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         }
         let expandArray = { (values: [String]) -> [String] in values.map(expand) }
         let denyWrite = filesystem["denyWrite"] as? [String] ?? []
+        let processPolicy = object["process"] as? [String: Any] ?? [:]
+        let allowedExecutables = processPolicy["allowedExecutables"] as? [String] ?? []
+        let deniedExecutables = processPolicy["deniedExecutables"] as? [String] ?? []
+        let blockRisky = processPolicy["blockRiskyChildExecutables"] as? Bool ?? true
+        let denyByDefault = processPolicy["denyByDefault"] as? Bool == true ||
+            processPolicy["allowChildren"] as? Bool == false ||
+            processPolicy["defaultAction"] as? String == "deny"
         let secretsProtected = denyWrite.contains { value in
             value.contains(".env") || value.contains("secrets") || value.contains("*.key") || value.contains("*.pem")
         }
@@ -5667,6 +5740,18 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 allowLoopbackListeningHighPortProcesses: network["allowLoopbackListeningHighPortProcesses"] as? [String],
                 allowLoopbackPorts: network["allowLoopbackPorts"] as? [Int]
             ),
+            process: GuardProcessSummary(
+                mode: processModeText(
+                    denyByDefault: denyByDefault,
+                    allowedCount: allowedExecutables.count,
+                    blockRisky: blockRisky
+                ),
+                allowChildren: processPolicy["allowChildren"] as? Bool,
+                denyByDefault: denyByDefault,
+                blockRiskyChildExecutables: blockRisky,
+                allowedExecutables: expandArray(allowedExecutables),
+                deniedExecutables: expandArray(deniedExecutables)
+            ),
             filesystem: GuardFilesystemSummary(
                 allowRead: expandArray(filesystem["allowRead"] as? [String] ?? []),
                 denyRead: expandArray(filesystem["denyRead"] as? [String] ?? []),
@@ -5687,6 +5772,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             throw NSError(domain: "GuardMonitor", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid app-summary JSON"])
         }
         let network = object["network"] as? [String: Any] ?? [:]
+        let process = object["process"] as? [String: Any] ?? [:]
         let filesystem = object["filesystem"] as? [String: Any] ?? [:]
         let findings = (object["findings"] as? [[String: Any]] ?? []).map {
             GuardFinding(
@@ -5716,6 +5802,18 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 allowLoopbackListeningHighPorts: network["allowLoopbackListeningHighPorts"] as? Bool,
                 allowLoopbackListeningHighPortProcesses: network["allowLoopbackListeningHighPortProcesses"] as? [String],
                 allowLoopbackPorts: network["allowLoopbackPorts"] as? [Int]
+            ),
+            process: GuardProcessSummary(
+                mode: process["mode"] as? String ?? processModeText(
+                    denyByDefault: process["denyByDefault"] as? Bool == true,
+                    allowedCount: (process["allowedExecutables"] as? [String] ?? []).count,
+                    blockRisky: process["blockRiskyChildExecutables"] as? Bool ?? true
+                ),
+                allowChildren: process["allowChildren"] as? Bool,
+                denyByDefault: process["denyByDefault"] as? Bool,
+                blockRiskyChildExecutables: process["blockRiskyChildExecutables"] as? Bool,
+                allowedExecutables: process["allowedExecutables"] as? [String] ?? [],
+                deniedExecutables: process["deniedExecutables"] as? [String] ?? []
             ),
             filesystem: GuardFilesystemSummary(
                 allowRead: filesystem["allowRead"] as? [String] ?? [],
@@ -9595,7 +9693,10 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             return ("live", .systemGreen, "Applies to new proxy decisions in this run.")
         case "policy-read", "policy-write", "policy-deny-read", "policy-deny-write":
             return ("next run", .secondaryLabelColor, "Filesystem sandbox rules are generated when a guarded run starts.")
-        case "policy-raw-tcp", "policy-proxy-env", "policy-socks-env", "policy-loopback", "policy-secret-injection":
+        case "policy-raw-tcp", "policy-proxy-env", "policy-socks-env", "policy-loopback", "policy-secret-injection", "policy-process-mode", "policy-risky-tools", "policy-allow-exec", "policy-deny-exec":
+            if row.kind.hasPrefix("policy-") && (row.kind.contains("exec") || row.kind == "policy-process-mode" || row.kind == "policy-risky-tools") {
+                return ("next run", .secondaryLabelColor, "Subprocess sandbox rules are generated when a guarded run starts.")
+            }
             return ("next run", .secondaryLabelColor, "Proxy environment and direct TCP exceptions are fixed for the current guarded run.")
         case "policy-http":
             return ("proxy reload", .systemOrange, "Deep HTTP rules are enforced by the proxy and require a proxy reload or the next run.")
@@ -9844,6 +9945,8 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 switch row.kind {
                 case "policy-network": symbol = "network"
                 case "policy-files": symbol = "folder.badge.gearshape"
+                case "policy-process": symbol = "terminal"
+                case "policy-allow-exec", "policy-deny-exec", "policy-process-mode", "policy-risky-tools": symbol = "terminal"
                 case "policy-proxy": symbol = "lock.shield"
                 case "policy-secret-injection": symbol = "key.fill"
                 default: symbol = "list.bullet.rectangle"

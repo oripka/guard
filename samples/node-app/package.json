@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "NODE_GUARD_BYPASS=1 node --test test/*.test.mjs",
+    "test": "NODE_GUARD_BYPASS=1 node --test --test-concurrency=1 test/*.test.mjs",
     "smoke": "node scripts/smoke.mjs"
   },
   "packageManager": "pnpm@10.32.1"

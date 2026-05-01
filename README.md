@@ -546,8 +546,9 @@ Default high-severity file alerts are intentionally low false-positive:
 cloud and cluster credentials (`~/.aws/credentials`, `~/.config/gcloud`,
 `~/.azure`, `~/.kube/config`), developer token files (`~/.config/gh/hosts.yml`,
 `~/.npmrc`, `~/.pypirc`, `~/.netrc`), Terraform/Cargo/Gem credentials, GnuPG
-private keys, and private key material such as `*.pem`, `*.key`, `*.p12`, and
-`*.pfx`. Guard Monitor shows this default watchlist under Filesystem Policy.
+private keys, KeePass databases (`*.kdbx`, `*.kdb`), and private key material
+such as `*.pem`, `*.key`, `*.p12`, and `*.pfx`. Guard Monitor shows this
+default watchlist under Filesystem Policy.
 
 The same data is available without opening the app:
 
