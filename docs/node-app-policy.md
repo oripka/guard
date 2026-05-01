@@ -31,7 +31,6 @@ The imported default expands to:
     "allowLocalBinding": true,
     "allowLoopbackConnections": false,
     "allowLoopbackListeningHighPorts": [],
-    "allowLoopbackHighPorts": false,
     "allowLoopbackPorts": [
       3000,
       3001,
@@ -125,27 +124,19 @@ project-local tools under `node_modules/.bin`.
   array such as `["node", "workerd"]` to include only those lsof command names.
   This is useful for helper services that pick an ephemeral callback port before
   a guarded command launches.
-- `allowLoopbackHighPorts` expands to the macOS ephemeral port range
-  `49152-65535` for tools that choose random local callback ports. This is much
-  narrower than all localhost ports, but larger and slower to compile than exact
-  ports. Prefer `allowLoopbackListeningHighPorts` when the helper port already
-  exists at launch.
 - `allowLoopbackConnections` allows all localhost TCP ports and should stay an
-  escape hatch for tools that cannot be pinned or covered by high ports.
+  escape hatch for tools that cannot be pinned to exact ports.
 - `allowPty` lets interactive dev CLIs use terminal raw mode for shortcuts.
 - `allowMachLookup` allows macOS file watching for Vite/Nuxt/Slidev.
 - `guard` also allows the narrow sysctl reads that Node's macOS FSEvents
   integration needs, such as CPU/page-size/OS-variant lookups. Projects do not
   need to add these in their own profile.
 
-Warning: `allowLoopbackHighPorts` is intentionally more expensive than exact
-ports because macOS sandbox profiles do not have a compact port-range predicate.
-Guard must generate one native sandbox rule for every port in `49152-65535`.
-That preserves the security guarantee better than `allowLoopbackConnections`,
-but it can slow startup and it grants access to unrelated high-port loopback
-services. Use exact `allowLoopbackPorts` first, then
-`allowLoopbackListeningHighPorts`, and reserve `allowLoopbackHighPorts` for
-tools that create unpredictable callback ports after Guard has launched.
+Guard intentionally does not provide a blanket "high loopback ports" option.
+macOS sandbox profiles do not have a compact port-range predicate, and allowing
+all high localhost ports is broad enough to be misleading. Use exact
+`allowLoopbackPorts` first, then `allowLoopbackListeningHighPorts` for helper
+services that are already listening before Guard launches the command.
 
 - `allowUnixSockets` is limited to the same per-run guard directory so
   Nitro/Miniflare-style worker sockets can work without opening arbitrary Unix

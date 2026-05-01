@@ -6,7 +6,6 @@
     "allowLocalBinding": true,
     "allowLoopbackConnections": false,
     "allowLoopbackListeningHighPorts": [],
-    "allowLoopbackHighPorts": false,
     "allowLoopbackPorts": [
       3000,
       3001,

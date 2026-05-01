@@ -13,7 +13,6 @@
   "network": {
     "allowLocalBinding": true,
     "allowLoopbackConnections": true,
-    "allowLoopbackHighPorts": true,
     "allowUnixSockets": [
       "${GUARD_RUN_DIR}",
       "${GUARD_REAL_TMPDIR}",

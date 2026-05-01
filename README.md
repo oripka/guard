@@ -452,8 +452,9 @@ guard init [template] [--force]
   such as `curl`, `wget`, `python`, `ruby`, `perl`, `osascript`, and `nc` for
   this run. Use `--block-risky-child-tools` to force the default blocklist back
   on if a profile disables it
-- `--allow-loopback` and `--allow-loopback-port PORT`: add one-run loopback
-  network exceptions
+- `--allow-loopback-port PORT`: add one exact one-run localhost TCP exception.
+  `--allow-loopback` remains the broad all-localhost escape hatch; there is no
+  high-port range flag
 - `--no-network` and `--network-unrestricted`: force no egress or unrestricted
   egress for this run
 - `--proxy-logs` and `--quiet-proxy-logs`: show or quiet proxy logs for this run
@@ -910,14 +911,11 @@ specific process. Only list ports that are stable and expected for the project;
 if a different local service later binds the same port, the sandbox cannot
 distinguish it from the intended helper.
 
-Warning: `network.allowLoopbackHighPorts` is a compatibility fallback, not the
-default recommendation. macOS sandbox profiles do not support compact port
-ranges, so Guard must emit one rule per ephemeral port for `49152-65535`. That
-keeps the boundary narrower than all localhost access, but it can make guarded
-command startup noticeably slower and grants access to any loopback service in
-that high-port range. Prefer exact `network.allowLoopbackPorts`, or use
-`network.allowLoopbackListeningHighPorts` when the helper service is already
-listening before the guarded command starts.
+Guard intentionally does not provide a blanket "high loopback ports" option.
+macOS sandbox profiles do not support compact port ranges, and allowing all high
+localhost ports is broad enough to be misleading. Prefer exact
+`network.allowLoopbackPorts`, or use `network.allowLoopbackListeningHighPorts`
+when the helper service is already listening before the guarded command starts.
 
 `network.allowLoopbackConnections` permits all localhost TCP ports and should be
 treated as an escape hatch.

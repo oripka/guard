@@ -38,7 +38,6 @@
     "deniedDomains": [],
     "allowLocalBinding": false,
     "allowLoopbackConnections": false,
-    "allowLoopbackHighPorts": false,
     "allowLoopbackPorts": [],
     "allowUnixSockets": [
       "${GUARD_RUN_DIR}",
