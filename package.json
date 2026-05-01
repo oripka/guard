@@ -21,6 +21,7 @@
     "profiles",
     "scripts",
     "templates",
+    "install.sh",
     "LICENSE",
     "README.md"
   ],

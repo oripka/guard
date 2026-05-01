@@ -11,6 +11,7 @@ const buildDir = path.join(repoRoot, '.build')
 const ironProxyRepo = process.env.GUARD_IRON_PROXY_REPO || 'https://github.com/oripka/iron-proxy'
 const ironProxyRef = process.env.GUARD_IRON_PROXY_REF || 'main'
 const ironProxyDir = path.join(buildDir, 'iron-proxy')
+const ironProxyBinDir = path.join(buildDir, 'iron-proxy-bin')
 const platformArch = `${process.platform}-${process.arch}`
 const packageVersion = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')).version
 
@@ -44,16 +45,20 @@ const commandOutput = (command, args, options = {}) => {
 
 const buildIronProxy = () => {
   fs.rmSync(ironProxyDir, { recursive: true, force: true })
+  fs.rmSync(ironProxyBinDir, { recursive: true, force: true })
   fs.mkdirSync(buildDir, { recursive: true })
+  fs.mkdirSync(ironProxyBinDir, { recursive: true })
   run('git', ['clone', '--depth', '1', '--branch', ironProxyRef, ironProxyRepo, ironProxyDir])
   const commit = commandOutput('git', ['rev-parse', 'HEAD'], { cwd: ironProxyDir })
-  const output = path.join(distDir, `iron-proxy-${platformArch}`)
+  const output = path.join(ironProxyBinDir, `iron-proxy-${platformArch}`)
   run('go', ['build', '-trimpath', '-o', output, './cmd/iron-proxy'], { cwd: ironProxyDir })
   return {
     repo: ironProxyRepo,
     ref: ironProxyRef,
     commit,
     artifact: path.basename(output),
+    path: output,
+    bundledOnly: true,
   }
 }
 
@@ -79,6 +84,14 @@ const pruneBuildArtifacts = (root) => {
 }
 
 const writeEditionMetadata = (root, edition, extra = {}) => {
+  const ironProxy = extra.ironProxy
+    ? {
+        repo: extra.ironProxy.repo,
+        ref: extra.ironProxy.ref,
+        commit: extra.ironProxy.commit,
+        bundledOnly: true,
+      }
+    : undefined
   fs.writeFileSync(
     path.join(root, 'GUARD_EDITION.json'),
     `${JSON.stringify({
@@ -90,7 +103,7 @@ const writeEditionMetadata = (root, edition, extra = {}) => {
       stability: edition === 'cli' ? 'alpha' : 'experimental',
       includes: extra.includes || [],
       excludes: extra.excludes || [],
-      ironProxy: extra.ironProxy,
+      ironProxy,
     }, null, 2)}\n`,
   )
 }
@@ -150,7 +163,7 @@ const createEdition = ({ edition, entries, ironProxy, extra = {} }) => {
   pruneBuildArtifacts(root)
   const binDir = path.join(root, 'bin')
   fs.mkdirSync(binDir, { recursive: true })
-  fs.copyFileSync(path.join(distDir, ironProxy.artifact), path.join(binDir, 'iron-proxy'))
+  fs.copyFileSync(ironProxy.path, path.join(binDir, 'iron-proxy'))
   fs.chmodSync(path.join(binDir, 'iron-proxy'), 0o755)
   writeInstallScript(root, edition)
   writeEditionMetadata(root, edition, {
@@ -238,6 +251,12 @@ if (process.platform === 'darwin') {
 }
 
 const editionArtifacts = createEditions({ ironProxy, macAppBuilt })
+const ironProxyMetadata = {
+  repo: ironProxy.repo,
+  ref: ironProxy.ref,
+  commit: ironProxy.commit,
+  bundledIntoEditions: true,
+}
 
 const manifest = {
   package: 'guard',
@@ -245,7 +264,7 @@ const manifest = {
   platform: process.platform,
   artifacts: fs.readdirSync(distDir).sort(),
   editions: editionArtifacts,
-  ironProxy,
+  ironProxy: ironProxyMetadata,
   nativeMacAppBuilt: macAppBuilt,
   daemonExperimental: true,
   desktopExperimental: true,

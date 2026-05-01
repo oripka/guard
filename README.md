@@ -43,14 +43,11 @@ not signed, notarized, installer-ready, or suitable for production enforcement.
 
 ## Quick Start
 
-Install Guard, choose the managed code root, and install the optional PATH
-shims. Source/package-manager installs require `iron-proxy` to be available
-separately; release edition tarballs bundle it.
+Install Guard from the latest release tarball. This path bundles `iron-proxy`,
+so users do not need Go, npm, pnpm, or a separate proxy checkout.
 
 ```sh
-pnpm add -g github:oripka/guard
-guard setup --yes --code-root ~/code --bin-dir ~/.local/bin
-guard install --code-root ~/code
+curl -fsSL https://raw.githubusercontent.com/oripka/guard/main/install.sh | sh
 ```
 
 Initialize a project profile from the repo you want to run:
@@ -154,11 +151,29 @@ Requirements:
 
 - macOS with the native `sandbox-exec` runtime
 - Node.js 20 or newer
-- `iron-proxy` on `PATH`, `GUARD_IRON_PROXY_BIN=/absolute/path/to/iron-proxy`,
-  or a sibling `../iron-proxy` checkout for the default deep HTTP/S policy
-  backend
 - `~/.local/bin` or another user-writable bin directory on `PATH`
 - Xcode Command Line Tools only if you want optional native `.app` wrappers
+
+Recommended install from GitHub Releases:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/oripka/guard/main/install.sh | sh
+```
+
+The installer detects the current OS/CPU, downloads the matching
+`guard-cli-<version>-<platform>-<arch>.tar.gz` release asset, unpacks it to
+`~/.local/guard`, links `guard` and bundled `iron-proxy` into `~/.local/bin`,
+and runs `guard setup` non-interactively. Override defaults when needed:
+
+```sh
+GUARD_VERSION=v0.1.0 GUARD_PREFIX=/opt/guard \
+  sh -c "$(curl -fsSL https://raw.githubusercontent.com/oripka/guard/main/install.sh)"
+```
+
+Package-manager and source installs do not bundle `iron-proxy`. Use them only
+when you already have `iron-proxy` on `PATH`, set
+`GUARD_IRON_PROXY_BIN=/absolute/path/to/iron-proxy`, or keep an
+`../iron-proxy` checkout next to this repo.
 
 Package-manager install from GitHub:
 
@@ -166,14 +181,6 @@ Package-manager install from GitHub:
 pnpm add -g github:oripka/guard
 guard setup
 ```
-
-Package-manager and source installs do not bundle `iron-proxy`. Before running
-the default deep network backend, either put `iron-proxy` on `PATH`, set
-`GUARD_IRON_PROXY_BIN=/absolute/path/to/iron-proxy`, or keep an
-`../iron-proxy` checkout next to this repo. To give testers a one-command
-install without that prerequisite, publish the edition tarballs from
-`npm run build:package`; those tarballs include `bin/iron-proxy` and Guard
-discovers it automatically.
 
 Or clone and link directly from the repo:
 
@@ -220,9 +227,8 @@ guard install --code-root ~/code --no-shims
 testers because it bundles the matching OS binary for the `iron-proxy` backend.
 By default it clones
 `https://github.com/oripka/iron-proxy` at `main`, builds
-`./cmd/iron-proxy`, and writes the binary into `dist/` as
-`iron-proxy-<platform>-<arch>` next to the Guard package tarball and
-`manifest.json`.
+`./cmd/iron-proxy`, keeps the resulting binary as a private build intermediate,
+and writes it into each installable edition as `bin/iron-proxy`.
 
 The same command also emits edition tarballs:
 
@@ -249,8 +255,10 @@ default, then runs Guard's normal onboarding setup so users do not need to set
 ```
 
 Tagged pushes such as `v0.1.0-alpha.1` publish a GitHub Release with both
-macOS and Linux artifacts plus SHA256 checksum files. The release notes label
-the CLI as alpha and the daemon/desktop editions as experimental.
+macOS and Linux edition tarballs plus SHA256 checksum files. Users should only
+need the matching `guard-cli-<version>-<platform>-<arch>.tar.gz` asset for a
+CLI install; it already includes `iron-proxy`. The release notes label the CLI
+as alpha and the daemon/desktop editions as experimental.
 
 Override the source when needed:
 
