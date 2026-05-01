@@ -248,6 +248,10 @@ default, then runs Guard's normal onboarding setup so users do not need to set
 ./install.sh /opt/guard
 ```
 
+Tagged pushes such as `v0.1.0-alpha.1` publish a GitHub Release with both
+macOS and Linux artifacts plus SHA256 checksum files. The release notes label
+the CLI as alpha and the daemon/desktop editions as experimental.
+
 Override the source when needed:
 
 ```sh
@@ -275,6 +279,13 @@ Linux support is experimental and intentionally limited. The current
 network-denied runs, but Guard proxy/domain/httpRules, loopback port
 exceptions, and `allowedRawTcp` are not supported there yet. Treat Linux as a
 future compatibility target, not a supported release platform for the alpha.
+
+### Signing and Notarization
+
+The alpha CLI and tarball editions are not notarized. That matches the current
+distribution goal: easy test artifacts, not a polished signed macOS product
+installer. The desktop bundle remains experimental until a later signing,
+notarization, and installer pass.
 
 ## Usage
 

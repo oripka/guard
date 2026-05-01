@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import fs from 'node:fs'
+import crypto from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import path from 'node:path'
 
@@ -86,6 +87,7 @@ const writeEditionMetadata = (root, edition, extra = {}) => {
       version: packageVersion,
       platform: process.platform,
       arch: process.arch,
+      stability: edition === 'cli' ? 'alpha' : 'experimental',
       includes: extra.includes || [],
       excludes: extra.excludes || [],
       ironProxy: extra.ironProxy,
@@ -239,12 +241,26 @@ const editionArtifacts = createEditions({ ironProxy, macAppBuilt })
 
 const manifest = {
   package: 'guard',
+  stability: 'alpha',
   platform: process.platform,
   artifacts: fs.readdirSync(distDir).sort(),
   editions: editionArtifacts,
   ironProxy,
   nativeMacAppBuilt: macAppBuilt,
+  daemonExperimental: true,
+  desktopExperimental: true,
   linuxBubblewrapBackend: process.platform === 'linux',
 }
 
 fs.writeFileSync(path.join(distDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
+
+const checksumLines = fs.readdirSync(distDir)
+  .filter((name) => name !== 'SHA256SUMS')
+  .sort()
+  .map((name) => {
+    const hash = crypto.createHash('sha256')
+      .update(fs.readFileSync(path.join(distDir, name)))
+      .digest('hex')
+    return `${hash}  ${name}`
+  })
+fs.writeFileSync(path.join(distDir, 'SHA256SUMS'), `${checksumLines.join('\n')}\n`)
