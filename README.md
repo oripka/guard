@@ -434,6 +434,11 @@ guard init [template] [--force]
 - `--allow-read PATH`, `--allow-write PATH`, `--deny-read PATH`, and
   `--deny-write PATH`: add one-run filesystem path rules
 - `--allow-domain HOST` and `--deny-domain HOST`: add one-run domain rules
+- Guard blocks common telemetry domains by default, including analytics,
+  tag-manager, product analytics, session replay, and crash-reporting hosts.
+  Explicit `--allow-domain HOST` or `network.allowedDomains` entries override
+  those default denies. Use `--allow-telemetry-domains` to disable the default
+  telemetry blocklist for one run, or `--block-telemetry-domains` to force it on
 - `--allow-exec PATH`: add one executable to the one-run subprocess allowlist
 - `--allow-risky-child-tools`: permit child executions of commonly abused tools
   such as `curl`, `wget`, `python`, `ruby`, `perl`, `osascript`, and `nc` for
