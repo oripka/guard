@@ -1,18 +1,16 @@
 # Guard Desktop and Network Extension Roadmap
 
 Guard's current enforcement model combines `sandbox-exec`, per-run filesystem
-profiles, proxy environment injection, and the optional `iron-proxy` backend for
-HTTP/HTTPS policy. This is the right base for a Little Snitch-style desktop
-experience because it already has explicit launches, profiles, templates, and
-deep request rules.
+profiles, proxy environment injection, and the default `iron-proxy` backend for
+HTTP/HTTPS policy. The product focus is guarded-run developer and app workflows,
+not system-wide interception of arbitrary unguarded apps.
 
 ## Current Layer
 
 - Guard launches selected commands and app profiles under a generated macOS
   sandbox profile.
-- The built-in proxy backend filters by host/port.
-- The `iron-proxy` backend can enforce HTTP method/path rules when traffic is
-  routed through the proxy.
+- The `iron-proxy` backend enforces HTTP method/path rules when traffic is
+  routed through Guard's proxy.
 - Guard writes persistent monitor events to
   `~/Library/Application Support/guard/events.jsonl` by default.
 - `guard monitor-log` and `Guard Monitor.app` read that event stream.
@@ -23,7 +21,7 @@ deep request rules.
 
 A macOS Network Extension would add system-level flow visibility and coarse
 allow/deny controls. It should not replace `iron-proxy`; it should complement
-it.
+it. This is entitlement-gated future work, not a current runtime path.
 
 Recommended split:
 

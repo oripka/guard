@@ -31,6 +31,7 @@ const runGuard = (args, extraEnv = {}) => {
     env: {
       ...process.env,
       ...extraEnv,
+      GUARD_ASK_NETWORK_UI: extraEnv.GUARD_ASK_NETWORK_UI || 'tty',
       GUARD_QUIET: '1',
     },
   })
@@ -43,6 +44,7 @@ const runGuardFrom = (cwd, args, extraEnv = {}) => {
     env: {
       ...process.env,
       ...extraEnv,
+      GUARD_ASK_NETWORK_UI: extraEnv.GUARD_ASK_NETWORK_UI || 'tty',
       GUARD_QUIET: '1',
     },
   })
@@ -55,6 +57,7 @@ const runGuardCommand = (args, extraEnv = {}) => {
     env: {
       ...process.env,
       ...extraEnv,
+      GUARD_ASK_NETWORK_UI: extraEnv.GUARD_ASK_NETWORK_UI || 'tty',
       GUARD_QUIET: '1',
     },
   })
@@ -67,6 +70,7 @@ const runGuardCommandAsync = (args, extraEnv = {}) =>
       env: {
         ...process.env,
         ...extraEnv,
+        GUARD_ASK_NETWORK_UI: extraEnv.GUARD_ASK_NETWORK_UI || 'tty',
         GUARD_QUIET: '1',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -1032,7 +1036,99 @@ test('accepts -- as a command separator', () => {
   assert.equal(env.guardProjectDir, appRoot)
 })
 
-test('--deep-egress forces the iron-proxy backend for a run', () => {
+test('guard defaults guarded runs to the iron-proxy ask-and-learn backend', () => {
+  const profilePath = writeGuardProfile(
+    'default-deep-egress',
+    networkProfileConfig({ allowedDomains: [] }),
+  )
+
+  try {
+    const result = runGuardCommand([
+      '--profile',
+      'default-deep-egress',
+      'node',
+      'scripts/probe.mjs',
+      'runtime-config-json',
+    ])
+    expectOk(result)
+    const cfg = JSON.parse(result.stdout)
+    assert.equal(cfg.network.backend, 'iron-proxy')
+    assert.equal(cfg.network.ask, true)
+    assert.equal(cfg.network.learnHttpRules, true)
+    assert.equal(cfg.network.upgradeDomainAllows, true)
+  } finally {
+    rmSync(profilePath, { force: true })
+  }
+})
+
+test('profiles can opt out of default network ask learning', () => {
+  const profilePath = writeGuardProfile(
+    'default-deep-egress-opt-out',
+    {
+      ...networkProfileConfig({ allowedDomains: [] }),
+      network: {
+        ...networkProfileConfig({ allowedDomains: [] }).network,
+        ask: false,
+        learnHttpRules: false,
+        upgradeDomainAllows: false,
+      },
+    },
+  )
+
+  try {
+    const result = runGuardCommand([
+      '--profile',
+      'default-deep-egress-opt-out',
+      'node',
+      'scripts/probe.mjs',
+      'runtime-config-json',
+    ])
+    expectOk(result)
+    const cfg = JSON.parse(result.stdout)
+    assert.equal(cfg.network.backend, 'iron-proxy')
+    assert.equal(cfg.network.ask, false)
+    assert.equal(cfg.network.learnHttpRules, false)
+    assert.equal(cfg.network.upgradeDomainAllows, false)
+  } finally {
+    rmSync(profilePath, { force: true })
+  }
+})
+
+test('default network ask delegates to managed guardd for native popups when available', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-native-ask-connection-'))
+  const profilePath = writeGuardProfile(
+    'default-native-ask',
+    networkProfileConfig({ allowedDomains: [] }),
+  )
+  mkdirSync(tempRoot, { recursive: true })
+  writeFileSync(
+    join(tempRoot, 'guardd-connection.json'),
+    JSON.stringify({ url: 'http://127.0.0.1:18797', token: 'test-token' }, null, 2),
+  )
+
+  try {
+    const result = runGuardCommand([
+      '--profile',
+      'default-native-ask',
+      'node',
+      'scripts/probe.mjs',
+      'runtime-config-json',
+    ], {
+      GUARD_STATE_DIR: tempRoot,
+      GUARD_ASK_NETWORK_UI: 'native',
+    })
+    expectOk(result)
+    const cfg = JSON.parse(result.stdout)
+    assert.equal(cfg.network.ask, true)
+    assert.equal(cfg.network.decisionMode, 'guardd')
+    assert.equal(cfg.network.nativePromptFallback, true)
+  } finally {
+    rmSync(profilePath, { force: true })
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('--deep-egress remains a compatibility flag for the iron-proxy backend', () => {
   const profilePath = writeGuardProfile(
     'deep-egress-flag',
     networkProfileConfig({ allowedDomains: [] }),
@@ -1041,7 +1137,6 @@ test('--deep-egress forces the iron-proxy backend for a run', () => {
   try {
     const result = runGuardCommand([
       '--deep-egress',
-      '--ask-network',
       '--profile',
       'deep-egress-flag',
       'node',
@@ -1051,7 +1146,6 @@ test('--deep-egress forces the iron-proxy backend for a run', () => {
     expectOk(result)
     const cfg = JSON.parse(result.stdout)
     assert.equal(cfg.network.backend, 'iron-proxy')
-    assert.equal(cfg.network.ask, true)
   } finally {
     rmSync(profilePath, { force: true })
   }
@@ -1497,6 +1591,58 @@ test('iron-proxy interactive backend denies unknown requests in non-interactive 
     assert.match(`${result.stderr}\n${result.stdout}`, /403|Forbidden/i)
   } finally {
     rmSync(profilePath, { force: true })
+    await closeServer(server)
+  }
+})
+
+test('iron-proxy default ask allows existing domain rules non-interactively and suggests path upgrade', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-iron-upgrade-domain-'))
+  const eventLog = resolve(tempRoot, 'events.jsonl')
+  const profilePath = writeGuardProfile(
+    'network-iron-upgrade-domain',
+    {
+      ...ironProxyNetworkProfileConfig({ ask: true }),
+      network: {
+        ...ironProxyNetworkProfileConfig({ ask: true }).network,
+        allowedDomains: ['localhost'],
+      },
+    },
+  )
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end(`domain-ok ${req.url}\n`)
+  })
+  const port = await listenLoopback(server)
+
+  try {
+    const result = await runGuardCommandAsync([
+      '--profile',
+      'network-iron-upgrade-domain',
+      '/usr/bin/curl',
+      '--noproxy',
+      '',
+      '-fsS',
+      `http://localhost:${port}/v1/responses`,
+    ], {
+      GUARD_EVENT_LOG: eventLog,
+    })
+    expectOk(result)
+    assert.match(result.stdout, /domain-ok/)
+    const events = readFileSync(eventLog, 'utf8')
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+    assert.ok(events.some((event) =>
+      event.type === 'network.decision' &&
+        event.reason === 'domain-allow-upgrade-skipped-noninteractive' &&
+        event.suggestedRule?.paths?.includes('/v1/*'),
+    ))
+    const cfg = JSON.parse(readFileSync(profilePath, 'utf8'))
+    assert.deepEqual(cfg.network.httpRules || [], [])
+  } finally {
+    rmSync(profilePath, { force: true })
+    rmSync(tempRoot, { recursive: true, force: true })
     await closeServer(server)
   }
 })
@@ -3630,6 +3776,9 @@ test('guardd state, TLS CA scaffold, and bounded event log truncation stay local
     assert.equal(pendingAlertJson.alert.host, 'pending.example.com')
     assert.equal(pendingAlertJson.alert.method, 'POST')
     assert.equal(pendingAlertJson.alert.path, '/v1/responses')
+    assert.equal(pendingAlertJson.alert.decisionRequest.operation.kind, 'http.request')
+    assert.equal(pendingAlertJson.alert.decisionRequest.resource.kind, 'http')
+    assert.equal(pendingAlertJson.alert.decisionRequest.resource.host, 'pending.example.com')
     assert.match(pendingAlertJson.alert.id, /^[0-9a-f-]{36}$/)
     assert.match(pendingAlertJson.alert.expiresAt, /^\d{4}-\d{2}-\d{2}T/)
 
@@ -3796,11 +3945,15 @@ test('guardd state, TLS CA scaffold, and bounded event log truncation stay local
     assert.equal(evaluationAllowedJson.decision.reason, 'deniedDomains')
     assert.equal(evaluationAllowedJson.decision.contractVersion, 1)
     assert.equal(evaluationAllowedJson.decision.evaluator, 'guard-policy')
+    assert.equal(evaluationAllowedJson.normalizedDecision.decisionRequest.operation.kind, 'network.connect')
 
     const sync = await fetch(`${daemon.base}/extension/sync`, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ profile: 'guard', mode: 'strict-deny' }),
+      body: JSON.stringify({
+        profile: 'guard',
+        mode: 'strict-deny',
+      }),
     })
     assert.equal(sync.status, 200)
     const syncJson = await sync.json()

@@ -144,7 +144,7 @@ Authenticated write API:
   `"force":true` to regenerate the cached leaf. Certificates are stored under
   the daemon state directory and emit `tls.cert.changed`; the endpoint still
   never touches the macOS trust store.
-- `POST /alerts/decision` records a Little Snitch-style user decision. Body:
+- `POST /alerts/decision` records a guarded-run network user decision. Body:
   `{"profile":"guard","host":"api.example.com","action":"allow","duration":"once"}`.
   `action` may be `allow` or `deny`; `duration` may be `once`, `session`, or
   `forever`. `forever` persists the corresponding allow/deny domain rule using

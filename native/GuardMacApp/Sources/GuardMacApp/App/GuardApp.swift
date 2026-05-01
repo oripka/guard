@@ -7,6 +7,7 @@ final class GuardApp: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         let coordinator = AppCoordinator()
         self.coordinator = coordinator
-        coordinator.showMonitor()
+        NSApp.setActivationPolicy(.accessory)
+        coordinator.startMenuBarOnly()
     }
 }

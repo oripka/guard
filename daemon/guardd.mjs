@@ -11,12 +11,14 @@ import {
   buildTypedRules,
   buildPolicySnapshot,
   MUTABLE_PROFILE_ARRAY_FIELDS,
+  evaluateDecisionRequest,
   evaluateNetworkPolicy,
   loadProfileConfig,
   mergeProfileConfig,
   mutateArrayRuleConfig,
   mutateHttpRuleConfig,
   mutateTlsConfig,
+  normalizeDecisionRequest,
   profileVersion,
   profileVersionInfo,
   readJsonFile,
@@ -2535,7 +2537,13 @@ class PendingAlertQueue {
   }
 
   decisionActive(decision) {
-    if (!decision || !decision.host || !decision.action) return false
+    if (!decision || !decision.action) return false
+    if (decision.decisionKey) {
+      if (!decision.expiresAt) return true
+      const expiresAtMs = Date.parse(decision.expiresAt)
+      return Number.isFinite(expiresAtMs) && expiresAtMs > Date.now()
+    }
+    if (!decision.host) return false
     if (!decision.expiresAt) return true
     const expiresAtMs = Date.parse(decision.expiresAt)
     return Number.isFinite(expiresAtMs) && expiresAtMs > Date.now()
@@ -2547,14 +2555,18 @@ class PendingAlertQueue {
 
   matchingDecision(body = {}) {
     this.pruneDecisions()
+    const request = normalizeDecisionRequest(body)
+    const requestKey = request.id || alertDecisionKey(request)
     const profile = String(body.profile || 'guard')
-    const host = sanitizeTlsHost(body.host || '')
+    const rawHost = body.host || ''
+    const host = rawHost ? sanitizeTlsHost(rawHost) : ''
     const method = String(body.method || '')
     const requestPath = String(body.path || '')
     const launcherApp = String(body.launcherApp || '')
     const launcherProcess = String(body.launcherProcess || '')
-    if (!host) return null
     return this.decisions.find((decision) => {
+      if (decision.decisionKey && decision.decisionKey === requestKey) return true
+      if (!host) return false
       if (decision.profile !== profile || decision.host !== host) return false
       if (decision.method && decision.method !== method) return false
       if (decision.path && decision.path !== requestPath) return false
@@ -2576,6 +2588,9 @@ class PendingAlertQueue {
         String(decision.launcherProcess || '') === String(event.launcherProcess || '')),
     )
     this.decisions.push({
+      decisionKey: event.decisionRequest?.id || '',
+      operationKind: event.operationKind || event.decisionRequest?.operation?.kind || '',
+      resourceKind: event.resourceKind || event.decisionRequest?.resource?.kind || '',
       profile: event.profile,
       host: event.host,
       port: event.port,
@@ -2631,8 +2646,12 @@ class PendingAlertQueue {
   }
 
   create(body = {}) {
-    const profile = String(body.profile || 'guard')
-    const host = sanitizeTlsHost(body.host || '')
+    const decisionRequest = normalizeDecisionRequest(body)
+    const profile = String(body.profile || decisionRequest.subject.profile || 'guard')
+    const resource = decisionRequest.resource || {}
+    const operation = decisionRequest.operation || {}
+    const rawHost = body.host || resource.host || ''
+    const host = rawHost ? sanitizeTlsHost(rawHost) : ''
     if (!host) throw new Error('pending alert requires host')
     const now = new Date().toISOString()
     const { timeoutMs, expiresAt } = this.normalizeTimeout(body)
@@ -2647,22 +2666,27 @@ class PendingAlertQueue {
       updatedAt: now,
       expiresAt,
       timeoutMs,
+      decisionRequest,
+      operationKind: operation.kind || '',
+      resourceKind: resource.kind || '',
       profile,
       host,
-      port: Number.isInteger(Number(body.port)) ? Number(body.port) : 0,
-      method: String(body.method || ''),
-      path: String(body.path || ''),
-      protocol: String(body.protocol || ''),
-      command: String(body.command || ''),
-      projectDir: String(body.projectDir || ''),
+      port: Number.isInteger(Number(body.port ?? resource.port)) ? Number(body.port ?? resource.port) : 0,
+      method: String(body.method || resource.method || ''),
+      path: String(body.path || resource.path || ''),
+      protocol: String(body.protocol || resource.protocol || ''),
+      command: String(body.command || decisionRequest.subject.commandLine || ''),
+      projectDir: String(body.projectDir || decisionRequest.subject.projectDir || ''),
       runDir: String(body.runDir || ''),
-      launcherApp: String(body.launcherApp || ''),
-      launcherProcess: String(body.launcherProcess || ''),
-      launcherPid: Number.isInteger(Number(body.launcherPid)) ? Number(body.launcherPid) : 0,
-      parentChain: String(body.parentChain || ''),
+      launcherApp: String(body.launcherApp || decisionRequest.subject.launcherApp || ''),
+      launcherProcess: String(body.launcherProcess || decisionRequest.subject.launcherProcess || ''),
+      launcherPid: Number.isInteger(Number(body.launcherPid ?? decisionRequest.subject.launcherPid)) ? Number(body.launcherPid ?? decisionRequest.subject.launcherPid) : 0,
+      parentChain: String(body.parentChain || decisionRequest.subject.parentChain || ''),
       reason: body.reason || 'pending-alert',
       suggestedAction: body.suggestedAction || '',
       suggestedDuration: body.suggestedDuration || '',
+      recommendedScopes: decisionRequest.recommendedScopes,
+      availableActions: ['deny', 'allowOnce', 'allowUntilQuit', 'allowSession', 'allowForever', 'editRule'],
     }
     this.alerts.set(alert.id, alert)
     this.persist()
@@ -2746,6 +2770,8 @@ class PendingAlertQueue {
       expiresAt: decision.expiresAt || '',
       rulePersisted: decision.rulePersisted === true,
       ruleId: decision.ruleId || '',
+      operationKind: decision.operationKind || '',
+      resourceKind: decision.resourceKind || '',
       launcherApp: decision.launcherApp || '',
       launcherProcess: decision.launcherProcess || '',
     }
@@ -2786,6 +2812,9 @@ const alertRuleId = (event) => {
   })
   return `rule_${crypto.createHash('sha256').update(key).digest('hex').slice(0, 16)}`
 }
+
+const alertDecisionKey = (decisionRequest) =>
+  decisionRequest?.id || `decision_${crypto.createHash('sha256').update(stableJson(decisionRequest || {})).digest('hex').slice(0, 16)}`
 
 const alertDecisionExpiresAt = (duration) => {
   const value = String(duration || 'once').toLowerCase()
@@ -2829,23 +2858,28 @@ const alertHttpRuleForScope = ({ host, method, requestPath, scope }) => {
 }
 
 const alertDecision = ({ body, policyStore, eventLogPath, tail }) => {
-  const profile = String(body.profile || 'guard')
-  const host = sanitizeTlsHost(body.host || '')
+  const decisionRequest = normalizeDecisionRequest(body)
+  const resource = decisionRequest.resource || {}
+  const operation = decisionRequest.operation || {}
+  const profile = String(body.profile || decisionRequest.subject?.profile || 'guard')
+  const rawHost = body.host || resource.host || ''
+  const host = rawHost ? sanitizeTlsHost(rawHost) : ''
   const action = String(body.action || 'deny').toLowerCase()
   const duration = String(body.duration || 'once').toLowerCase()
-  const method = String(body.method || '')
-  const requestPath = String(body.path || '')
+  const method = String(body.method || resource.method || '')
+  const requestPath = String(body.path || resource.path || '')
   const scope = String(body.scope || body.ruleScope || '')
   if (!['allow', 'deny'].includes(action)) throw new Error(`unsupported alert action: ${action}`)
   if (!['once', 'session', '5m', '1h', '2d', '5d', 'forever'].includes(duration)) throw new Error(`unsupported alert duration: ${duration}`)
   if (!host) throw new Error('alert decision requires host')
-  const httpRule = action === 'allow' ? alertHttpRuleForScope({ host, method, requestPath, scope }) : null
-  const field = httpRule && duration === 'forever' ? 'network.httpRules' : action === 'allow' ? 'network.allowedDomains' : 'network.deniedDomains'
-  const launcherApp = String(body.launcherApp || '')
-  const launcherProcess = String(body.launcherProcess || '')
+  const httpRule = host && action === 'allow' ? alertHttpRuleForScope({ host, method, requestPath, scope }) : null
+  const networkField = httpRule && duration === 'forever' ? 'network.httpRules' : action === 'allow' ? 'network.allowedDomains' : 'network.deniedDomains'
+  const field = host ? networkField : ''
+  const launcherApp = String(body.launcherApp || decisionRequest.subject?.launcherApp || '')
+  const launcherProcess = String(body.launcherProcess || decisionRequest.subject?.launcherProcess || '')
   const launcherScoped = Boolean(launcherApp || launcherProcess)
   let mutation = null
-  if (duration === 'forever' && !launcherScoped) {
+  if (duration === 'forever' && !launcherScoped && host) {
     mutation = httpRule
       ? policyStore.mutateHttpRule({
           profile,
@@ -2866,25 +2900,29 @@ const alertDecision = ({ body, policyStore, eventLogPath, tail }) => {
     at: new Date().toISOString(),
     type: 'guard.alert.decision',
     backend: 'guardd',
+    decisionRequest,
+    operationKind: operation.kind || '',
+    resourceKind: resource.kind || '',
     profile,
     host,
-    port: Number.isInteger(Number(body.port)) ? Number(body.port) : 0,
+    port: Number.isInteger(Number(body.port ?? resource.port)) ? Number(body.port ?? resource.port) : 0,
     alertId: body.alertId || '',
     resolvedAt: body.alertId ? new Date().toISOString() : '',
     expiresAt: alertDecisionExpiresAt(duration),
     method,
     path: requestPath,
+    target: host ? `${host}${body.port || resource.port ? `:${body.port || resource.port}` : ''}` : '',
     scope,
     suggestedRule: httpRule || null,
     launcherApp,
     launcherProcess,
-    launcherPid: Number.isInteger(Number(body.launcherPid)) ? Number(body.launcherPid) : 0,
-    parentChain: String(body.parentChain || ''),
+    launcherPid: Number.isInteger(Number(body.launcherPid ?? decisionRequest.subject?.launcherPid)) ? Number(body.launcherPid ?? decisionRequest.subject?.launcherPid) : 0,
+    parentChain: String(body.parentChain || decisionRequest.subject?.parentChain || ''),
     action,
     duration,
     allowed: action === 'allow',
-    rulePersisted: duration === 'forever' && !launcherScoped,
-    field: duration === 'forever' && !launcherScoped ? field : '',
+    rulePersisted: Boolean(mutation),
+    field: mutation ? field : '',
     ruleId: mutation?.ruleId || '',
     version: mutation?.version || '',
     reason: body.reason || 'user-alert-decision',
@@ -2934,6 +2972,10 @@ const createServer = ({ tail, policyStore, projectRegistry, startedAt, apiToken,
             writeJson(response, 404, { error: 'profile_not_found', profile })
             return
           }
+          const decisionRequest = normalizeDecisionRequest({
+            ...body,
+            profile,
+          })
           writeJson(response, 200, {
             contractVersion: 1,
             profile,
@@ -2943,15 +2985,55 @@ const createServer = ({ tail, policyStore, projectRegistry, startedAt, apiToken,
               method: body.method || '',
               path: body.path || '',
             },
+            decisionRequest,
             decision: evaluateNetworkPolicy({
               config: policy.config,
               host: body.host,
               method: body.method,
               path: body.path,
             }),
+            normalizedDecision: evaluateDecisionRequest({
+              config: policy.config,
+              request: decisionRequest,
+            }),
           })
         } catch (error) {
           writeJson(response, 400, { error: 'evaluate_failed', message: error.message })
+        }
+        return
+      }
+
+      if (url.pathname === '/decisions/evaluate') {
+        try {
+          const body = await readRequestJson(request)
+          const decisionRequest = normalizeDecisionRequest(body)
+          const profile = body.profile || decisionRequest.subject.profile || url.searchParams.get('profile') || 'guard'
+          const policy = policyStore.getEffectivePolicy(profile)
+          if (!policy) {
+            writeJson(response, 404, { error: 'profile_not_found', profile })
+            return
+          }
+          const decision = evaluateDecisionRequest({
+            config: policy.config,
+            request: {
+              ...decisionRequest,
+              subject: {
+                ...decisionRequest.subject,
+                profile,
+              },
+            },
+          })
+          writeJson(response, 200, {
+            schemaVersion: 1,
+            contractVersion: 1,
+            action: 'decision-evaluate',
+            profile,
+            version: policy.effectiveVersion,
+            decisionRequest: decision.decisionRequest,
+            decision,
+          })
+        } catch (error) {
+          writeJson(response, 400, { error: 'decision_evaluate_failed', message: error.message })
         }
         return
       }
@@ -3191,6 +3273,7 @@ const createServer = ({ tail, policyStore, projectRegistry, startedAt, apiToken,
               launcherProcess: body.launcherProcess || pending.launcherProcess,
               launcherPid: body.launcherPid ?? pending.launcherPid,
               parentChain: body.parentChain || pending.parentChain,
+              decisionRequest: body.decisionRequest || pending.decisionRequest,
               expiresAt: pending.expiresAt,
               reason: body.reason || 'pending-alert-resolved',
             },
@@ -3244,6 +3327,7 @@ const createServer = ({ tail, policyStore, projectRegistry, startedAt, apiToken,
             body.launcherProcess ||= pending.launcherProcess
             body.launcherPid ??= pending.launcherPid
             body.parentChain ||= pending.parentChain
+            body.decisionRequest ||= pending.decisionRequest
             body.expiresAt ||= pending.expiresAt
           }
           const result = alertDecision({ body, policyStore, eventLogPath, tail })

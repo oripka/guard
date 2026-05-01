@@ -19,8 +19,15 @@ It supports two main workflows:
 
 Under the hood, `guard` generates local `sandbox-exec` profiles, provides
 PATH-based shims for risky toolchains, creates per-run fake home/temp
-directories, and can proxy network traffic through an allowlist/ask flow. It is
-macOS-focused and does not depend on a remote service.
+directories, and routes cooperative network clients through Guard's proxy path.
+For guarded runs, the default network backend is the deep `iron-proxy` path so
+HTTP/TLS requests can be reviewed by host, method, path, and selected headers.
+Guard is macOS-focused and does not depend on a remote service.
+
+Guard is not currently a system-wide Little Snitch replacement. Apps that are
+not launched through Guard are outside Guard's enforcement boundary unless they
+voluntarily use Guard's proxy settings. Future Network Extension or Endpoint
+Security support is entitlement-gated and tracked only as future planning.
 
 ## What It Protects
 
@@ -111,15 +118,21 @@ guard --ask-network pnpm run dev
 guard --daemon-policy pnpm run dev
 ```
 
-For deep HTTP egress rules, use the optional `iron-proxy` backend. Guard starts
-`iron-proxy` for the run, injects proxy and CA environment variables, and keeps
-the sandboxed process limited to the local proxy.
+Guard uses the deep `iron-proxy` backend by default for guarded runs. Guard
+starts `iron-proxy` for the run, injects proxy and CA environment variables,
+keeps the sandboxed process limited to the local proxy, and enables ask-and-learn
+HTTP policy by default. Exact `network.httpRules` allow silently. Existing
+`network.allowedDomains` still work as compatibility allows, but interactive
+runs ask whether to save a narrower path rule. Once a path rule is saved, Guard
+does not ask again for that request shape.
 
 ```json
 {
   "network": {
     "backend": "iron-proxy",
     "ask": true,
+    "learnHttpRules": true,
+    "upgradeDomainAllows": true,
     "allowedDomains": ["registry.npmjs.org"],
     "httpRules": [
       {
@@ -395,7 +408,7 @@ guard init [template] [--force]
 - `guard help`: print CLI usage
 - `--ask-network`: prompt before allowing unknown proxied network hosts for
   the current run
-- `--deep-egress`: force the optional `iron-proxy` backend for this run
+- `--deep-egress`: compatibility flag for the default `iron-proxy` backend
 - `--daemon-policy`: route unknown proxied network decisions through `guardd`
   pending alerts for this run. Alias flags are `--guardd-policy` and
   `--use-guardd`
@@ -411,7 +424,7 @@ guard init [template] [--force]
 - `guard app-summary`: print the permission summary used by native launchers
 - `guard daemon`: run the local `guardd` prototype for health and recent event
   APIs
-- `guard ui`: build, install, open, and self-bootstrap the native Guard Monitor
+- `guard ui`: build, install, and start the native Guard menu-bar monitor
 - `guard monitor-log`: summarize the persistent Guard event stream used by the
   native monitor
 - `guard profile add` / `guard profile remove`: edit project-local profile
@@ -450,10 +463,12 @@ Install the local monitor app:
 guard ui
 ```
 
-This builds and opens `Guard Monitor.app`. On launch, the monitor connects to an
-existing local `guardd` if one is reachable; otherwise it starts a temporary
-local daemon using the selected project when available or Guard's global
-app-support policy store by default.
+This builds and starts `Guard Monitor.app` as a lightweight menu-bar utility.
+It shows only the toolbar/status icon by default. On launch, the monitor
+connects to an existing local `guardd` if one is reachable; otherwise it starts
+a temporary local daemon using the selected project when available or Guard's
+global app-support policy store by default. Use the menu-bar icon to open the
+full monitor, rules, or settings windows when needed.
 
 Install the local monitor app without opening it:
 
@@ -694,13 +709,18 @@ an explicit escape hatch.
 
 ## Interactive Network Ask
 
-`guard --ask-network <command>` enables a per-run prompt for proxied network
-requests that are not already matched by `network.allowedDomains` and are not
-blocked by `network.deniedDomains`.
+Guard enables per-run ask-and-learn prompts by default for proxied HTTP/S
+requests under the `iron-proxy` backend. `guard --ask-network <command>` remains
+as an explicit compatibility flag.
 
-Approving a host allows that host for the rest of the current run only. Denying
-it blocks that host for the rest of the current run. Non-interactive shells fail
-closed instead of waiting for input.
+Approving an exact or path rule saves a `network.httpRules` entry in the current
+project profile when learning is enabled, so matching requests allow silently in
+later runs. Approving a domain allows that host for the rest of the current run.
+Denying blocks the request for the current run. If an existing
+`network.allowedDomains` entry matches, interactive runs offer to upgrade it to
+a narrower path rule; non-interactive runs keep allowing the domain and record
+the suggested path rule in the event log instead of breaking existing workflows.
+Non-interactive unknown requests still fail closed instead of waiting for input.
 
 When the guarded command is an interactive shell such as `bash` or `zsh`, guard
 uses a macOS dialog for the prompt so the parent proxy process does not fight the
@@ -713,6 +733,8 @@ The same mode can be enabled in a profile:
 ```json
 "network": {
   "ask": true,
+  "learnHttpRules": true,
+  "upgradeDomainAllows": true,
   "allowedDomains": [],
   "deniedDomains": []
 }

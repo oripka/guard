@@ -293,7 +293,7 @@ final class GuardStatusItemController: NSObject {
     let recentStack = NSStackView()
     let deniedBadgeLabel = NSTextField(labelWithString: "0")
     let deniedRow = NSButton()
-    let popoverContentWidth: CGFloat = 318
+    let popoverContentWidth: CGFloat = 286
     var lastNotifiedPendingCount = 0
 
     init(monitor: MonitorWindowController) {
@@ -301,7 +301,7 @@ final class GuardStatusItemController: NSObject {
         super.init()
         if let button = statusItem.button {
             if #available(macOS 11.0, *) {
-                button.image = statusImage(named: "shield.lefthalf.filled", description: "Guard Monitor")
+                button.image = statusImage(named: "shield", description: "Guard Monitor")
                 button.title = ""
             } else {
                 button.title = "G"
@@ -314,34 +314,46 @@ final class GuardStatusItemController: NSObject {
             button.toolTip = "Guard Monitor"
         }
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 342, height: 420)
+        popover.contentSize = NSSize(width: 310, height: 382)
         popover.contentViewController = NSViewController()
         popover.contentViewController?.view = makePopoverView()
     }
 
     @available(macOS 11.0, *)
     func statusImage(named symbolName: String, description: String) -> NSImage? {
-        let config = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
-        let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: description)?
-            .withSymbolConfiguration(config)
-            ?? NSImage(systemSymbolName: "shield", accessibilityDescription: description)
-        image?.isTemplate = true
-        image?.size = NSSize(width: 17, height: 17)
+        let image = NSImage(size: NSSize(width: 17, height: 17))
+        image.lockFocus()
+        NSColor.white.setStroke()
+        let path = NSBezierPath()
+        path.lineWidth = 1.7
+        path.lineJoinStyle = .round
+        path.lineCapStyle = .round
+        path.move(to: NSPoint(x: 8.5, y: 15.0))
+        path.curve(to: NSPoint(x: 3.6, y: 12.8), controlPoint1: NSPoint(x: 6.9, y: 14.4), controlPoint2: NSPoint(x: 5.2, y: 13.7))
+        path.line(to: NSPoint(x: 3.6, y: 8.0))
+        path.curve(to: NSPoint(x: 8.5, y: 2.0), controlPoint1: NSPoint(x: 3.6, y: 5.0), controlPoint2: NSPoint(x: 6.0, y: 3.0))
+        path.curve(to: NSPoint(x: 13.4, y: 8.0), controlPoint1: NSPoint(x: 11.0, y: 3.0), controlPoint2: NSPoint(x: 13.4, y: 5.0))
+        path.line(to: NSPoint(x: 13.4, y: 12.8))
+        path.curve(to: NSPoint(x: 8.5, y: 15.0), controlPoint1: NSPoint(x: 11.8, y: 13.7), controlPoint2: NSPoint(x: 10.1, y: 14.4))
+        path.close()
+        path.stroke()
+        image.unlockFocus()
+        image.isTemplate = false
         return image
     }
 
     func makePopoverView() -> NSView {
         let background = NSVisualEffectView()
-        background.material = .popover
+        background.material = .menu
         background.state = .active
-        background.blendingMode = .withinWindow
+        background.blendingMode = .behindWindow
         background.translatesAutoresizingMaskIntoConstraints = false
 
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .width
-        root.spacing = 8
-        root.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 10, right: 12)
+        root.spacing = 6
+        root.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
         root.translatesAutoresizingMaskIntoConstraints = false
         background.addSubview(root)
         NSLayoutConstraint.activate([
@@ -356,21 +368,25 @@ final class GuardStatusItemController: NSObject {
         root.addArrangedSubview(statusBadgeRow())
         root.addArrangedSubview(trafficSummary())
 
-        let recentTitle = NSTextField(labelWithString: "Recent Activity")
+        let recentTitle = NSTextField(labelWithString: "Recent Network Activity")
         recentTitle.font = NSFont.systemFont(ofSize: 11, weight: .medium)
         recentTitle.textColor = .secondaryLabelColor
         recentTitle.alignment = .left
+        recentTitle.translatesAutoresizingMaskIntoConstraints = false
+        recentTitle.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
         root.addArrangedSubview(recentTitle)
 
         recentStack.orientation = .vertical
         recentStack.alignment = .width
-        recentStack.spacing = 8
+        recentStack.spacing = 6
+        recentStack.translatesAutoresizingMaskIntoConstraints = false
+        recentStack.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
         root.addArrangedSubview(recentStack)
 
         root.addArrangedSubview(separator())
         root.addArrangedSubview(recentDeniedRow())
         root.addArrangedSubview(separator())
-        root.addArrangedSubview(menuAction("Open Monitor...", symbol: "rectangle.3.group", action: #selector(openMonitor(_:))))
+        root.addArrangedSubview(menuAction("Open Monitor", symbol: "rectangle.3.group", action: #selector(openMonitor(_:))))
         root.addArrangedSubview(menuAction("Manage Rules...", symbol: "list.bullet.rectangle", action: #selector(openRules(_:))))
         root.addArrangedSubview(menuAction("Guard Settings...", symbol: "gearshape", action: #selector(openSettings(_:))))
         return background
@@ -398,6 +414,7 @@ final class GuardStatusItemController: NSObject {
 
         row.addArrangedSubview(iconButton("bell.slash", action: #selector(openSettings(_:)), tint: .secondaryLabelColor, tooltip: "Alert settings"))
         row.addArrangedSubview(iconButton("network", action: #selector(openMonitor(_:)), tint: .secondaryLabelColor, tooltip: "Open live monitor"))
+        row.addArrangedSubview(iconButton("xmark", action: #selector(closePopover(_:)), tint: .secondaryLabelColor, tooltip: "Close"))
         return row
     }
 
@@ -406,8 +423,8 @@ final class GuardStatusItemController: NSObject {
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 6
-        row.addArrangedSubview(statusBadge(daemonBadgeLabel, symbol: "bolt.horizontal.circle.fill", width: 120))
-        row.addArrangedSubview(statusBadge(extensionBadgeLabel, symbol: "shield.lefthalf.filled", width: 192))
+        row.addArrangedSubview(statusBadge(daemonBadgeLabel, symbol: "bolt.horizontal.circle.fill", width: 126))
+        row.addArrangedSubview(statusBadge(extensionBadgeLabel, symbol: "shield.lefthalf.filled", width: 162))
         return row
     }
 
@@ -420,7 +437,7 @@ final class GuardStatusItemController: NSObject {
         badge.wantsLayer = true
         badge.layer?.cornerRadius = 6
         badge.layer?.cornerCurve = .continuous
-        badge.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.52).cgColor
+        badge.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.18).cgColor
         badge.translatesAutoresizingMaskIntoConstraints = false
         badge.widthAnchor.constraint(equalToConstant: width).isActive = true
         badge.addArrangedSubview(symbolImage(symbol, tint: .secondaryLabelColor, size: 10, weight: .regular))
@@ -441,8 +458,8 @@ final class GuardStatusItemController: NSObject {
         card.wantsLayer = true
         card.layer?.cornerRadius = 8
         card.layer?.cornerCurve = .continuous
-        card.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.36).cgColor
-        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.22).cgColor
+        card.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.14).cgColor
+        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.18).cgColor
         card.layer?.borderWidth = 0.5
 
         let metrics = NSStackView()
@@ -533,18 +550,16 @@ final class GuardStatusItemController: NSObject {
         button.target = self
         button.action = action
         button.isBordered = false
-        button.wantsLayer = true
-        button.layer?.cornerRadius = 6
-        button.layer?.cornerCurve = .continuous
+        button.wantsLayer = false
         button.translatesAutoresizingMaskIntoConstraints = false
-        button.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 24).isActive = true
         button.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
 
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 7
-        row.edgeInsets = NSEdgeInsets(top: 0, left: 5, bottom: 0, right: 5)
+        row.spacing = 0
+        row.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
         row.translatesAutoresizingMaskIntoConstraints = false
         button.addSubview(row)
         NSLayoutConstraint.activate([
@@ -554,10 +569,10 @@ final class GuardStatusItemController: NSObject {
             row.bottomAnchor.constraint(equalTo: button.bottomAnchor)
         ])
 
-        row.addArrangedSubview(symbolImage(symbol, tint: .secondaryLabelColor, size: 11, weight: .regular))
         let label = NSTextField(labelWithString: title)
         label.font = NSFont.systemFont(ofSize: 13)
         label.textColor = .labelColor
+        label.lineBreakMode = .byTruncatingTail
         row.addArrangedSubview(label)
         row.addArrangedSubview(NSView())
         return button
@@ -661,13 +676,9 @@ final class GuardStatusItemController: NSObject {
 
     func statusItemTintColor(active: Bool) -> NSColor {
         if active {
-            return .systemOrange
+            return .white
         }
-        if #available(macOS 10.14, *) {
-            let style = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua])
-            return style == .darkAqua ? .white : .black
-        }
-        return .black
+        return .white
     }
 
     func compactDaemonStatus(_ raw: String) -> String {
@@ -699,21 +710,33 @@ final class GuardStatusItemController: NSObject {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 9
+        row.spacing = 7
+        row.edgeInsets = NSEdgeInsets(top: 1, left: 0, bottom: 1, right: 0)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
 
         let denied = event.result == "deny" || event.result == "denied"
         row.addArrangedSubview(miniSymbolCircle(denied ? "xmark.shield.fill" : "checkmark.shield.fill", tint: denied ? .systemRed : .systemBlue))
 
         let text = NSStackView()
         text.orientation = .vertical
-        text.spacing = 1
+        text.alignment = .leading
+        text.spacing = 0
+        text.translatesAutoresizingMaskIntoConstraints = false
+        text.widthAnchor.constraint(equalToConstant: popoverContentWidth - 28).isActive = true
         let title = NSTextField(labelWithString: compactActorLabel(for: event))
-        title.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
+        title.font = NSFont.systemFont(ofSize: 12.5, weight: .semibold)
         title.lineBreakMode = .byTruncatingTail
+        title.alignment = .left
+        title.translatesAutoresizingMaskIntoConstraints = false
+        title.widthAnchor.constraint(equalToConstant: popoverContentWidth - 28).isActive = true
         let detail = NSTextField(labelWithString: compactDestinationLabel(for: event))
         detail.font = NSFont.systemFont(ofSize: 11)
         detail.textColor = denied ? .systemRed : .secondaryLabelColor
         detail.lineBreakMode = .byTruncatingMiddle
+        detail.alignment = .left
+        detail.translatesAutoresizingMaskIntoConstraints = false
+        detail.widthAnchor.constraint(equalToConstant: popoverContentWidth - 28).isActive = true
         text.addArrangedSubview(title)
         text.addArrangedSubview(detail)
         row.addArrangedSubview(text)
@@ -730,13 +753,13 @@ final class GuardStatusItemController: NSObject {
     func miniSymbolCircle(_ symbol: String, tint: NSColor) -> NSView {
         let holder = NSView()
         holder.wantsLayer = true
-        holder.layer?.cornerRadius = 9
+        holder.layer?.cornerRadius = 4
         holder.layer?.cornerCurve = .continuous
-        holder.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.62).cgColor
+        holder.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.28).cgColor
         holder.translatesAutoresizingMaskIntoConstraints = false
-        holder.widthAnchor.constraint(equalToConstant: 22).isActive = true
-        holder.heightAnchor.constraint(equalToConstant: 22).isActive = true
-        let image = symbolImage(symbol, tint: tint, size: 13)
+        holder.widthAnchor.constraint(equalToConstant: 16).isActive = true
+        holder.heightAnchor.constraint(equalToConstant: 16).isActive = true
+        let image = symbolImage(symbol, tint: tint, size: 10, weight: .regular)
         image.translatesAutoresizingMaskIntoConstraints = false
         holder.addSubview(image)
         NSLayoutConstraint.activate([
@@ -782,6 +805,10 @@ final class GuardStatusItemController: NSObject {
         } else {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }
+    }
+
+    @objc func closePopover(_ sender: Any?) {
+        popover.performClose(sender)
     }
 
     @objc func openMonitor(_ sender: Any?) {
@@ -996,7 +1023,7 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         root.orientation = .vertical
         root.alignment = .width
         root.spacing = 12
-        root.edgeInsets = NSEdgeInsets(top: 34, left: 38, bottom: 18, right: 28)
+        root.edgeInsets = NSEdgeInsets(top: 34, left: 28, bottom: 18, right: 28)
         root.translatesAutoresizingMaskIntoConstraints = false
         background.addSubview(root)
         NSLayoutConstraint.activate([
@@ -1006,19 +1033,28 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
             root.bottomAnchor.constraint(equalTo: background.bottomAnchor)
         ])
 
-        root.addArrangedSubview(makeHeader())
-        root.addArrangedSubview(makeScopePanel())
+        let header = makeHeader()
+        root.addArrangedSubview(header)
+        header.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -(root.edgeInsets.left + root.edgeInsets.right)).isActive = true
+
+        let cardWidthConstant = -(root.edgeInsets.left + root.edgeInsets.right)
+        let scopePanel = makeScopePanel()
+        root.addArrangedSubview(scopePanel)
+        scopePanel.widthAnchor.constraint(equalTo: root.widthAnchor, constant: cardWidthConstant).isActive = true
 
         let details = makeDetailsPanel()
         details.isHidden = true
         details.setContentHuggingPriority(.defaultLow, for: .horizontal)
         detailsView = details
         root.addArrangedSubview(details)
+        details.widthAnchor.constraint(equalTo: root.widthAnchor, constant: cardWidthConstant).isActive = true
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .vertical)
         root.addArrangedSubview(spacer)
-        root.addArrangedSubview(makeActionBar(panel: panel))
+        let actionBar = makeActionBar(panel: panel)
+        root.addArrangedSubview(actionBar)
+        actionBar.widthAnchor.constraint(equalTo: root.widthAnchor, constant: cardWidthConstant).isActive = true
 
         panel.center()
         NSApp.activate(ignoringOtherApps: true)
@@ -1109,8 +1145,8 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         let subtitle = promptLabel(context, size: 11.5, weight: .regular, color: .secondaryLabelColor)
         subtitle.maximumNumberOfLines = 1
 
-        let actorLine = makeKeyValueLine("Actor", actor, strong: true)
-        let targetLine = makeKeyValueLine("Destination", destination, strong: true)
+        let actorLine = makeHeaderKeyValueLine("Actor", actor)
+        let targetLine = makeHeaderKeyValueLine("Destination", destination)
 
         let text = NSStackView(views: [title, subtitle, actorLine, targetLine])
         text.orientation = .vertical
@@ -1120,9 +1156,27 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
 
         row.addArrangedSubview(iconWrap)
         row.addArrangedSubview(text)
-        let spacer = NSView()
-        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        row.addArrangedSubview(spacer)
+        return row
+    }
+
+    func makeHeaderKeyValueLine(_ key: String, _ value: String) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .firstBaseline
+        row.spacing = 7
+
+        let keyLabel = promptLabel(key, size: 11, weight: .medium, color: .tertiaryLabelColor)
+        keyLabel.alignment = .left
+        keyLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        let valueLabel = promptLabel(value.isEmpty ? "Unknown" : value, size: 13, weight: .semibold)
+        valueLabel.lineBreakMode = .byTruncatingMiddle
+        valueLabel.maximumNumberOfLines = 1
+        valueLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        row.addArrangedSubview(keyLabel)
+        row.addArrangedSubview(valueLabel)
+        row.setContentHuggingPriority(.defaultLow, for: .horizontal)
         return row
     }
 
@@ -1236,7 +1290,7 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         let keyLabel = promptLabel(key, size: 11, weight: .medium, color: .tertiaryLabelColor)
         keyLabel.alignment = .right
         keyLabel.translatesAutoresizingMaskIntoConstraints = false
-        keyLabel.widthAnchor.constraint(equalToConstant: 104).isActive = true
+        keyLabel.widthAnchor.constraint(equalToConstant: 84).isActive = true
 
         let valueLabel = promptLabel(value.isEmpty ? "Unknown" : value, size: strong ? 13 : 12, weight: strong ? .semibold : .regular)
         valueLabel.lineBreakMode = .byTruncatingMiddle
@@ -1260,7 +1314,7 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         let keyLabel = promptLabel(key, size: 11, weight: .medium, color: .tertiaryLabelColor)
         keyLabel.alignment = .right
         keyLabel.translatesAutoresizingMaskIntoConstraints = false
-        keyLabel.widthAnchor.constraint(equalToConstant: 104).isActive = true
+        keyLabel.widthAnchor.constraint(equalToConstant: 84).isActive = true
 
         row.addArrangedSubview(keyLabel)
         row.addArrangedSubview(control)
@@ -3908,6 +3962,14 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     }
 
     func show() {
+        show(makeVisible: true)
+    }
+
+    func startMenuBarOnly() {
+        show(makeVisible: false)
+    }
+
+    private func show(makeVisible: Bool) {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1100, height: 680),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -3961,16 +4023,20 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             object: nil
         )
         applyPreferredWindowFrame(window)
-        window.makeKeyAndOrderFront(nil)
         DispatchQueue.main.async {
             self.applyPreferredWindowFrame(window)
         }
-        NSApp.activate(ignoringOtherApps: true)
+        if makeVisible {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
         statusLabel.stringValue = "Loading recent Guard activity..."
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             self.autoStartDaemonIfNeeded()
             self.reloadEvents(nil)
-            self.showFirstRunOnboardingIfNeeded()
+            if makeVisible {
+                self.showFirstRunOnboardingIfNeeded()
+            }
         }
         let refreshTimer = Timer(timeInterval: 8.0, target: self, selector: #selector(reloadEvents(_:)), userInfo: nil, repeats: true)
         let pendingAlertTimer = Timer(timeInterval: 0.05, target: self, selector: #selector(pollPendingAlerts(_:)), userInfo: nil, repeats: true)
@@ -9676,12 +9742,14 @@ if let iconURL = Bundle.main.url(forResource: "GuardAppIcon", withExtension: "ic
 do {
     let config = try loadConfig()
     if config.mode == "monitor" {
+        app.setActivationPolicy(.accessory)
         let controller = MonitorWindowController(config: config)
         appDelegate.monitorController = controller
         appDelegate.statusController = GuardStatusItemController(monitor: controller)
-        controller.show()
+        controller.startMenuBarOnly()
         app.run()
     } else {
+        app.setActivationPolicy(.regular)
         let summary = try loadSummary(config: config)
         let controller = LauncherWindowController(config: config, summary: summary)
         appDelegate.launcherController = controller
