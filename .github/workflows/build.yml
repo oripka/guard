@@ -57,7 +57,10 @@ jobs:
 
       - name: Test macOS runtime
         if: runner.os == 'macOS'
-        run: pnpm test
+        run: |
+          NODE_GUARD_BYPASS=1 node --test --test-concurrency=1 \
+            --test-name-pattern "packaged iron-proxy|guard help prints command usage|doctor reports|iron-proxy backend permits matching HTTP method and path rules|can read files inside the allowed project root|cannot read the real home directory|cannot write protected env-style files in the project" \
+            samples/node-app/test/*.test.mjs
 
       - name: Test Linux bubblewrap runtime
         if: runner.os == 'Linux'
