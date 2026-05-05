@@ -36,6 +36,8 @@ const EVENT_LOG_SCHEMA_VERSION = 1
 const EVENT_STORAGE_SCHEMA_VERSION = 2
 const EVENT_INDEX_SCHEMA_VERSION = 2
 const DEFAULT_LOG_TRUNCATE_MAX_BYTES = 1024 * 1024
+const DEFAULT_TLS_CA_DAYS = 90
+const DEFAULT_TLS_LEAF_DAYS = 30
 const DEFAULT_RECOVERY_TAIL_BYTES = 1024 * 1024
 const DEFAULT_EVENT_QUERY_MAX_BYTES = 5 * 1024 * 1024
 const EXTENSION_SYNC_VERSION = 1
@@ -1665,6 +1667,14 @@ const tlsTrustStatus = ({ stateDir }) => {
       message: `Local TLS CA lifecycle is ${ca.lifecycle}. Generate or rotate it before decrypted TLS inspection.`,
     })
   }
+  if (ca.generated.certificate && !certificateValidFor(ca.paths.certificatePath, 60)) {
+    findings.push({
+      severity: 'high',
+      id: 'tls-ca-expired',
+      message: 'Local TLS CA is expired or near expiry. Guard will rotate it before the next decrypted TLS run.',
+      path: ca.paths.certificatePath,
+    })
+  }
   if (ca.generated.privateKey && fileMode(ca.paths.privateKeyPath) !== 0o600) {
     findings.push({
       severity: 'high',
@@ -1875,12 +1885,47 @@ const certificateIsCa = (certificatePath) => {
   }
 }
 
-const generateTlsCa = ({ stateDir, rotate = false, days = 30, commonName = 'Guard Local Development CA' }) => {
+const certificateValidFor = (certificatePath, seconds = 0) => {
+  if (!fileExists(certificatePath)) return false
+  try {
+    execFileSync(opensslPath(), [
+      'x509',
+      '-in',
+      certificatePath,
+      '-checkend',
+      String(Math.max(0, Number(seconds) || 0)),
+      '-noout',
+    ], { stdio: 'ignore' })
+    return true
+  } catch {
+    return false
+  }
+}
+
+const certificateVerifiesWithCa = ({ certificatePath, caCertificatePath }) => {
+  if (!fileExists(certificatePath) || !fileExists(caCertificatePath)) return false
+  try {
+    execFileSync(opensslPath(), [
+      'verify',
+      '-CAfile',
+      caCertificatePath,
+      certificatePath,
+    ], { stdio: 'ignore' })
+    return true
+  } catch {
+    return false
+  }
+}
+
+const generateTlsCa = ({ stateDir, rotate = false, days = DEFAULT_TLS_CA_DAYS, commonName = 'Guard Local Development CA' }) => {
   const current = tlsCaMetadata({ stateDir })
   const caDir = current.paths.caDir
   fs.mkdirSync(caDir, { recursive: true, mode: 0o700 })
   const existing = current.generated.certificate || current.generated.privateKey || current.generated.metadata
-  const existingValid = existing && certificateIsCa(current.paths.certificatePath)
+  const existingValid =
+    existing &&
+    certificateIsCa(current.paths.certificatePath) &&
+    certificateValidFor(current.paths.certificatePath, 60)
   if (existing && existingValid && !rotate) {
     return { action: 'generate-ca', changed: false, ...tlsCaMetadata({ stateDir }) }
   }
@@ -1892,8 +1937,16 @@ const generateTlsCa = ({ stateDir, rotate = false, days = 30, commonName = 'Guar
   if (existing && rotate) {
     const archiveDir = path.join(caDir, `archive-${now.replace(/[:.]/g, '-')}`)
     fs.mkdirSync(archiveDir, { recursive: true, mode: 0o700 })
-    for (const source of [current.paths.certificatePath, current.paths.privateKeyPath, current.paths.bundlePath, current.paths.metadataPath]) {
+    for (const source of [
+      current.paths.certificatePath,
+      current.paths.privateKeyPath,
+      current.paths.bundlePath,
+      current.paths.metadataPath,
+      path.join(caDir, 'guard-local-ca.srl'),
+      path.join(caDir, 'issued'),
+    ]) {
       if (fileExists(source)) fs.renameSync(source, path.join(archiveDir, path.basename(source)))
+      else if (fs.existsSync(source)) fs.renameSync(source, path.join(archiveDir, path.basename(source)))
     }
   }
 
@@ -1935,7 +1988,7 @@ const generateTlsCa = ({ stateDir, rotate = false, days = 30, commonName = 'Guar
   return { action: rotate ? 'rotate-ca' : 'generate-ca', changed: true, ...tlsCaMetadata({ stateDir }) }
 }
 
-const issueTlsHostCertificate = ({ stateDir, host, days = 7, force = false }) => {
+const issueTlsHostCertificate = ({ stateDir, host, days = DEFAULT_TLS_LEAF_DAYS, force = false }) => {
   const normalizedHost = sanitizeTlsHost(host)
   const current = tlsHostCertificateMetadata({ stateDir, host: normalizedHost })
   const ca = tlsCaMetadata({ stateDir })
@@ -1944,7 +1997,16 @@ const issueTlsHostCertificate = ({ stateDir, host, days = 7, force = false }) =>
     error.code = 'ca_missing'
     throw error
   }
-  if (current.generated.certificate && current.generated.privateKey && current.generated.metadata && !force) {
+  const existingCertificateUsable =
+    current.generated.certificate &&
+    current.generated.privateKey &&
+    current.generated.metadata &&
+    certificateValidFor(current.paths.certificatePath, 60) &&
+    certificateVerifiesWithCa({
+      certificatePath: current.paths.certificatePath,
+      caCertificatePath: ca.paths.certificatePath,
+    })
+  if (existingCertificateUsable && !force) {
     return { action: 'issue-cert', changed: false, ...current }
   }
 
@@ -2531,7 +2593,7 @@ class PendingAlertQueue {
     if (value === 'forever' || value === 'session') return ''
     const amount = Number.parseInt(value, 10)
     const unit = value.replace(/^\d+/, '')
-    const unitMs = unit === 'm' ? 60_000 : unit === 'h' ? 3_600_000 : unit === 'd' ? 86_400_000 : 0
+    const unitMs = unit === 's' ? 1_000 : unit === 'm' ? 60_000 : unit === 'h' ? 3_600_000 : unit === 'd' ? 86_400_000 : 0
     if (!amount || !unitMs) return ''
     return new Date(Date.now() + amount * unitMs).toISOString()
   }
@@ -2564,12 +2626,18 @@ class PendingAlertQueue {
     const requestPath = String(body.path || '')
     const launcherApp = String(body.launcherApp || '')
     const launcherProcess = String(body.launcherProcess || '')
+    const requestForRule = { host, method, path: requestPath }
     return this.decisions.find((decision) => {
       if (decision.decisionKey && decision.decisionKey === requestKey) return true
       if (!host) return false
-      if (decision.profile !== profile || decision.host !== host) return false
-      if (decision.method && decision.method !== method) return false
-      if (decision.path && decision.path !== requestPath) return false
+      if (decision.rule && typeof decision.rule === 'object') {
+        if (decision.profile !== profile) return false
+        if (!alertRuleMatchesRequest(decision.rule, requestForRule)) return false
+      } else {
+        if (decision.profile !== profile || decision.host !== host) return false
+        if (decision.method && decision.method !== method) return false
+        if (decision.path && decision.path !== requestPath) return false
+      }
       if (decision.launcherApp && decision.launcherApp !== launcherApp) return false
       if (decision.launcherProcess && decision.launcherProcess !== launcherProcess) return false
       return true
@@ -2579,6 +2647,9 @@ class PendingAlertQueue {
   rememberDecision(event) {
     if (!event || event.duration === 'once' || event.rulePersisted === true) return
     const expiresAt = this.decisionExpiresAt(event.duration)
+    const rule = event.suggestedRule && typeof event.suggestedRule === 'object'
+      ? event.suggestedRule
+      : null
     this.decisions = this.decisions.filter((decision) =>
       !(decision.profile === event.profile &&
         decision.host === event.host &&
@@ -2603,6 +2674,7 @@ class PendingAlertQueue {
       action: event.action,
       duration: event.duration,
       expiresAt,
+      rule,
       ruleId: event.ruleId || '',
       createdAt: event.at || new Date().toISOString(),
     })
@@ -2821,7 +2893,7 @@ const alertDecisionExpiresAt = (duration) => {
   if (value === 'forever' || value === 'session' || value === 'once') return ''
   const amount = Number.parseInt(value, 10)
   const unit = value.replace(/^\d+/, '')
-  const unitMs = unit === 'm' ? 60_000 : unit === 'h' ? 3_600_000 : unit === 'd' ? 86_400_000 : 0
+  const unitMs = unit === 's' ? 1_000 : unit === 'm' ? 60_000 : unit === 'h' ? 3_600_000 : unit === 'd' ? 86_400_000 : 0
   if (!amount || !unitMs) return ''
   return new Date(Date.now() + amount * unitMs).toISOString()
 }
@@ -2830,6 +2902,43 @@ const wildcardPathFor = (requestPath) => {
   const parts = String(requestPath || '/').split('/').filter(Boolean)
   if (parts.length <= 1) return '/*'
   return `/${parts.slice(0, -1).join('/')}/*`
+}
+
+const alertHostMatches = (pattern = '', host = '') => {
+  const normalizedPattern = String(pattern || '').toLowerCase()
+  const normalizedHost = String(host || '').toLowerCase()
+  if (!normalizedPattern) return true
+  if (!normalizedPattern.includes('*')) return normalizedPattern === normalizedHost
+  const escaped = normalizedPattern
+    .split('*')
+    .map((part) => part.replace(/[|\\{}()[\]^$+?.]/g, '\\$&'))
+    .join('.*')
+  return new RegExp(`^${escaped}$`).test(normalizedHost)
+}
+
+const alertPathMatches = (pattern = '', requestPath = '') => {
+  const normalizedPattern = String(pattern || '')
+  const normalizedPath = String(requestPath || '/')
+  if (!normalizedPattern) return true
+  if (normalizedPattern === normalizedPath) return true
+  if (!normalizedPattern.includes('*')) return false
+  const escaped = normalizedPattern
+    .split('*')
+    .map((part) => part.replace(/[|\\{}()[\]^$+?.]/g, '\\$&'))
+    .join('.*')
+  return new RegExp(`^${escaped}$`).test(normalizedPath)
+}
+
+const alertRuleMatchesRequest = (rule = {}, request = {}) => {
+  const host = String(rule.host || '').toLowerCase()
+  if (host && !alertHostMatches(host, request.host)) return false
+  const methods = Array.isArray(rule.methods)
+    ? rule.methods.map((value) => String(value).toUpperCase()).filter(Boolean)
+    : []
+  if (methods.length > 0 && !methods.includes(String(request.method || '').toUpperCase())) return false
+  const paths = Array.isArray(rule.paths) ? rule.paths.map(String).filter(Boolean) : []
+  if (paths.length > 0 && !paths.some((pattern) => alertPathMatches(pattern, request.path))) return false
+  return true
 }
 
 const alertHttpRuleForScope = ({ host, method, requestPath, scope }) => {
@@ -2874,7 +2983,7 @@ const alertDecision = ({ body, policyStore, eventLogPath, tail }) => {
   const requestPath = String(body.path || resource.path || '')
   const scope = String(body.scope || body.ruleScope || '')
   if (!['allow', 'deny'].includes(action)) throw new Error(`unsupported alert action: ${action}`)
-  if (!['once', 'session', '5m', '1h', '2d', '5d', 'forever'].includes(duration)) throw new Error(`unsupported alert duration: ${duration}`)
+  if (!/^(once|session|forever|\d+[smhd])$/.test(duration)) throw new Error(`unsupported alert duration: ${duration}`)
   if (!host) throw new Error('alert decision requires host')
   const httpRule = host && action === 'allow' ? alertHttpRuleForScope({ host, method, requestPath, scope }) : null
   const networkField = httpRule && duration === 'forever' ? 'network.httpRules' : action === 'allow' ? 'network.allowedDomains' : 'network.deniedDomains'
@@ -3234,6 +3343,7 @@ const createServer = ({ tail, policyStore, projectRegistry, startedAt, apiToken,
                 duration: cached.duration,
                 expiresAt: cached.expiresAt || '',
                 ruleId: cached.ruleId || '',
+                rule: cached.rule || null,
                 launcherApp: cached.launcherApp || '',
                 launcherProcess: cached.launcherProcess || '',
               },

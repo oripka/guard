@@ -220,6 +220,15 @@ flags:
 guard setup --yes --code-root ~/code --bin-dir ~/.local/bin
 ```
 
+The managed code root is the top-level folder where you keep projects that
+Guard should manage through its shims. `~/code` is a common choice, but it is
+not special: use `~/src`, `~/dev`, `~/Projects`, or any other parent directory
+that matches your local workflow. Interactive setup suggests a folder under
+your home directory when the saved config points somewhere temporary or outside
+your home. The install links directory is where Guard creates command symlinks
+such as `guard`, `guard-zoom`, and optional tool shims; for a user-local install
+this is usually `~/.local/bin`.
+
 Guard also ships agent-facing project guidance. In a repo where you want a
 coding agent to help maintain Guard policy, run:
 
@@ -298,7 +307,9 @@ guard install --bin-dir ~/bin --code-root ~/work --force
 `guard install` creates symlinks back to the real `guard` entrypoint. Packaged
 editions also include a bundled `bin/iron-proxy`, and Guard automatically
 discovers that binary when running from an unpacked edition. It also writes the
-managed root to `~/.config/guard/config.json`; set `GUARD_CODE_ROOT` to override
+managed root to `~/.config/guard/config.json`. The managed root should usually
+be the parent directory that contains your source checkouts, for example
+`~/code`, `~/src`, `~/dev`, or `~/Projects`; set `GUARD_CODE_ROOT` to override
 that value for a single shell or CI job.
 
 ### Linux Status

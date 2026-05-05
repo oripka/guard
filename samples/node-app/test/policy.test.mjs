@@ -2802,6 +2802,65 @@ test('iron-proxy backend reuses guardd local TLS CA and warms host certificate c
   }
 })
 
+test('guardd regenerates TLS CA when existing CA fails validity check', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-expired-ca-'))
+  const eventLog = resolve(tempRoot, 'events.jsonl')
+  const stateDir = resolve(tempRoot, 'state')
+  const opensslWrapper = resolve(tempRoot, 'openssl-expired-ca.sh')
+  writeFileSync(opensslWrapper, `#!/bin/sh
+has_checkend=0
+has_guard_ca=0
+for arg in "$@"; do
+  [ "$arg" = "-checkend" ] && has_checkend=1
+  case "$arg" in
+    *guard-local-ca.pem) has_guard_ca=1 ;;
+  esac
+done
+[ "$has_checkend" = "1" ] && [ "$has_guard_ca" = "1" ] && exit 1
+exec /usr/bin/openssl "$@"
+`)
+  chmodSync(opensslWrapper, 0o755)
+  let daemon = null
+
+  try {
+    daemon = await startGuarddForTest({
+      policyRoot: appRoot,
+      eventLog,
+      extraEnv: {
+        GUARD_STATE_DIR: stateDir,
+        GUARDD_OPENSSL: opensslWrapper,
+      },
+    })
+    const headers = {
+      authorization: `Bearer ${daemon.token}`,
+      'content-type': 'application/json',
+    }
+    const first = await fetch(`${daemon.base}/tls/ca`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ action: 'generate', days: 30, commonName: 'Guard Test CA' }),
+    })
+    assert.equal(first.status, 200)
+    const firstJson = await first.json()
+    assert.equal(firstJson.changed, true)
+    assert.equal(firstJson.lifecycle, 'active')
+
+    const regenerated = await fetch(`${daemon.base}/tls/ca`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ action: 'generate', days: 30, commonName: 'Guard Test CA' }),
+    })
+    assert.equal(regenerated.status, 200)
+    const regeneratedJson = await regenerated.json()
+    assert.equal(regeneratedJson.changed, true)
+    assert.equal(regeneratedJson.lifecycle, 'active')
+    assert.notEqual(regeneratedJson.serial, firstJson.serial)
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true })
+    await daemon?.stop()
+  }
+})
+
 for (const [profile, appPattern] of [
   ['zoom', /\/Applications\/zoom\.us\.app/],
   ['teams', /\/Applications\/Microsoft Teams\.app/],
@@ -3876,6 +3935,7 @@ test('guardd state, TLS CA scaffold, and bounded event log truncation stay local
       body: JSON.stringify({
         action: 'allow',
         duration: 'session',
+        scope: 'path',
       }),
     })
     assert.equal(resolvedPending.status, 200)
@@ -3895,6 +3955,91 @@ test('guardd state, TLS CA scaffold, and bounded event log truncation stay local
       rule.layer === 'http' &&
       rule.scope === 'POST pending.example.com /v1/responses'
     ), true)
+
+    const cachedPathAlert = await fetch(`${daemon.base}/alerts/pending`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        profile: 'guard',
+        host: 'pending.example.com',
+        port: 443,
+        method: 'POST',
+        path: '/v1/models',
+        timeoutMs: 5000,
+      }),
+    })
+    assert.equal(cachedPathAlert.status, 200)
+    const cachedPathAlertJson = await cachedPathAlert.json()
+    assert.equal(cachedPathAlertJson.cached, true)
+    assert.equal(cachedPathAlertJson.decision.action, 'allow')
+    assert.deepEqual(cachedPathAlertJson.decision.rule, {
+      host: 'pending.example.com',
+      methods: ['POST'],
+      paths: ['/v1/*'],
+    })
+
+    const shortRuleAlert = await fetch(`${daemon.base}/alerts/pending`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        profile: 'guard',
+        host: 'short-rule.example.com',
+        port: 443,
+        method: 'POST',
+        path: '/v1/responses',
+        timeoutMs: 5000,
+      }),
+    })
+    assert.equal(shortRuleAlert.status, 201)
+    const shortRuleAlertJson = await shortRuleAlert.json()
+    const shortRuleResolve = await fetch(`${daemon.base}/alerts/${shortRuleAlertJson.alert.id}/resolve`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        action: 'allow',
+        duration: '10s',
+        scope: 'path',
+      }),
+    })
+    assert.equal(shortRuleResolve.status, 200)
+    const shortRuleResolveJson = await shortRuleResolve.json()
+    assert.equal(shortRuleResolveJson.decision.duration, '10s')
+    assert.match(shortRuleResolveJson.decision.expiresAt, /^\d{4}-\d{2}-\d{2}T/)
+
+    const cachedShortRuleAlert = await fetch(`${daemon.base}/alerts/pending`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        profile: 'guard',
+        host: 'short-rule.example.com',
+        port: 443,
+        method: 'POST',
+        path: '/v1/models',
+        timeoutMs: 5000,
+      }),
+    })
+    assert.equal(cachedShortRuleAlert.status, 200)
+    const cachedShortRuleAlertJson = await cachedShortRuleAlert.json()
+    assert.equal(cachedShortRuleAlertJson.cached, true)
+    assert.equal(cachedShortRuleAlertJson.decision.duration, '10s')
+
+    await new Promise((resolveDone) => setTimeout(resolveDone, 10_500))
+    const expiredShortRuleAlert = await fetch(`${daemon.base}/alerts/pending`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        profile: 'guard',
+        host: 'short-rule.example.com',
+        port: 443,
+        method: 'POST',
+        path: '/v1/models',
+        timeoutMs: 5000,
+      }),
+    })
+    assert.equal(expiredShortRuleAlert.status, 201)
+    const expiredShortRuleAlertJson = await expiredShortRuleAlert.json()
+    assert.equal(expiredShortRuleAlertJson.cached, undefined)
+    assert.notEqual(expiredShortRuleAlertJson.alert.id, shortRuleAlertJson.alert.id)
 
     const resolvedList = await fetch(`${daemon.base}/alerts/pending?status=resolved&limit=5`, { headers })
     assert.equal(resolvedList.status, 200)
