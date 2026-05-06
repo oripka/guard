@@ -1067,7 +1067,8 @@ The Linux backend is intentionally narrower than the macOS backend today:
   namespace with `lo` enabled before the guarded command starts
 - `networkUnrestricted: true` uses the host network for trusted commands
 - `network.linuxBackend: "host-proxy"` enables Guard proxy/domain allowlists, HTTP rules, `iron-proxy` TLS inspection, and `allowedRawTcp` for proxy-aware clients while keeping filesystem containment
-- direct egress in `host-proxy` mode is not kernel-blocked; use rootless default-deny mode or the future `policy-helper` backend when fail-closed network namespaces are required
+- `network.linuxBackend: "policy-helper"` creates a Linux network namespace, connects it through a veth pair to Guard's proxy, installs nftables allow rules for the proxy and `allowedRawTcp`, and records nftables denial counters as `sandbox.denial` events
+- `policy-helper` requires root plus `ip` and `nft`; use `host-proxy` when those privileges are unavailable and direct-socket kernel blocking is not required
 
 The native runtime now lives in:
 

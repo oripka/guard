@@ -800,6 +800,24 @@ test('linux host-proxy backend permits proxy policy selection', { skip: process.
   assert.deepEqual(args.slice(-2), ['/usr/bin/env', '/usr/bin/true'])
 })
 
+test('linux policy-helper backend permits kernel-enforced proxy policy selection', { skip: process.platform !== 'linux' }, () => {
+  const cfg = networkProfileConfig({ allowedDomains: ['example.com'] })
+  cfg.network.linuxBackend = 'policy-helper'
+
+  assert.equal(linuxSandboxBackend({ network: cfg.network, proxyEnabled: true }), 'bubblewrap-host-proxy-network')
+  assert.equal(assertLinuxBubblewrapSupported(cfg, { proxyEnabled: true }), 'bubblewrap-host-proxy-network')
+
+  const args = buildBubblewrapArgs({
+    cfg,
+    commandArgs: ['/usr/bin/true'],
+    env: ['HOME=/tmp/guard-home', 'PATH=/usr/bin:/bin'],
+    cwd: appRoot,
+  })
+
+  assert.equal(args.includes('--unshare-net'), false)
+  assert.deepEqual(args.slice(-2), ['/usr/bin/env', '/usr/bin/true'])
+})
+
 test('linux bubblewrap backend fails closed for proxy-routed domain policy', { skip: process.platform !== 'linux' }, () => {
   assert.throws(
     () => assertLinuxBubblewrapSupported(networkProfileConfig({ allowedDomains: ['example.com'] }), { proxyEnabled: true }),
