@@ -11,7 +11,7 @@ import { connect as tlsConnect } from 'node:tls'
 import { fileURLToPath } from 'node:url'
 
 import { generateProfile } from '../../../lib/guard-manager.mjs'
-import { assertLinuxBubblewrapSupported, buildBubblewrapArgs } from '../../../lib/guard-bubblewrap.mjs'
+import { assertLinuxBubblewrapSupported, buildBubblewrapArgs, linuxSandboxBackend } from '../../../lib/guard-bubblewrap.mjs'
 import { classifySandboxDenialSensitivity, parseSandboxDenialMessage } from '../../../lib/guard-sandbox-log.mjs'
 import {
   createDomainFilter,
@@ -277,7 +277,7 @@ const expectNoDirectNetwork = (result) => {
   assert.notEqual(result.status, 0, 'direct network unexpectedly succeeded')
   assert.match(
     `${result.stderr}\n${result.stdout}`,
-    /EPERM|operation not permitted|permission|not permitted|denied/i,
+    /EPERM|ENETUNREACH|operation not permitted|permission|not permitted|denied/i,
   )
 }
 
@@ -757,6 +757,27 @@ test('linux bubblewrap backend denies network when policy has no egress exceptio
   })
 
   assert.ok(args.includes('--unshare-net'))
+  assert.deepEqual(args.slice(-2), ['/usr/bin/env', '/usr/bin/true'])
+})
+
+test('linux bubblewrap backend enables isolated loopback for local listeners', { skip: process.platform !== 'linux' }, () => {
+  const cfg = networkProfileConfig({ allowedDomains: [] })
+  cfg.network.allowLocalBinding = true
+  cfg.network.allowLoopbackPorts = [3000]
+
+  assert.equal(linuxSandboxBackend({ network: cfg.network }), 'bubblewrap-loopback-network')
+  assert.equal(assertLinuxBubblewrapSupported(cfg), 'bubblewrap-loopback-network')
+
+  const args = buildBubblewrapArgs({
+    cfg,
+    commandArgs: ['/usr/bin/true'],
+    env: ['HOME=/tmp/guard-home', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin'],
+    cwd: appRoot,
+  })
+
+  assert.ok(args.includes('--unshare-net'))
+  assert.ok(args.includes('guard-bwrap-loopback'))
+  assert.match(args.join('\n'), /ip link set lo up/)
   assert.deepEqual(args.slice(-2), ['/usr/bin/env', '/usr/bin/true'])
 })
 

@@ -316,9 +316,13 @@ that value for a single shell or CI job.
 
 Linux support is experimental and intentionally limited. The current
 `bubblewrap` backend can fail closed for basic filesystem containment and
-network-denied runs, but Guard proxy/domain/httpRules, loopback port
-exceptions, and `allowedRawTcp` are not supported there yet. Treat Linux as a
-future compatibility target, not a supported release platform for the alpha.
+network-denied runs. It also supports local development processes with an
+isolated loopback interface when `allowLocalBinding` or `allowLoopbackPorts`
+are configured, which lets a guarded web app talk to its own localhost service
+while external egress stays blocked. Guard proxy/domain/httpRules, TLS
+inspection through `iron-proxy`, and `allowedRawTcp` are not supported there
+yet. Treat Linux as a compatibility target, not a polished release platform for
+the alpha.
 
 ### Signing and Notarization
 
@@ -1059,10 +1063,12 @@ The Linux backend is intentionally narrower than the macOS backend today:
 
 - filesystem containment is built from read-only and writable bind mounts
 - network-denied runs use a private `bubblewrap` network namespace
+- loopback-only local development runs use a private `bubblewrap` network
+  namespace with `lo` enabled before the guarded command starts
 - `networkUnrestricted: true` uses the host network for trusted commands
-- Guard proxy/domain/httpRules, loopback port exceptions, and `allowedRawTcp`
-  fail closed on Linux until a Linux network-policy helper can enforce those
-  contracts without silently allowing bypasses
+- Guard proxy/domain/httpRules, TLS inspection, and `allowedRawTcp` fail closed
+  on Linux until a Linux network-policy helper can enforce those contracts
+  without silently allowing bypasses
 
 The native runtime now lives in:
 
