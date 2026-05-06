@@ -781,10 +781,29 @@ test('linux bubblewrap backend enables isolated loopback for local listeners', {
   assert.deepEqual(args.slice(-2), ['/usr/bin/env', '/usr/bin/true'])
 })
 
+
+test('linux host-proxy backend permits proxy policy selection', { skip: process.platform !== 'linux' }, () => {
+  const cfg = networkProfileConfig({ allowedDomains: ['example.com'] })
+  cfg.network.linuxBackend = 'host-proxy'
+
+  assert.equal(linuxSandboxBackend({ network: cfg.network, proxyEnabled: true }), 'bubblewrap-host-proxy-network')
+  assert.equal(assertLinuxBubblewrapSupported(cfg, { proxyEnabled: true }), 'bubblewrap-host-proxy-network')
+
+  const args = buildBubblewrapArgs({
+    cfg,
+    commandArgs: ['/usr/bin/true'],
+    env: ['HOME=/tmp/guard-home', 'PATH=/usr/bin:/bin'],
+    cwd: appRoot,
+  })
+
+  assert.equal(args.includes('--unshare-net'), false)
+  assert.deepEqual(args.slice(-2), ['/usr/bin/env', '/usr/bin/true'])
+})
+
 test('linux bubblewrap backend fails closed for proxy-routed domain policy', { skip: process.platform !== 'linux' }, () => {
   assert.throws(
     () => assertLinuxBubblewrapSupported(networkProfileConfig({ allowedDomains: ['example.com'] }), { proxyEnabled: true }),
-    /does not yet support Guard proxy\/domain\/httpRules enforcement/,
+    /does not support Guard proxy\/domain\/httpRules enforcement in rootless mode/,
   )
 })
 
@@ -1297,6 +1316,8 @@ test('allowedDomains permits allowlisted HTTP traffic through the local proxy ru
       {
         allowPty: true,
         network: {
+          backend: 'guard',
+          ask: false,
           allowedDomains: ['localhost'],
           deniedDomains: [],
           allowLocalBinding: false,
@@ -2360,6 +2381,8 @@ test('allowedRawTcp resolveAtLaunch permits only exact direct TCP destinations',
     ...networkProfileConfig({ allowedDomains: [] }),
     network: {
       ...networkProfileConfig({ allowedDomains: [] }).network,
+      ask: false,
+      backend: 'guard',
       allowedRawTcp: [
         {
           host: 'localhost',
@@ -2391,7 +2414,12 @@ test('allowedRawTcp resolveAtLaunch permits only exact direct TCP destinations',
       'direct-tcp',
       `tcp://127.0.0.1:${port + 1}`,
     ])
-    expectNoDirectNetwork(denied)
+    if (process.platform === 'linux' && process.env.GUARD_LINUX_NETWORK_BACKEND === 'host-proxy') {
+      assert.notEqual(denied.status, 0)
+      assert.match(`${denied.stderr}\n${denied.stdout}`, /ECONNREFUSED|denied|not permitted/i)
+    } else {
+      expectNoDirectNetwork(denied)
+    }
   } finally {
     rmSync(profilePath, { force: true })
     await closeServer(server)

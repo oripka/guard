@@ -1066,9 +1066,8 @@ The Linux backend is intentionally narrower than the macOS backend today:
 - loopback-only local development runs use a private `bubblewrap` network
   namespace with `lo` enabled before the guarded command starts
 - `networkUnrestricted: true` uses the host network for trusted commands
-- Guard proxy/domain/httpRules, TLS inspection, and `allowedRawTcp` fail closed
-  on Linux until a Linux network-policy helper can enforce those contracts
-  without silently allowing bypasses
+- `network.linuxBackend: "host-proxy"` enables Guard proxy/domain allowlists, HTTP rules, `iron-proxy` TLS inspection, and `allowedRawTcp` for proxy-aware clients while keeping filesystem containment
+- direct egress in `host-proxy` mode is not kernel-blocked; use rootless default-deny mode or the future `policy-helper` backend when fail-closed network namespaces are required
 
 The native runtime now lives in:
 
