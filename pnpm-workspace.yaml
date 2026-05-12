@@ -1,0 +1,11 @@
+minimumReleaseAge: 10080
+strictDepBuilds: true
+blockExoticSubdeps: true
+trustPolicy: no-downgrade
+packageManagerStrict: true
+preferFrozenLockfile: true
+savePrefix: ''
+strictSsl: true
+verifyStoreIntegrity: true
+
+allowBuilds: {}

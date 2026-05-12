@@ -151,7 +151,7 @@ test('guard blocks pnpm projects without a minimum release age gate', () => {
     writeMinimalGuardProfile(tempRoot)
     writeFileSync(
       join(tempRoot, 'package.json'),
-      JSON.stringify({ name: 'age-gate-fixture', packageManager: 'pnpm@10.32.1' }),
+      JSON.stringify({ name: 'age-gate-fixture', packageManager: 'pnpm@11.1.1' }),
     )
 
     const blocked = spawnSync(guard, [], {
