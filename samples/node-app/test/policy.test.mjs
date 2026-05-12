@@ -134,6 +134,92 @@ test('scan npm reports URL and domain literals from a project', () => {
   }
 })
 
+const writeMinimalGuardProfile = (root) => {
+  mkdirSync(join(root, '.guard'), { recursive: true })
+  writeFileSync(
+    join(root, '.guard', 'guard.json'),
+    JSON.stringify({
+      network: { allowedDomains: [] },
+      filesystem: { allowRead: ['${GUARD_PROJECT_DIR}'], allowWrite: ['${GUARD_PROJECT_DIR}'] },
+    }),
+  )
+}
+
+test('guard blocks pnpm projects without a minimum release age gate', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-age-gate-pnpm-'))
+  try {
+    writeMinimalGuardProfile(tempRoot)
+    writeFileSync(
+      join(tempRoot, 'package.json'),
+      JSON.stringify({ name: 'age-gate-fixture', packageManager: 'pnpm@10.32.1' }),
+    )
+
+    const blocked = spawnSync(guard, [], {
+      cwd: tempRoot,
+      encoding: 'utf8',
+      env: { ...process.env, GUARD_QUIET: '1' },
+    })
+    assert.notEqual(blocked.status, 0)
+    assert.match(blocked.stderr, /minimumReleaseAge|release-age protection/)
+
+    writeFileSync(join(tempRoot, '.npmrc'), 'minimumReleaseAge=10080\n')
+    const allowed = spawnSync(guard, [], {
+      cwd: tempRoot,
+      encoding: 'utf8',
+      env: { ...process.env, GUARD_QUIET: '1' },
+    })
+    expectOk(allowed)
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('guard blocks uv projects without exclude-newer but allows empty dependency projects', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-age-gate-uv-'))
+  try {
+    writeMinimalGuardProfile(tempRoot)
+    writeFileSync(
+      join(tempRoot, 'pyproject.toml'),
+      [
+        '[project]',
+        'name = "age-gate-fixture"',
+        'version = "0.1.0"',
+        'dependencies = ["requests"]',
+        '',
+        '[tool.uv]',
+      ].join('\n'),
+    )
+
+    const blocked = spawnSync(guard, [], {
+      cwd: tempRoot,
+      encoding: 'utf8',
+      env: { ...process.env, GUARD_QUIET: '1' },
+    })
+    assert.notEqual(blocked.status, 0)
+    assert.match(blocked.stderr, /exclude-newer|release-age protection/)
+
+    writeFileSync(
+      join(tempRoot, 'pyproject.toml'),
+      [
+        '[project]',
+        'name = "age-gate-fixture"',
+        'version = "0.1.0"',
+        'dependencies = []',
+        '',
+        '[tool.uv]',
+      ].join('\n'),
+    )
+    const emptyDeps = spawnSync(guard, [], {
+      cwd: tempRoot,
+      encoding: 'utf8',
+      env: { ...process.env, GUARD_QUIET: '1' },
+    })
+    expectOk(emptyDeps)
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
 test('scan npm skips node_modules unless requested', () => {
   const tempRoot = mkdtempSync(join(tmpdir(), 'guard-npm-scan-modules-'))
   try {

@@ -114,6 +114,20 @@ App profiles use the same idea for native UI apps: deny broad local filesystem
 access, reopen only the app bundle and required app data paths, and constrain
 network egress to the vendor domains that profile needs.
 
+### Running Guard inside another sandbox
+
+Guard can run under a parent sandbox such as Codex, but the parent must allow
+Guard's own localhost control plane to start. When a profile uses network ask,
+domain allowlists, HTTP rules, or the `iron-proxy` backend, Guard binds
+ephemeral `127.0.0.1` listeners for its proxy and policy decision service before
+it launches the protected child process.
+
+The parent sandbox should allow Guard itself to bind and accept localhost high
+ports, plus read/write Guard's per-run directory. Guard still generates the
+child sandbox and enforces the child's filesystem, process, and network policy.
+If the parent blocks these listeners, Guard fails before the child command
+starts with a loopback control-plane bind error.
+
 `guard` is not a VM and is not a replacement for a separate macOS user account
 or full virtualization. It is a practical local containment layer for everyday
 developer workflows and selected UI apps where running unsandboxed would be too

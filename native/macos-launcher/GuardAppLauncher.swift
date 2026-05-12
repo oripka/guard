@@ -1118,7 +1118,7 @@ func decodeJsonArgument<T: Decodable>(_ type: T.Type) throws -> T {
     return try JSONDecoder().decode(T.self, from: data)
 }
 
-enum GuardPromptChoice {
+enum GuardPromptChoice: Hashable {
     case deny
     case allowOnce
     case allowExact
@@ -1138,6 +1138,7 @@ struct GuardPromptAction {
 
 final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
     let promptControlWidth: CGFloat = 430
+    let promptHeaderValueWidth: CGFloat = 520
     let titleText: String
     let actor: String
     let destination: String
@@ -1149,6 +1150,8 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
     let lifetimeOptions: [(String, String)]
     let methodOptions: [(String, [String]?)]
     let editablePath: String?
+    let defaultLifetimeValue: String
+    let scopePathOverrides: [GuardPromptChoice: String]
     var selectedChoice: GuardPromptChoice = .deny
     var selectedActionDuration: String?
     var selectedScopeChoice: GuardPromptChoice?
@@ -1169,7 +1172,9 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         scopeOptions: [(String, GuardPromptChoice)] = [],
         lifetimeOptions: [(String, String)] = [],
         methodOptions: [(String, [String]?)] = [],
-        editablePath: String? = nil
+        editablePath: String? = nil,
+        defaultLifetimeValue: String = "forever",
+        scopePathOverrides: [GuardPromptChoice: String] = [:]
     ) {
         self.titleText = titleText
         self.actor = actor
@@ -1182,12 +1187,14 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         self.lifetimeOptions = lifetimeOptions
         self.methodOptions = methodOptions
         self.editablePath = editablePath
+        self.defaultLifetimeValue = defaultLifetimeValue
+        self.scopePathOverrides = scopePathOverrides
     }
 
     func run() -> GuardPromptChoice {
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 700, height: 390),
-            styleMask: [.titled, .closable, .fullSizeContentView],
+            styleMask: [.titled, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
@@ -1276,7 +1283,11 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
 
     @objc func chooseScope(_ sender: NSButton) {
         guard sender.tag >= 0 && sender.tag < scopeOptions.count else { return }
-        selectedScopeChoice = scopeOptions[sender.tag].1
+        let choice = scopeOptions[sender.tag].1
+        selectedScopeChoice = choice
+        if let path = scopePathOverrides[choice] {
+            pathField?.stringValue = path
+        }
     }
 
     @objc func toggleDetails(_ sender: NSButton) {
@@ -1341,7 +1352,7 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
 
         let title = promptLabel(titleText, size: 18, weight: .bold)
         let subtitle = promptLabel(context, size: 11.5, weight: .regular, color: .secondaryLabelColor)
-        subtitle.maximumNumberOfLines = 1
+        subtitle.maximumNumberOfLines = 2
 
         let actorLine = makeHeaderKeyValueLine("Actor", actor)
         let targetLine = makeHeaderKeyValueLine("Destination", destination)
@@ -1351,6 +1362,8 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         text.alignment = .leading
         text.spacing = 5
         text.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        text.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        text.widthAnchor.constraint(lessThanOrEqualToConstant: promptHeaderValueWidth + 48).isActive = true
 
         row.addArrangedSubview(iconWrap)
         row.addArrangedSubview(text)
@@ -1368,9 +1381,12 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         keyLabel.setContentHuggingPriority(.required, for: .horizontal)
 
         let valueLabel = promptLabel(value.isEmpty ? "Unknown" : value, size: 13, weight: .semibold)
-        valueLabel.lineBreakMode = .byTruncatingMiddle
-        valueLabel.maximumNumberOfLines = 1
+        valueLabel.lineBreakMode = .byWordWrapping
+        valueLabel.maximumNumberOfLines = 3
+        valueLabel.translatesAutoresizingMaskIntoConstraints = false
+        valueLabel.widthAnchor.constraint(lessThanOrEqualToConstant: promptHeaderValueWidth).isActive = true
         valueLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        valueLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         row.addArrangedSubview(keyLabel)
         row.addArrangedSubview(valueLabel)
@@ -1388,7 +1404,9 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         if !lifetimeOptions.isEmpty {
             let popup = NSPopUpButton()
             popup.addItems(withTitles: lifetimeOptions.map { $0.0 })
-            popup.selectItem(at: min(1, lifetimeOptions.count - 1))
+            if let defaultIndex = lifetimeOptions.firstIndex(where: { $0.1 == defaultLifetimeValue }) {
+                popup.selectItem(at: defaultIndex)
+            }
             popup.controlSize = .regular
             popup.font = NSFont.systemFont(ofSize: 13, weight: .medium)
             popup.translatesAutoresizingMaskIntoConstraints = false
@@ -1431,8 +1449,10 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         let stack = paddedPromptStack(in: container, inset: 12)
         stack.spacing = 7
         stack.addArrangedSubview(promptLabel("Connection Details", size: 12, weight: .semibold, color: .secondaryLabelColor))
+        stack.addArrangedSubview(makeKeyValueLine("Actor", actor, strong: false, maxLines: 0))
+        stack.addArrangedSubview(makeKeyValueLine("Destination", destination, strong: false, maxLines: 0))
         for (label, value) in detailRows {
-            stack.addArrangedSubview(makeKeyValueLine(label, value, strong: false))
+            stack.addArrangedSubview(makeKeyValueLine(label, value, strong: false, maxLines: 0))
         }
         return container
     }
@@ -1459,14 +1479,8 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
             button.tag = index
             button.controlSize = .regular
             button.setContentHuggingPriority(.required, for: .horizontal)
-            if action.isDefault {
-                button.keyEquivalent = "\r"
-                button.keyEquivalentModifierMask = []
-            }
             if action.choice == .deny {
                 button.hasDestructiveAction = true
-                button.keyEquivalent = "\u{1b}"
-                button.keyEquivalentModifierMask = []
             }
             row.addArrangedSubview(button)
         }
@@ -1493,7 +1507,7 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         return makeControlLine("Rule", stack)
     }
 
-    func makeKeyValueLine(_ key: String, _ value: String, strong: Bool) -> NSView {
+    func makeKeyValueLine(_ key: String, _ value: String, strong: Bool, maxLines: Int = 4) -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .firstBaseline
@@ -1505,9 +1519,12 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         keyLabel.widthAnchor.constraint(equalToConstant: 84).isActive = true
 
         let valueLabel = promptLabel(value.isEmpty ? "Unknown" : value, size: strong ? 13 : 12, weight: strong ? .semibold : .regular)
-        valueLabel.lineBreakMode = .byTruncatingMiddle
-        valueLabel.maximumNumberOfLines = 1
+        valueLabel.lineBreakMode = .byWordWrapping
+        valueLabel.maximumNumberOfLines = maxLines
+        valueLabel.translatesAutoresizingMaskIntoConstraints = false
+        valueLabel.widthAnchor.constraint(lessThanOrEqualToConstant: promptControlWidth).isActive = true
         valueLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        valueLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         row.addArrangedSubview(keyLabel)
         row.addArrangedSubview(valueLabel)
@@ -1652,8 +1669,10 @@ func runAskHttpPolicyPanel(input: GuardAskHttpPolicyInput) -> GuardAskDecision {
     let suggestedPaths = input.suggestedRule.paths?.joined(separator: ", ") ?? "Any path"
     let suggestedMethods = input.suggestedRule.methods?.joined(separator: ", ") ?? "Any method"
     let wildcardHost = wildcardDomainForHost(request.host)
+    let wildcardPath = input.suggestedRule.paths?.first ?? wildcardPathForPrompt(request.path)
     var scopeOptions: [(String, GuardPromptChoice)] = [
-        ("Exact path on \(request.host)", .allowExact),
+        ("Exact method and path on \(request.host)", .allowExact),
+        ("Wildcard path: \(wildcardPath) on \(request.host)", .allowPath),
         ("All paths on \(request.host)", .allowDomain)
     ]
     if let wildcardHost {
@@ -1691,7 +1710,11 @@ func runAskHttpPolicyPanel(input: GuardAskHttpPolicyInput) -> GuardAskDecision {
             ("Read methods: GET, HEAD", ["GET", "HEAD"]),
             ("Write methods: POST, PUT, PATCH, DELETE", ["POST", "PUT", "PATCH", "DELETE"])
         ],
-        editablePath: request.path
+        editablePath: request.path,
+        scopePathOverrides: [
+            .allowExact: request.path,
+            .allowPath: wildcardPath
+        ]
     )
     switch controller.run() {
     case .allowExact:
@@ -1740,6 +1763,14 @@ func promptLifetimeOptions() -> [(String, String)] {
         ("5 days", "5d"),
         ("Forever", "forever")
     ]
+}
+
+func wildcardPathForPrompt(_ requestPath: String) -> String {
+    let parts = requestPath.split(separator: "/").filter { !$0.isEmpty }
+    if parts.count <= 1 {
+        return "/*"
+    }
+    return "/" + parts.dropLast().joined(separator: "/") + "/*"
 }
 
 func wildcardDomainForHost(_ host: String) -> String? {
@@ -4245,7 +4276,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     var projectSummaryCache: [String: GuardAppSummary?] = [:]
     var projectSummaryMissCache = Set<String>()
     var codeSignatureCache: [String: (status: String, signer: String, teamId: String, bundleIdentifier: String)] = [:]
-    var presentedPendingAlertIds = Set<String>()
+    var activePendingAlertId: String?
     var recentAllowedCount = 0
     var recentDeniedCount = 0
     var recentTopHost = "-"
@@ -8237,12 +8268,14 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     }
 
     func presentNextPendingAlert(_ alerts: [[String: Any]], client: GuardDaemonClient) {
-        guard let alert = alerts.first(where: { alert in
+        guard activePendingAlertId == nil else { return }
+        let pendingAlerts = alerts.filter { ($0["status"] as? String ?? "pending") == "pending" }
+        guard let alert = pendingAlerts.reversed().first(where: { alert in
             let id = alert["id"] as? String ?? ""
-            return !id.isEmpty && !presentedPendingAlertIds.contains(id)
+            return !id.isEmpty
         }) else { return }
         let id = alert["id"] as? String ?? ""
-        presentedPendingAlertIds.insert(id)
+        activePendingAlertId = id
         DispatchQueue.main.async {
             self.presentPendingAlert(alert, client: client)
         }
@@ -8250,7 +8283,14 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     func presentPendingAlert(_ alert: [String: Any], client: GuardDaemonClient) {
         let id = alert["id"] as? String ?? ""
-        guard !id.isEmpty else { return }
+        guard !id.isEmpty else {
+            activePendingAlertId = nil
+            return
+        }
+        defer {
+            activePendingAlertId = nil
+            pollPendingAlerts(nil)
+        }
         let host = alert["host"] as? String ?? ""
         let method = alert["method"] as? String ?? ""
         let path = alert["path"] as? String ?? ""
@@ -8262,6 +8302,8 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         let isHTTP = !method.isEmpty || !path.isEmpty
         let controller: GuardConnectionPromptController
         if isHTTP {
+            let requestPath = path.isEmpty ? "/" : path
+            let wildcardPath = wildcardPathForPrompt(requestPath)
             controller = GuardConnectionPromptController(
                 titleText: "HTTP Policy Request",
                 actor: command,
@@ -8283,13 +8325,17 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                     GuardPromptAction(title: "Allow", choice: .allowExact, duration: nil, isDefault: true, tint: nil)
                 ],
                 scopeOptions: [
-                    ("Exact host: \(host)", .allowDomain),
                     ("Exact method and path on \(host)", .allowExact),
-                    ("Path group on \(host)", .allowPath),
+                    ("Wildcard path: \(wildcardPath) on \(host)", .allowPath),
+                    ("All paths on \(host)", .allowDomain),
                     ("All hosts for this app", .allowAllNetwork)
                 ],
                 lifetimeOptions: promptLifetimeOptions(),
-                editablePath: path.isEmpty ? "/" : path
+                editablePath: requestPath,
+                scopePathOverrides: [
+                    .allowExact: requestPath,
+                    .allowPath: wildcardPath
+                ]
             )
         } else {
             let parts = host.split(separator: ".")
