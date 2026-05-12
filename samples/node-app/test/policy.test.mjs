@@ -151,7 +151,7 @@ test('guard blocks pnpm projects without a minimum release age gate', () => {
     writeMinimalGuardProfile(tempRoot)
     writeFileSync(
       join(tempRoot, 'package.json'),
-      JSON.stringify({ name: 'age-gate-fixture', packageManager: 'pnpm@11.1.1' }),
+      JSON.stringify({ name: 'age-gate-fixture', packageManager: 'pnpm@10.32.1' }),
     )
 
     const blocked = spawnSync(guard, [], {
@@ -5209,7 +5209,7 @@ test('setup can be rerun after install and reports current values', () => {
   assert.match(setup.stdout, new RegExp(`managed root: ${codeRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
   assert.match(setup.stdout, new RegExp(`install dir: ${binDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
   assert.match(setup.stdout, /installed entrypoints: .*guard.*guard-zoom.*guard-teams.*guard-webex/)
-  assert.match(setup.stdout, /installed shims: .*node.*pnpm.*npm.*python.*python3.*pip.*pip3/)
+  assert.match(setup.stdout, /installed shims: .*node.*pnpm.*npm.*python.*python3.*pip.*pip3.*uv/)
   assert.match(setup.stdout, /Guard setup complete/)
   assert.equal(realpathSync(resolve(binDir, 'guard')), guard)
   const config = JSON.parse(readFileSync(resolve(configDir, 'config.json'), 'utf8'))
@@ -5313,6 +5313,42 @@ test('shim resolves the real tool from sanitized PATH instead of fixed package-m
   expectOk(result)
   assert.equal(result.stdout.trim(), 'fake-python3')
   assert.equal(readFileSync(marker, 'utf8').trim(), realpathSync(fakePython))
+})
+
+test('uv shim resolves real uv from sanitized PATH when installed later', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-uv-path-'))
+  const fakeBin = resolve(tempRoot, 'bin')
+  mkdirSync(fakeBin, { recursive: true })
+  const marker = resolve(tempRoot, 'uv-marker.txt')
+  const fakeUv = resolve(fakeBin, 'uv')
+
+  writeFileSync(
+    fakeUv,
+    `#!/bin/sh\nprintf 'fake-uv\\n'\nprintf '%s\\n' "$0" > "${marker}"\n`,
+    { mode: 0o755 },
+  )
+
+  try {
+    const result = spawnSync(shim, ['--version'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${dirname(shim)}:${fakeBin}:${process.env.PATH || ''}`,
+        GUARD_BIN: guard,
+        GUARD_SHIM_TOOL: 'uv',
+        GUARD_CODE_ROOT: appRoot,
+        UV_GUARD_BYPASS: '1',
+        GUARD_SHIM_BYPASS: '',
+      },
+    })
+
+    expectOk(result)
+    assert.equal(result.stdout.trim(), 'fake-uv')
+    assert.equal(readFileSync(marker, 'utf8').trim(), realpathSync(fakeUv))
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
 })
 
 test('can write files inside the allowed project root', () => {

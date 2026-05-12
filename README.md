@@ -486,7 +486,7 @@ symlinks are just policy gates that dispatch back into `guard`.
 Guarded shims:
 
 ```text
-node pnpm npm python python3 pip pip3
+node pnpm npm python python3 pip pip3 uv
 ```
 
 Disabled shims:
@@ -906,11 +906,11 @@ For CI or repeatable non-interactive deploys, prefer `CLOUDFLARE_API_TOKEN`.
 Guard tools that either execute project-controlled code or install/fetch code:
 
 - keep auto-shims for `node`, `pnpm`, `npm`, `python`, `python3`, `pip`, `pip3`,
-  and `deno` only where the native runtime supports it
+  and `uv`; add `deno` only when the native runtime supports it
 - keep `npx` and `corepack` disabled by default because they are easy
   one-command remote execution paths
-- use explicit `guard <tool> ...` for `make`, `just`, `go`, `cargo`, `uv`,
-  `poetry`, `bun`, `yarn`, `gem`, `bundle`, `mvn`, and `gradle` when working in
+- use explicit `guard <tool> ...` for `make`, `just`, `go`, `cargo`, `poetry`,
+  `bun`, `yarn`, `gem`, `bundle`, `mvn`, and `gradle` when working in
   an untrusted or freshly updated project
 - keep `docker` and `/var/run/docker.sock` outside the default policy; granting
   Docker socket access is effectively host access
