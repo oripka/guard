@@ -2860,6 +2860,37 @@ class PendingAlertQueue {
     })
     return alert
   }
+
+  alertMatchesDecision(alert = {}, decision = {}) {
+    if (!alert || alert.status !== 'pending' || !decision || !decision.action) return false
+    if (alert.id === decision.alertId) return false
+    if (String(alert.profile || 'guard') !== String(decision.profile || 'guard')) return false
+    if (decision.launcherApp && decision.launcherApp !== alert.launcherApp) return false
+    if (decision.launcherProcess && decision.launcherProcess !== alert.launcherProcess) return false
+
+    const request = {
+      host: String(alert.host || ''),
+      method: String(alert.method || ''),
+      path: String(alert.path || ''),
+    }
+    if (decision.suggestedRule && typeof decision.suggestedRule === 'object') {
+      return alertRuleMatchesRequest(decision.suggestedRule, request)
+    }
+    if (String(decision.host || '') !== request.host) return false
+    if (decision.method && String(decision.method || '') !== request.method) return false
+    if (decision.path && String(decision.path || '') !== request.path) return false
+    return true
+  }
+
+  resolveMatching({ decision, excludeId = '' }) {
+    const resolved = []
+    for (const alert of this.alerts.values()) {
+      if (excludeId && alert.id === excludeId) continue
+      if (!this.alertMatchesDecision(alert, decision)) continue
+      resolved.push(this.resolve({ id: alert.id, decision }))
+    }
+    return resolved
+  }
 }
 
 const alertResolveId = (url) => {
@@ -3396,11 +3427,13 @@ const createServer = ({ tail, policyStore, projectRegistry, startedAt, apiToken,
             tail,
           })
           const alert = pendingAlerts.resolve({ id: resolveAlertId, decision: result.decision })
+          const resolvedMatching = pendingAlerts.resolveMatching({ decision: result.decision, excludeId: resolveAlertId })
           pendingAlerts.rememberDecision(result.decision)
           writeJson(response, 200, {
             ...result,
             action: 'alert-resolve',
             alert,
+            resolvedMatching,
             pending: pendingAlerts.list({ limit: 50 }),
           })
         } catch (error) {
@@ -3447,8 +3480,9 @@ const createServer = ({ tail, policyStore, projectRegistry, startedAt, apiToken,
           const result = alertDecision({ body, policyStore, eventLogPath, tail })
           if (body.alertId) {
             const alert = pendingAlerts.resolve({ id: body.alertId, decision: result.decision })
+            const resolvedMatching = pendingAlerts.resolveMatching({ decision: result.decision, excludeId: body.alertId })
             pendingAlerts.rememberDecision(result.decision)
-            writeJson(response, 200, { ...result, alert, pending: pendingAlerts.list({ limit: 50 }) })
+            writeJson(response, 200, { ...result, alert, resolvedMatching, pending: pendingAlerts.list({ limit: 50 }) })
           } else {
             writeJson(response, 200, result)
           }

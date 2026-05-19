@@ -4131,6 +4131,50 @@ test('guardd state, TLS CA scaffold, and bounded event log truncation stay local
       paths: ['/v1/*'],
     })
 
+    const queuedDomainPathOne = await fetch(`${daemon.base}/alerts/pending`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        profile: 'guard',
+        host: 'registry.npmjs.org',
+        port: 443,
+        method: 'GET',
+        path: '/@vueuse/core',
+        timeoutMs: 5000,
+      }),
+    })
+    assert.equal(queuedDomainPathOne.status, 201)
+    const queuedDomainPathOneJson = await queuedDomainPathOne.json()
+    const queuedDomainPathTwo = await fetch(`${daemon.base}/alerts/pending`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        profile: 'guard',
+        host: 'registry.npmjs.org',
+        port: 443,
+        method: 'GET',
+        path: '/@nuxt/image',
+        timeoutMs: 5000,
+      }),
+    })
+    assert.equal(queuedDomainPathTwo.status, 201)
+    const queuedDomainPathTwoJson = await queuedDomainPathTwo.json()
+
+    const resolvedDomainQueue = await fetch(`${daemon.base}/alerts/${queuedDomainPathOneJson.alert.id}/resolve`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        action: 'allow',
+        duration: 'once',
+        scope: 'domain',
+      }),
+    })
+    assert.equal(resolvedDomainQueue.status, 200)
+    const resolvedDomainQueueJson = await resolvedDomainQueue.json()
+    assert.equal(resolvedDomainQueueJson.alert.status, 'resolved')
+    assert.equal(resolvedDomainQueueJson.resolvedMatching.some((alert) => alert.id === queuedDomainPathTwoJson.alert.id), true)
+    assert.equal(resolvedDomainQueueJson.pending.alerts.some((alert) => alert.id === queuedDomainPathTwoJson.alert.id), false)
+
     const shortRuleAlert = await fetch(`${daemon.base}/alerts/pending`, {
       method: 'POST',
       headers,

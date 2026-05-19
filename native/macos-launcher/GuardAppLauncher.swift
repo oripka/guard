@@ -8277,11 +8277,11 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         let id = alert["id"] as? String ?? ""
         activePendingAlertId = id
         DispatchQueue.main.async {
-            self.presentPendingAlert(alert, client: client)
+            self.presentPendingAlert(alert, pendingAlerts: pendingAlerts, client: client)
         }
     }
 
-    func presentPendingAlert(_ alert: [String: Any], client: GuardDaemonClient) {
+    func presentPendingAlert(_ alert: [String: Any], pendingAlerts: [[String: Any]] = [], client: GuardDaemonClient) {
         let id = alert["id"] as? String ?? ""
         guard !id.isEmpty else {
             activePendingAlertId = nil
@@ -8300,20 +8300,32 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         let projectDir = alert["projectDir"] as? String ?? ""
         let runDir = alert["runDir"] as? String ?? ""
         let isHTTP = !method.isEmpty || !path.isEmpty
+        let groupedPaths = matchingPendingHTTPPaths(for: alert, in: pendingAlerts)
+        let groupedPathText = groupedPaths.joined(separator: "\n")
+        let groupedPathSummary = groupedPaths.count > 1 ? "\(groupedPaths.count) queued paths" : (path.isEmpty ? "/" : path)
         let controller: GuardConnectionPromptController
         if isHTTP {
             let requestPath = path.isEmpty ? "/" : path
             let wildcardPath = wildcardPathForPrompt(requestPath)
+            let destinationPath = groupedPaths.count > 1 ? " (\(groupedPaths.count) paths)" : requestPath
+            let domainLabel = groupedPaths.count > 1
+                ? "All paths on \(host) (\(groupedPaths.count) queued requests)"
+                : "All paths on \(host)"
             controller = GuardConnectionPromptController(
                 titleText: "HTTP Policy Request",
                 actor: command,
-                destination: "\(method.isEmpty ? "HTTP" : method) \(host)\(path)",
-                context: "Choose the narrowest HTTP rule that fits this request.",
-                scopeRows: [],
+                destination: "\(method.isEmpty ? "HTTP" : method) \(host)\(destinationPath)",
+                context: groupedPaths.count > 1
+                    ? "Several queued HTTP requests differ only by path."
+                    : "Choose the narrowest HTTP rule that fits this request.",
+                scopeRows: groupedPaths.count > 1 ? [
+                    ("Queued", groupedPathSummary)
+                ] : [],
                 detailRows: [
                     ("Host", host),
                     ("Method", method.isEmpty ? "GET" : method),
                     ("Path", path.isEmpty ? "/" : path),
+                    ("Queued Paths", groupedPathText.isEmpty ? "None" : groupedPathText),
                     ("Type", "HTTP request"),
                     ("TLS", "Inspected by iron-proxy for this guarded process"),
                     ("Profile", profile),
@@ -8327,7 +8339,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 scopeOptions: [
                     ("Exact method and path on \(host)", .allowExact),
                     ("Wildcard path: \(wildcardPath) on \(host)", .allowPath),
-                    ("All paths on \(host)", .allowDomain),
+                    (domainLabel, .allowDomain),
                     ("All hosts for this app", .allowAllNetwork)
                 ],
                 lifetimeOptions: promptLifetimeOptions(),
@@ -8380,6 +8392,31 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             ifMatch: controller.selectedDuration == "forever" ? profileVersionText : nil
         )
         reloadEvents(nil)
+    }
+
+    func matchingPendingHTTPPaths(for alert: [String: Any], in alerts: [[String: Any]]) -> [String] {
+        let profile = alert["profile"] as? String ?? selectedProfileName
+        let host = alert["host"] as? String ?? ""
+        let method = alert["method"] as? String ?? ""
+        let command = alert["command"] as? String ?? ""
+        guard !host.isEmpty, (!method.isEmpty || !(alert["path"] as? String ?? "").isEmpty) else {
+            return []
+        }
+
+        var seen = Set<String>()
+        var paths: [String] = []
+        for candidate in alerts {
+            guard (candidate["status"] as? String ?? "pending") == "pending" else { continue }
+            guard (candidate["profile"] as? String ?? selectedProfileName) == profile else { continue }
+            guard (candidate["host"] as? String ?? "") == host else { continue }
+            guard (candidate["method"] as? String ?? "") == method else { continue }
+            guard (candidate["command"] as? String ?? "") == command else { continue }
+            let path = (candidate["path"] as? String ?? "").isEmpty ? "/" : (candidate["path"] as? String ?? "/")
+            if seen.insert(path).inserted {
+                paths.append(path)
+            }
+        }
+        return paths
     }
 
     func alertScopeName(_ choice: GuardPromptChoice) -> String {
