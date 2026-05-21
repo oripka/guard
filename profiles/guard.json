@@ -7,7 +7,8 @@
   "allowPty": true,
   "supplyChain": {
     "installHardening": true,
-    "sanitizeEnvironment": true
+    "sanitizeEnvironment": true,
+    "installSandbox": true
   },
   "workingDirectory": "${GUARD_RUN_DIR}",
   "network": {

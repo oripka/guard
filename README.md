@@ -31,7 +31,8 @@ That gives Guard three practical review surfaces today:
 - **Filesystem**: deny broad home, volume, application, and secret paths unless
   the profile reopens them.
 - **Subprocesses**: optionally deny child process launches by default and block
-  common download/script helper tools from install scripts.
+  common download/script helper tools from install scripts. Package install
+  commands can also run under a narrower PMG-style installation sandbox.
 - **Network**: constrain direct raw egress, route cooperative clients through
   HTTP/SOCKS proxy variables, and use `iron-proxy` for deeper HTTP/TLS policy.
 
@@ -70,8 +71,10 @@ guard doctor
 Run commands by putting `guard` first:
 
 ```sh
+guard pnpm install
 guard pnpm run dev
 guard --ask-network pnpm run dev
+guard npx vite --host 127.0.0.1
 guard bash
 ```
 
@@ -347,95 +350,59 @@ notarization, and installer pass.
 
 ## Usage
 
-### Guard Developer Commands
+### Everyday Developer Commands
 
-From a project that contains `.guard/guard.json`, prefix commands with `guard`:
+The clearest mode is explicit Guard:
 
 ```sh
+guard pnpm install
 guard pnpm run dev
+guard node scripts/build.mjs
+guard pip install -r requirements.txt
+guard npx vite --host 127.0.0.1
 guard --ask-network pnpm run dev
 ```
 
-Guard uses the deep `iron-proxy` backend by default for guarded runs. Guard
-starts `iron-proxy` for the run, injects proxy and CA environment variables,
-keeps the sandboxed process limited to the local proxy, and asks before
-unknown proxied HTTP/S requests when ask mode is enabled. Exact
-`network.httpRules` allow silently. Existing `network.allowedDomains` still
-work as compatibility allows, but interactive runs can upgrade them to narrower
-path rules.
+Common runs get these policies:
 
-Use `--deny-subprocesses`, `process.denyByDefault`, or
-`process.allowedExecutables` to constrain which binaries the guarded run may
-launch. When these are absent, Guard keeps the current permissive
-`process-exec` behavior. With `denyByDefault`, Guard automatically allows
-`/usr/bin/env` and the command you launched, then the sandbox default deny
-blocks other child process launches unless they are listed:
+| Command | Policy applied |
+| --- | --- |
+| `guard pnpm install` | Project profile plus the package-install sandbox when enabled. Writes are narrowed to install artifacts such as `node_modules`, lockfiles, caches, and local virtualenvs; secrets and Git hooks stay denied. Package threat intelligence, dependency cooldown, and package lookup apply when configured. |
+| `guard pnpm run dev` | Normal project profile. The project and Guard run directory are reopened, localhost dev-server binding is allowed, and network egress follows `network.allowedDomains`, `network.httpRules`, ask prompts, and proxy settings. |
+| `guard node scripts/build.mjs` | Normal project profile for a direct script. Filesystem, subprocess, and network rules come from `.guard/guard.json`; the install sandbox does not turn on unless forced. |
+| `guard pip install -r requirements.txt` | Python package-install run. With install sandbox enabled, Guard allows package/cache/virtualenv writes and keeps user secrets denied. |
+| `guard npx ...` | Explicit one-off package-tool run. `npx` shims are disabled by default, so use this form when you want Guard policy around `npx`. |
+| `guard --ask-network ...` | Same filesystem and subprocess policy, plus prompts for unknown proxied HTTP/S requests. Exact `network.httpRules` allow silently. |
 
-```sh
-guard --deny-subprocesses bash
-```
-
-Even when child processes are otherwise allowed, Guard blocks child executions
-of commonly abused download/script tools such as `curl`, `wget`, `python`,
-`ruby`, `perl`, `osascript`, and `nc` by default. The explicit command still
-works, so `guard curl https://example.com` is allowed, but a shell or install
-script spawning `curl` is blocked unless the profile or run uses
-`--allow-risky-child-tools`.
-
-```json
-{
-  "process": {
-    "denyByDefault": true,
-    "allowedExecutables": [
-      "/opt/homebrew/bin/node",
-      "${GUARD_PROJECT_DIR}/node_modules/.bin/*"
-    ]
-  }
-}
-```
-
-Profiles still need to include interpreters and helper tools spawned by the
-initial command, such as `/bin/sh`, `python3`, package-manager shims, or
-project-local binaries. On denial, `sandbox-exec` usually reports the attempted
-exec to the process as `Operation not permitted`; Guard's profile rules include
-a sandbox message tag for system-log correlation, but the portable CLI signal is
-the command failure line from the blocked process.
-
-When `ask` is enabled, unknown requests trigger an interactive prompt that can
-allow an exact API path or a generated wildcard path for the current run.
-Set `GUARD_ASK_NETWORK_UI=dialog` to use native macOS dialogs for ask decisions
-even when a guarded app was launched from a native wrapper.
-Set `GUARD_ASK_NETWORK_UI=native` to opt into the Swift helper panels; the
-launcher builds and wires `GUARD_ASK_NETWORK_HELPER` automatically when needed.
-
-You can persist reviewed rules back into the current project profile:
+If you install shims with `guard setup`, common tool commands are guarded inside
+the managed code root:
 
 ```sh
-guard profile add network.allowedDomains registry.npmjs.org
-guard profile add filesystem.denyRead ~/.ssh
-guard profile add-http-rule --host api.openai.com --method POST --path /v1/responses
-guard profile add-raw-tcp --host localhost --resolve-at-launch --port 8976 --reason "local OAuth callback"
+guard setup
+pnpm install
+pnpm run dev
+node scripts/build.mjs
 ```
 
-Bootstrap a default project profile for a Node, Vite, Nuxt, Slidev, Wrangler,
-or similar UI/dev-server app:
+The enabled shims are `node`, `pnpm`, `npm`, `python`, `python3`, `pip`, `pip3`,
+and `uv`. `npx`, `corepack`, and `deno` are disabled by default because they are
+easy to misuse as hidden download or execution paths. Outside the managed root,
+the shims run the real tools normally; inside the managed root, unconfigured
+directories fail closed in non-interactive shells.
+
+Use profile commands for the common edits:
 
 ```sh
 guard init
-```
-
-Inspect the current resolution state:
-
-```sh
 guard doctor
-guard doctor pnpm --json
-guard list profiles
-guard list templates
-guard daemon --port 8765
-guard profile doctor --profile teams
-guard diff-profile zoom teams
-guard network-log /tmp/guard-network.jsonl
+guard profile add network.allowedDomains registry.npmjs.org
+guard profile add filesystem.denyRead ~/.ssh
+guard profile add-http-rule --host api.openai.com --method POST --path /v1/responses
 ```
+
+For subprocess hardening, use `--deny-subprocesses`,
+`process.denyByDefault`, and `process.allowedExecutables`; see
+[Child Process Policy](#child-process-policy).
 
 ### Guard Native UI Apps
 
@@ -478,37 +445,6 @@ Those wrappers appear as `Guard Zoom.app`, `Guard Teams.app`, and
 including filesystem, network, and warning status, before launching the real
 app through `guard`.
 
-The local setup can install PATH shims in `~/.local/bin` so common dependency
-and script runners are guarded in both interactive terminals and non-interactive
-Codex-style shells. `guard` remains the only real executable. The tool-name
-symlinks are just policy gates that dispatch back into `guard`.
-
-Guarded shims:
-
-```text
-node pnpm npm python python3 pip pip3 uv
-```
-
-Disabled shims:
-
-```text
-npx corepack deno
-```
-
-Escape hatches:
-
-```sh
-guard off npm i -g @openai/codex
-command pnpm ...
-command node ...
-PNPM_GUARD_BYPASS=1 pnpm ...
-NODE_GUARD_BYPASS=1 node ...
-GUARD_SHIM_BYPASS=1 <tool> ...
-```
-
-Inside the configured managed root, unconfigured directories fail closed for
-shimmed tools. Outside that root, the shims run the real tools normally.
-
 ## Integration Model
 
 `guard` is the only real entrypoint. Everything else is one of two modes:
@@ -528,122 +464,73 @@ Shim mode is intentionally narrow:
 This keeps Codex and local shell behavior aligned without relying on shell
 aliases or tool-specific wrapper scripts.
 
-## Commands
+## Command Reference
+
+Run `guard help` for the full CLI reference. Most daily use fits this shape:
 
 ```text
 guard [options] <command> [args...]
-guard [options] -- <command> [args...]
-guard [options]
+guard --ask-network <command> [args...]
+guard --install-sandbox <package-install-command> [args...]
 guard off <command> [args...]
-guard unprotected <command> [args...]
-guard help
-guard run <webex|teams|zoom> [args...]
-guard doctor [tool] [--json]
-guard audit [--json]
-guard settings [--json]
-guard tls status [--json]
-guard scan npm [--dir DIR] [--include-node-modules] [--json]
-guard app-summary --profile NAME [--json]
-guard daemon [guardd options...]
-guard ui [--dir DIR]
-guard monitor-log [--json] [--limit N] [PATH]
-guard profile add FIELD VALUE [--json]
-guard profile remove FIELD VALUE [--json]
-guard profile add-http-rule (--host HOST|--cidr CIDR) [--method METHOD] [--path PATH] [--json]
-guard profile remove-http-rule (--host HOST|--cidr CIDR) [--method METHOD] [--path PATH] [--json]
-guard profile add-raw-tcp (--host HOST [--resolve-at-launch]|--ip IP) --port PORT [--reason TEXT] [--json]
-guard profile remove-raw-tcp (--host HOST [--resolve-at-launch]|--ip IP) --port PORT [--reason TEXT] [--json]
-guard profile tls <enable|disable|status> [--json]
-guard profile doctor [--json]
-guard install-monitor [--dir DIR] [--force]
-guard install-app <webex|teams|zoom> [--dir DIR] [--force]
-guard install-app all [--dir DIR] [--force]
-guard install-apps [--dir DIR] [--force]
-guard discover [--profile NAME] [--report PATH] -- <command> [args...]
-guard diff-profile OLD NEW [--json]
-guard network-log PATH [--json]
-guard list profiles [--json]
-guard list templates [--json]
-guard list domain-presets [--json]
-guard setup [--bin-dir DIR] [--code-root DIR] [--shims|--no-shims] [--force] [--yes]
-guard install [--bin-dir DIR] [--code-root DIR] [--no-shims] [--force]
-guard init [template] [--force]
 ```
 
-- `guard`: run a command inside the matched policy
-- `guard help`: print CLI usage
-- `--ask-network`: prompt before allowing unknown proxied network hosts for
-  the current run
-- `--deep-egress`: compatibility flag for the default `iron-proxy` backend
-- `--daemon-policy`: route unknown proxied network decisions through `guardd`
-  pending alerts for this run. Alias flags are `--guardd-policy` and
-  `--use-guardd`
-- `--deny-subprocesses`: deny child process execution by default for this run.
-  Aliases are `--no-child-processes` and `--deny-children`
-- `--allow-subprocesses`: force permissive child process execution for this
-  run, overriding a strict profile. Aliases are `--allow-child-processes` and
-  `--allow-children`
+Common commands:
+
+```sh
+guard init
+guard doctor
+guard audit
+guard profile doctor
+guard profile add network.allowedDomains registry.npmjs.org
+guard profile add-http-rule --host api.openai.com --method POST --path /v1/responses
+guard profile add-raw-tcp --host localhost --resolve-at-launch --port 8976 --reason "local callback"
+guard run zoom
+guard ui
+```
+
+Common one-run flags:
+
+- `--ask-network`: prompt for unknown proxied HTTP/S destinations.
+- `--install-sandbox`: force the package-install sandbox for one run.
+- `--install-sandbox-allow type=value`: add a one-run exception. Supported
+  types are `read`, `write`, `exec`, `domain`, `net`, and `net-bind`.
+- `--deny-subprocesses`: deny child process execution unless explicitly
+  allowed.
 - `--allow-read PATH`, `--allow-write PATH`, `--deny-read PATH`, and
-  `--deny-write PATH`: add one-run filesystem path rules
-- `--allow-domain HOST` and `--deny-domain HOST`: add one-run domain rules
-- Guard blocks common telemetry domains by default, including analytics,
-  tag-manager, product analytics, session replay, and crash-reporting hosts.
-  Explicit `--allow-domain HOST` or `network.allowedDomains` entries override
-  those default denies. Use `--allow-telemetry-domains` to disable the default
-  telemetry blocklist for one run, or `--block-telemetry-domains` to force it on
-- `--allow-exec PATH`: add one executable to the one-run subprocess allowlist
-- `--allow-risky-child-tools`: permit child executions of commonly abused tools
-  such as `curl`, `wget`, `python`, `ruby`, `perl`, `osascript`, and `nc` for
-  this run. Use `--block-risky-child-tools` to force the default blocklist back
-  on if a profile disables it
-- `--allow-loopback-port PORT`: add one exact one-run localhost TCP exception.
-  `--allow-loopback` remains the broad all-localhost escape hatch; there is no
-  high-port range flag
+  `--deny-write PATH`: add one-run filesystem rules.
+- `--allow-domain HOST` and `--deny-domain HOST`: add one-run network domain
+  rules.
+- `--allow-loopback-port PORT`: add one exact localhost TCP exception.
 - `--no-network` and `--network-unrestricted`: force no egress or unrestricted
-  egress for this run
-- `--proxy-logs` and `--quiet-proxy-logs`: show or quiet proxy logs for this run
-- `guard` with no command: show the resolved policy banner
-- `guard run`: launch a built-in app profile by name
-- `guard doctor`: inspect current resolution and profile state
-- `guard audit`: print risky policy choices for the selected profile
-- `guard settings`: print monitor, prompt, daemon, and TLS inspection settings
-- `guard tls status`: print the effective TLS inspection policy for a profile
-- `guard scan npm`: statically scan an npm project for URL and domain literals.
-  The scanner skips `node_modules` and common build/cache folders by default;
-  pass `--include-node-modules` when dependency code should be included.
-- `guard app-summary`: print the permission summary used by native launchers
-- `guard daemon`: run the local `guardd` prototype for health and recent event
-  APIs
-- `guard ui`: build, install, and start the native Guard menu-bar monitor
-- `guard monitor-log`: summarize the persistent Guard event stream used by the
-  native monitor
-- `guard profile add` / `guard profile remove`: edit project-local profile
-  array rules such as `network.allowedDomains` and `filesystem.denyRead`
-- `guard profile add-http-rule` / `guard profile remove-http-rule`: edit
-  `iron-proxy` HTTP method/path rules in the project profile
-  JSON output includes stable rule IDs and metadata keys; project profiles store
-  this in a backward-compatible top-level `ruleMetadata` sidecar.
-- `guard profile add-raw-tcp` / `guard profile remove-raw-tcp`: edit structured
-  `network.allowedRawTcp` rules for exact supported raw TCP exceptions
-- `guard profile tls`: enable, disable, or inspect explicit project-local TLS
-  inspection settings
-- `guard profile doctor`: validate profile quality for CI/review
-- `guard install-monitor`: build the native macOS monitor app
-- `guard install-app`: build one native macOS `.app` launcher wrapper, or all
-  wrappers with `guard install-app all`
-- `guard install-apps`: build all native macOS launcher wrappers
-- `guard discover`: run with temporary network ask/logging and write a
-  discovery report
-- `guard diff-profile`: compare two profile policy surfaces
-- `guard network-log`: summarize guard proxy allow/deny decisions
-- `guard list profiles`: list built-in profiles such as `zoom`, `teams`, and
-  `webex`
-- `guard list templates`: list project bootstrap templates for `guard init`
-- `guard list domain-presets`: show denied-domain preset names and patterns
-- `guard setup`: guided first-run or rerunnable install and managed-root
-  configuration, including the current configured values
-- `guard install`: install the entrypoint, optional shims, and user-local config
-- `guard init`: create `.guard/guard.json` from a bundled template
+  egress for one run.
+
+Package installs can opt into PMG-style controls in `.guard/guard.json`:
+
+```json
+{
+  "supplyChain": {
+    "installSandbox": true,
+    "dependencyCooldown": { "enabled": true, "days": 5 },
+    "threatIntelligence": {
+      "blockedPackages": ["pkg:npm/safedep-test-pkg@1.0.0"]
+    }
+  },
+  "network": {
+    "allowedDomains": ["registry.npmjs.org"],
+    "packageLookup": { "provider": "socket-free" }
+  }
+}
+```
+
+`installSandbox` narrows package-manager writes during `pnpm install`,
+`npm install`, `pip install`, and similar install/download commands.
+`threatIntelligence` blocks known-bad package PURLs before artifact download
+using local rules, Socket lookup alerts when configured, or an adapter endpoint.
+`dependencyCooldown` filters npm and PyPI metadata so freshly published versions
+inside the cooldown window are not selected. See
+[docs/supply-chain-policy.md](docs/supply-chain-policy.md) for the full schema,
+event names, adapter contract, and limitations.
 
 ## Native App Launchers
 
@@ -1108,6 +995,10 @@ crashes under macOS `sandbox-exec` even with a minimal profile.
 
 Use [docs/node-app-policy.md](docs/node-app-policy.md) for Node/Nuxt/Vite/Slidev
 projects.
+
+Use [docs/supply-chain-policy.md](docs/supply-chain-policy.md) for package
+threat intelligence, dependency cooldown, install sandboxing, and install
+hardening.
 
 Use [docs/project-profiles.md](docs/project-profiles.md) for the current local
 PacketSafari, Wireshark, and on-prem profile conventions.

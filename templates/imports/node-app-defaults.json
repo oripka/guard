@@ -1,5 +1,8 @@
 {
   "allowPty": true,
+  "supplyChain": {
+    "installSandbox": true
+  },
   "network": {
     "allowedDomains": [],
     "deniedDomains": [],

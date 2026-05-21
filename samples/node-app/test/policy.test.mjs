@@ -11,14 +11,28 @@ import { connect as tlsConnect } from 'node:tls'
 import { fileURLToPath } from 'node:url'
 
 import { generateProfile } from '../../../lib/guard-manager.mjs'
+import {
+  applyInstallSandboxPolicy,
+  isInstallSandboxCommand,
+  parseInstallSandboxAllow,
+} from '../../../lib/guard-install-sandbox.mjs'
 import { assertLinuxBubblewrapSupported, buildBubblewrapArgs, linuxSandboxBackend } from '../../../lib/guard-bubblewrap.mjs'
 import { classifySandboxDenialSensitivity, parseSandboxDenialMessage } from '../../../lib/guard-sandbox-log.mjs'
 import {
   createDomainFilter,
+  detectPackageFetch,
+  createSocketFreePackageLookup,
   buildProxyEnv,
   createGuarddTlsCertificateIssuer,
   startHttpProxy,
 } from '../../../lib/guard-network.mjs'
+import {
+  cooldownIsWithinWindow,
+  createPackagePolicy,
+  detectPackageMetadataRequest,
+  filterNpmMetadataForCooldown,
+  filterPypiSimpleMetadataForCooldown,
+} from '../../../lib/guard-package-policy.mjs'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const appRoot = resolve(__dirname, '..')
@@ -937,12 +951,346 @@ test('supply-chain install hardening denies package persistence writes and risky
   assert.match(profile, /\(deny file-write\*[\s\S]*\.zshrc/)
 })
 
+test('supply-chain install sandbox applies only to package installation commands', () => {
+  assert.equal(isInstallSandboxCommand(['pnpm', 'install']), true)
+  assert.equal(isInstallSandboxCommand(['npm', '--prefix', appRoot, 'ci']), true)
+  assert.equal(isInstallSandboxCommand(['uv', 'pip', 'install', 'requests']), true)
+  assert.equal(isInstallSandboxCommand(['pnpm', 'run', 'dev']), false)
+  assert.deepEqual(parseInstallSandboxAllow('net=registry.npmjs.org:443'), {
+    allowedDomains: ['registry.npmjs.org'],
+  })
+})
+
+test('supply-chain install sandbox narrows project writes and denies secret reads after broad read allows', () => {
+  const guardRunDir = join(appRoot, '.guard-run-test')
+  const result = applyInstallSandboxPolicy(
+    {
+      supplyChain: {
+        installSandbox: true,
+      },
+      network: {},
+      filesystem: {
+        denyRead: ['/Users', '/Volumes'],
+        allowRead: [appRoot, guardRunDir],
+        allowWrite: [appRoot, guardRunDir],
+        denyWrite: [],
+      },
+    },
+    {
+      commandArgs: ['pnpm', 'install'],
+      cwd: appRoot,
+      projectDir: appRoot,
+      guardRunDir,
+      realHome: '/Users/example',
+    },
+  )
+
+  assert.equal(result.active, true)
+  assert.equal(result.config.supplyChain.installHardening, true)
+  assert.equal(result.config.filesystem.allowWrite.includes(appRoot), false)
+  assert.ok(result.config.filesystem.allowWrite.includes(join(appRoot, 'node_modules')))
+  assert.ok(result.config.filesystem.allowWrite.includes(join(appRoot, 'pnpm-lock.yaml.*')))
+  assert.ok(result.config.filesystem.denyReadAfterAllow.includes(join(appRoot, '.env')))
+  assert.ok(result.config.filesystem.denyReadAfterAllow.includes(join(appRoot, '**/.ssh')))
+  assert.ok(result.config.filesystem.denyWrite.includes(join(appRoot, '.git/hooks')))
+
+  const profile = generateProfile(result.config, {
+    cwd: appRoot,
+    projectDir: appRoot,
+    guardRunDir,
+  })
+  const allowProjectRead = profile.indexOf(`(allow file-read*\n  (subpath ${JSON.stringify(appRoot)})`)
+  const denyEnvRead = profile.indexOf(`(deny file-read*\n  (subpath ${JSON.stringify(join(appRoot, '.env'))})`)
+  assert.notEqual(allowProjectRead, -1)
+  assert.ok(denyEnvRead > allowProjectRead)
+
+  const inactive = applyInstallSandboxPolicy(result.config, {
+    commandArgs: ['pnpm', 'run', 'dev'],
+    cwd: appRoot,
+    projectDir: appRoot,
+    guardRunDir,
+    realHome: '/Users/example',
+    disabled: true,
+  })
+  assert.equal(inactive.active, false)
+})
+
 test('buildProxyEnv exposes reusable SOCKS and SSH proxy environment', () => {
   const env = buildProxyEnv({ httpPort: 18080, socksPort: 19090 })
 
   assert.ok(env.includes('GUARD_SOCKS_PROXY=localhost:19090'))
   assert.ok(env.includes('GUARD_SSH_PROXY_COMMAND=nc -X 5 -x localhost:19090 %h %p'))
   assert.ok(env.includes("GIT_SSH_COMMAND=ssh -o ProxyCommand='nc -X 5 -x localhost:19090 %h %p'"))
+  assert.ok(env.includes('npm_config_https_proxy=http://localhost:18080'))
+  assert.ok(env.includes('NPM_CONFIG_HTTPS_PROXY=http://localhost:18080'))
+  assert.ok(env.includes('YARN_HTTP_PROXY=http://localhost:18080'))
+  assert.ok(env.includes('YARN_HTTPS_PROXY=http://localhost:18080'))
+  assert.ok(env.includes('CARGO_HTTP_PROXY=http://localhost:18080'))
+})
+
+test('buildProxyEnv exposes package manager CA settings when TLS inspection is active', () => {
+  const env = buildProxyEnv({
+    httpPort: 18080,
+    caCertPath: '/tmp/guard-ca/socketFirewallCa.crt',
+    caDir: '/tmp/guard-ca',
+  })
+
+  assert.ok(env.includes('SSL_CERT_FILE=/tmp/guard-ca/socketFirewallCa.crt'))
+  assert.ok(env.includes('SSL_CERT_DIR=/tmp/guard-ca'))
+  assert.ok(env.includes('NODE_EXTRA_CA_CERTS=/tmp/guard-ca/socketFirewallCa.crt'))
+  assert.ok(env.includes('YARN_HTTPS_CA_FILE_PATH=/tmp/guard-ca/socketFirewallCa.crt'))
+  assert.ok(env.includes('PIP_CERT=/tmp/guard-ca/socketFirewallCa.crt'))
+  assert.ok(env.includes('CARGO_HTTP_CAINFO=/tmp/guard-ca/socketFirewallCa.crt'))
+  assert.ok(env.includes('GIT_SSL_CAINFO=/tmp/guard-ca/socketFirewallCa.crt'))
+  assert.ok(env.includes('GIT_PROXY_SSL_CAINFO=/tmp/guard-ca/socketFirewallCa.crt'))
+})
+
+test('detectPackageFetch recognizes benign registry artifact URLs', () => {
+  assert.deepEqual(
+    detectPackageFetch({
+      host: 'registry.npmjs.org',
+      path: '/lodash/-/lodash-4.17.21.tgz',
+    }),
+    {
+      ecosystem: 'npm',
+      registryHost: 'registry.npmjs.org',
+      name: 'lodash',
+      version: '4.17.21',
+      purl: 'pkg:npm/lodash@4.17.21',
+    },
+  )
+  assert.deepEqual(
+    detectPackageFetch({
+      host: 'registry.npmjs.org',
+      path: '/@scope/pkg/-/pkg-1.2.3.tgz?cache=hit',
+    }),
+    {
+      ecosystem: 'npm',
+      registryHost: 'registry.npmjs.org',
+      name: '@scope/pkg',
+      version: '1.2.3',
+      purl: 'pkg:npm/@scope/pkg@1.2.3',
+    },
+  )
+  assert.deepEqual(
+    detectPackageFetch({
+      host: 'files.pythonhosted.org',
+      path: '/packages/source/r/requests/requests-2.32.5.tar.gz',
+    }),
+    {
+      ecosystem: 'pypi',
+      registryHost: 'files.pythonhosted.org',
+      name: 'requests',
+      version: '2.32.5',
+      purl: 'pkg:pypi/requests@2.32.5',
+    },
+  )
+  assert.deepEqual(
+    detectPackageFetch({
+      host: 'static.crates.io',
+      path: '/crates/serde/serde-1.0.197.crate',
+    }),
+    {
+      ecosystem: 'cargo',
+      registryHost: 'static.crates.io',
+      name: 'serde',
+      version: '1.0.197',
+      purl: 'pkg:cargo/serde@1.0.197',
+    },
+  )
+  assert.equal(
+    detectPackageFetch({
+      host: 'registry.npmjs.org',
+      path: '/lodash',
+    }),
+    null,
+  )
+})
+
+test('package policy detects registry metadata and filters cooldown versions', () => {
+  assert.deepEqual(
+    detectPackageMetadataRequest({
+      host: 'registry.npmjs.org',
+      path: '/@scope%2fpkg',
+    }),
+    { ecosystem: 'npm', name: '@scope/pkg' },
+  )
+  assert.deepEqual(
+    detectPackageMetadataRequest({
+      host: 'pypi.org',
+      path: '/simple/requests/',
+    }),
+    { ecosystem: 'pypi', name: 'requests' },
+  )
+
+  const now = new Date('2026-05-21T00:00:00.000Z')
+  assert.deepEqual(
+    cooldownIsWithinWindow('2026-05-19T00:00:00.000Z', 5, now),
+    { withinCooldown: true, daysSincePublish: 2, daysRemaining: 3 },
+  )
+
+  const npm = filterNpmMetadataForCooldown(
+    JSON.stringify({
+      name: 'fixture',
+      'dist-tags': { latest: '2.0.0' },
+      versions: {
+        '1.0.0': { version: '1.0.0' },
+        '2.0.0': { version: '2.0.0' },
+      },
+      time: {
+        created: '2025-01-01T00:00:00.000Z',
+        modified: '2026-05-20T00:00:00.000Z',
+        '1.0.0': '2026-04-01T00:00:00.000Z',
+        '2.0.0': '2026-05-20T00:00:00.000Z',
+      },
+    }),
+    { days: 5, now, packageName: 'fixture' },
+  )
+  const npmBody = JSON.parse(npm.body.toString('utf8'))
+  assert.equal(npm.modified, true)
+  assert.equal(npm.stripped, 1)
+  assert.equal(npmBody.versions['2.0.0'], undefined)
+  assert.equal(npmBody['dist-tags'].latest, '1.0.0')
+
+  const pypi = filterPypiSimpleMetadataForCooldown(
+    JSON.stringify({
+      meta: { 'api-version': '1.0' },
+      name: 'requests',
+      files: [
+        { filename: 'requests-2.31.0.tar.gz', 'upload-time': '2026-04-01T00:00:00.000Z' },
+        { filename: 'requests-2.32.0.tar.gz', 'upload-time': '2026-05-20T00:00:00.000Z' },
+      ],
+    }),
+    { days: 5, now, packageName: 'requests' },
+  )
+  const pypiBody = JSON.parse(pypi.body.toString('utf8'))
+  assert.equal(pypi.modified, true)
+  assert.deepEqual(pypiBody.files.map((file) => file.filename), ['requests-2.31.0.tar.gz'])
+})
+
+test('package policy blocks locally denied package PURLs before artifact download', async () => {
+  const events = []
+  const policy = createPackagePolicy({
+    supplyChain: {
+      threatIntelligence: {
+        blockedPackages: ['pkg:npm/fixture@1.0.0'],
+      },
+    },
+    onEvent: (type, value) => events.push({ type, value }),
+  })
+  const decision = await policy.evaluatePackageFetch({
+    ecosystem: 'npm',
+    name: 'fixture',
+    version: '1.0.0',
+    purl: 'pkg:npm/fixture@1.0.0',
+  })
+
+  assert.equal(decision.allowed, false)
+  assert.equal(decision.reason, 'threat-intelligence')
+  assert.equal(events[0].type, 'supply_chain.threat_intel.blocked')
+})
+
+test('package policy can treat SFW lookup alerts as threat-intel blocks', async () => {
+  const policy = createPackagePolicy({
+    supplyChain: {
+      threatIntelligence: {
+        enabled: true,
+        blockPackageLookupAlerts: true,
+      },
+    },
+  })
+  const decision = await policy.evaluatePackageFetch(
+    {
+      ecosystem: 'npm',
+      name: 'fixture',
+      version: '1.0.0',
+      purl: 'pkg:npm/fixture@1.0.0',
+    },
+    {
+      packageLookup: {
+        provider: 'socket-free',
+        status: 'ok',
+        alerts: [{
+          action: 'block',
+          summary: 'Socket Firewall marked this package as malicious',
+          url: 'https://socket.dev/npm/package/fixture',
+        }],
+      },
+    },
+  )
+
+  assert.equal(decision.allowed, false)
+  assert.equal(decision.reason, 'threat-intelligence')
+  assert.equal(decision.source, 'socket-free')
+  assert.match(decision.summary, /malicious/)
+})
+
+test('Socket free package lookup parses NDJSON and caches PURLs for one TTL window', async () => {
+  let nowMs = 1000
+  const requested = []
+  const lookup = createSocketFreePackageLookup({
+    now: () => nowMs,
+    ttlMs: 60 * 60 * 1000,
+    fetchImpl: async (url, options) => {
+      requested.push({ url, method: options.method })
+      return {
+        ok: true,
+        status: 200,
+        async text() {
+          return `${JSON.stringify({ type: 'benign', purl: 'pkg:npm/lodash@4.17.21' })}\n`
+        },
+      }
+    },
+  })
+  const packageFetch = {
+    purl: 'pkg:npm/lodash@4.17.21',
+  }
+
+  const first = await lookup(packageFetch)
+  const cached = await lookup(packageFetch)
+  nowMs += 60 * 60 * 1000 + 1
+  const refreshed = await lookup(packageFetch)
+
+  assert.equal(requested.length, 2)
+  assert.deepEqual(requested.map((request) => request.url), [
+    'https://firewall-api.socket.dev/purl/pkg%3Anpm%2Flodash%404.17.21',
+    'https://firewall-api.socket.dev/purl/pkg%3Anpm%2Flodash%404.17.21',
+  ])
+  assert.equal(first.status, 'ok')
+  assert.equal(first.cached, false)
+  assert.deepEqual(first.alerts, [{ type: 'benign', purl: 'pkg:npm/lodash@4.17.21' }])
+  assert.equal(cached.status, 'ok')
+  assert.equal(cached.cached, true)
+  assert.equal(refreshed.status, 'ok')
+  assert.equal(refreshed.cached, false)
+})
+
+test('Socket free package lookup dedupes concurrent PURL checks', async () => {
+  let requests = 0
+  let resolveFetch
+  const fetchReady = new Promise((resolve) => {
+    resolveFetch = resolve
+  })
+  const lookup = createSocketFreePackageLookup({
+    fetchImpl: async () => {
+      requests += 1
+      await fetchReady
+      return {
+        ok: true,
+        status: 200,
+        async text() {
+          return ''
+        },
+      }
+    },
+  })
+
+  const first = lookup({ purl: 'pkg:npm/concurrent@1.0.0' })
+  const second = lookup({ purl: 'pkg:npm/concurrent@1.0.0' })
+  resolveFetch()
+  assert.equal(requests, 1)
+  assert.equal((await first).cached, false)
+  assert.equal((await second).cached, true)
 })
 
 test('version probes keep filesystem sandbox while skipping loopback port network rules', () => {
@@ -2222,6 +2570,280 @@ test('HTTPS CONNECT tunnels are filtered by allowedDomains', async () => {
   } finally {
     rmSync(profilePath, { force: true })
     await closeServer(server)
+  }
+})
+
+test('HTTP proxy emits package-fetch events without external registry traffic', async () => {
+  const upstream = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/octet-stream' })
+    res.end('benign test artifact\n')
+  })
+  const upstreamPort = await listenLoopback(upstream)
+  const events = []
+  const proxy = await startHttpProxy({
+    filter: async (host, port) => host === 'localhost' && port === upstreamPort,
+    onTraffic: (event) => events.push(event),
+    packageFetchDetector: ({ host, path }) => {
+      if (host !== 'localhost' || path !== '/fixture/-/fixture-1.0.0.tgz') return null
+      return {
+        ecosystem: 'npm',
+        registryHost: 'localhost',
+        name: 'fixture',
+        version: '1.0.0',
+        purl: 'pkg:npm/fixture@1.0.0',
+      }
+    },
+    packageFetchLookup: async (packageFetch) => ({
+      provider: 'socket-free',
+      status: 'ok',
+      cached: false,
+      alerts: [{ purl: packageFetch.purl, action: 'allow' }],
+    }),
+  })
+  const socket = await connectSocket({ host: '127.0.0.1', port: proxy.port })
+
+  try {
+    socket.write(
+      [
+        `GET http://localhost:${upstreamPort}/fixture/-/fixture-1.0.0.tgz HTTP/1.1`,
+        `Host: localhost:${upstreamPort}`,
+        'Connection: close',
+        '',
+        '',
+      ].join('\r\n'),
+    )
+    const chunks = []
+    for await (const chunk of socket) {
+      chunks.push(chunk)
+    }
+    assert.match(Buffer.concat(chunks).toString('utf8'), /200 OK/)
+    assert.deepEqual(
+      events.filter((event) => event.phase === 'package-fetch').map((event) => event.package),
+      [{
+        ecosystem: 'npm',
+        registryHost: 'localhost',
+        name: 'fixture',
+        version: '1.0.0',
+        purl: 'pkg:npm/fixture@1.0.0',
+      }],
+    )
+    assert.deepEqual(
+      events.filter((event) => event.phase === 'package-fetch').map((event) => event.packageLookup),
+      [{
+        provider: 'socket-free',
+        status: 'ok',
+        cached: false,
+        alerts: [{ purl: 'pkg:npm/fixture@1.0.0', action: 'allow' }],
+      }],
+    )
+  } finally {
+    socket.destroy()
+    await proxy.close()
+    await closeServer(upstream)
+  }
+})
+
+test('HTTP proxy blocks package fetches denied by package policy before upstream download', async () => {
+  let upstreamHits = 0
+  const upstream = createHttpServer((req, res) => {
+    upstreamHits += 1
+    res.writeHead(200, { 'content-type': 'application/octet-stream' })
+    res.end('should-not-reach-client\n')
+  })
+  const upstreamPort = await listenLoopback(upstream)
+  const events = []
+  const policy = createPackagePolicy({
+    supplyChain: {
+      threatIntelligence: {
+        blockedPackages: ['pkg:npm/fixture@1.0.0'],
+      },
+    },
+  })
+  const proxy = await startHttpProxy({
+    filter: async (host, port) => host === 'localhost' && port === upstreamPort,
+    onTraffic: (event) => events.push(event),
+    packagePolicy: policy,
+    packageFetchDetector: ({ host, path }) => {
+      if (host !== 'localhost' || path !== '/fixture/-/fixture-1.0.0.tgz') return null
+      return {
+        ecosystem: 'npm',
+        registryHost: 'localhost',
+        name: 'fixture',
+        version: '1.0.0',
+        purl: 'pkg:npm/fixture@1.0.0',
+      }
+    },
+  })
+  const socket = await connectSocket({ host: '127.0.0.1', port: proxy.port })
+
+  try {
+    socket.write(
+      [
+        `GET http://localhost:${upstreamPort}/fixture/-/fixture-1.0.0.tgz HTTP/1.1`,
+        `Host: localhost:${upstreamPort}`,
+        'Connection: close',
+        '',
+        '',
+      ].join('\r\n'),
+    )
+    const chunks = []
+    for await (const chunk of socket) {
+      chunks.push(chunk)
+    }
+    const response = Buffer.concat(chunks).toString('utf8')
+    assert.match(response, /403 Forbidden/)
+    assert.match(response, /Guard blocked package download/)
+    assert.equal(upstreamHits, 0)
+    assert.equal(events.some((event) => event.phase === 'package-blocked'), true)
+  } finally {
+    socket.destroy()
+    await proxy.close()
+    await closeServer(upstream)
+  }
+})
+
+test('HTTP proxy lets SFW lookup alerts feed explicit package-policy blocking', async () => {
+  let upstreamHits = 0
+  const upstream = createHttpServer((req, res) => {
+    upstreamHits += 1
+    res.writeHead(200, { 'content-type': 'application/octet-stream' })
+    res.end('should-not-reach-client\n')
+  })
+  const upstreamPort = await listenLoopback(upstream)
+  const events = []
+  const policy = createPackagePolicy({
+    supplyChain: {
+      threatIntelligence: {
+        enabled: true,
+        blockPackageLookupAlerts: true,
+      },
+    },
+  })
+  const proxy = await startHttpProxy({
+    filter: async (host, port) => host === 'localhost' && port === upstreamPort,
+    onTraffic: (event) => events.push(event),
+    packagePolicy: policy,
+    packageFetchLookup: async (packageFetch) => ({
+      provider: 'socket-free',
+      status: 'ok',
+      cached: false,
+      alerts: [{ purl: packageFetch.purl, action: 'block', summary: 'blocked by SFW' }],
+    }),
+    packageFetchDetector: ({ host, path }) => {
+      if (host !== 'localhost' || path !== '/fixture/-/fixture-1.0.0.tgz') return null
+      return {
+        ecosystem: 'npm',
+        registryHost: 'localhost',
+        name: 'fixture',
+        version: '1.0.0',
+        purl: 'pkg:npm/fixture@1.0.0',
+      }
+    },
+  })
+  const socket = await connectSocket({ host: '127.0.0.1', port: proxy.port })
+
+  try {
+    socket.write(
+      [
+        `GET http://localhost:${upstreamPort}/fixture/-/fixture-1.0.0.tgz HTTP/1.1`,
+        `Host: localhost:${upstreamPort}`,
+        'Connection: close',
+        '',
+        '',
+      ].join('\r\n'),
+    )
+    const chunks = []
+    for await (const chunk of socket) {
+      chunks.push(chunk)
+    }
+    const response = Buffer.concat(chunks).toString('utf8')
+    assert.match(response, /403 Forbidden/)
+    assert.equal(upstreamHits, 0)
+    assert.equal(events.some((event) => event.phase === 'package-blocked' && event.reason === 'threat-intelligence'), true)
+    assert.equal(events.some((event) => event.phase === 'package-fetch' && event.packageLookup?.provider === 'socket-free'), true)
+  } finally {
+    socket.destroy()
+    await proxy.close()
+    await closeServer(upstream)
+  }
+})
+
+test('HTTP proxy applies dependency cooldown metadata filtering', async () => {
+  let upstreamAccept = ''
+  const upstream = createHttpServer((req, res) => {
+    upstreamAccept = req.headers.accept || ''
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({
+      name: 'fixture',
+      'dist-tags': { latest: '2.0.0' },
+      versions: {
+        '1.0.0': { version: '1.0.0' },
+        '2.0.0': { version: '2.0.0' },
+      },
+      time: {
+        created: '2025-01-01T00:00:00.000Z',
+        modified: '2026-05-20T00:00:00.000Z',
+        '1.0.0': '2026-04-01T00:00:00.000Z',
+        '2.0.0': '2026-05-20T00:00:00.000Z',
+      },
+    }))
+  })
+  const upstreamPort = await listenLoopback(upstream)
+  const policyEvents = []
+  const basePolicy = createPackagePolicy({
+    supplyChain: {
+      dependencyCooldown: {
+        enabled: true,
+        days: 5,
+      },
+    },
+    now: () => new Date('2026-05-21T00:00:00.000Z'),
+    onEvent: (type, value) => policyEvents.push({ type, value }),
+  })
+  const packagePolicy = {
+    prepareMetadataRequest({ headers }) {
+      headers.accept = 'application/json'
+      headers['accept-encoding'] = 'identity'
+      return {
+        responsePolicy: {
+          type: 'dependency-cooldown',
+          ecosystem: 'npm',
+          name: 'fixture',
+        },
+      }
+    },
+    filterMetadataResponse: basePolicy.filterMetadataResponse,
+  }
+  const proxy = await startHttpProxy({
+    filter: async (host, port) => host === 'localhost' && port === upstreamPort,
+    packagePolicy,
+  })
+  const socket = await connectSocket({ host: '127.0.0.1', port: proxy.port })
+
+  try {
+    socket.write(
+      [
+        `GET http://localhost:${upstreamPort}/fixture HTTP/1.1`,
+        `Host: localhost:${upstreamPort}`,
+        'Connection: close',
+        '',
+        '',
+      ].join('\r\n'),
+    )
+    const chunks = []
+    for await (const chunk of socket) {
+      chunks.push(chunk)
+    }
+    const response = Buffer.concat(chunks).toString('utf8')
+    const body = JSON.parse(response.split('\r\n\r\n').at(-1))
+    assert.equal(upstreamAccept, 'application/json')
+    assert.equal(body.versions['2.0.0'], undefined)
+    assert.equal(body['dist-tags'].latest, '1.0.0')
+    assert.equal(policyEvents[0].type, 'supply_chain.dependency_cooldown.filtered')
+  } finally {
+    socket.destroy()
+    await proxy.close()
+    await closeServer(upstream)
   }
 })
 
@@ -5052,7 +5674,7 @@ test('GUARD_BANNER controls policy banner rendering', () => {
     },
   })
   expectOk(compact)
-  assert.match(compact.stderr, /^guard ok  net ask active  process children allowed, risky tools blocked  secrets protected  run=/)
+  assert.match(compact.stderr, /^guard ok  net ask active  pkg off  process children allowed, risky tools blocked  secrets protected  cmd=node scripts\/probe\.mjs env-json  run=/)
   assert.doesNotMatch(compact.stderr, /guard policy/)
   assert.doesNotMatch(compact.stderr, /✓ read/)
 
@@ -5066,6 +5688,7 @@ test('GUARD_BANNER controls policy banner rendering', () => {
   })
   expectOk(full)
   assert.match(full.stderr, /guard policy/)
+  assert.match(full.stderr, /packages/)
   assert.match(full.stderr, /✓ read/)
 
   const off = spawnSync(guard, command, {

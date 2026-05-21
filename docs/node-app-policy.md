@@ -12,6 +12,9 @@ This policy is intentionally fail-closed for user data and mounted volumes:
 - only paths listed in `allowRead` are reopened
 
 Do not create project configs with empty `denyRead` or broad home/volume reads.
+See [supply-chain-policy.md](supply-chain-policy.md) for the detailed package
+threat-intelligence, dependency cooldown, install sandbox, and install
+hardening reference.
 
 ```json
 {
@@ -95,18 +98,67 @@ For dependency installation or unknown package review, enable:
 {
   "supplyChain": {
     "installHardening": true,
+    "installSandbox": true,
+    "dependencyCooldown": { "enabled": true, "days": 5 },
+    "threatIntelligence": {
+      "blockedPackages": ["pkg:npm/safedep-test-pkg@1.0.0"]
+    },
     "sanitizeEnvironment": true
+  },
+  "network": {
+    "allowedDomains": ["registry.npmjs.org"],
+    "packageLookup": {
+      "provider": "socket-free",
+      "ttlMs": 3600000,
+      "timeoutMs": 5000
+    }
   }
 }
 ```
 
-That adds package-install oriented default denies for common stagers and
+`installHardening` adds package-install oriented default denies for common stagers and
 persistence paths: shells, `curl`/`wget`, `gh`, `git`, package-manager
 subprocesses, Python/Ruby/Perl helpers, `.github/workflows`, Git hooks, shell
 startup files, package credentials, and Python `.pth` startup files. Guard also
 injects package-manager environment defaults such as
 `NPM_CONFIG_IGNORE_SCRIPTS=true` and clears the inherited environment unless
 `supplyChain.sanitizeEnvironment` is set to `false`.
+
+`installSandbox` adds a PMG-style installation sandbox for package-manager
+install/download commands. It keeps normal `pnpm run dev` style commands on the
+profile's regular filesystem policy, but narrows install writes to package
+artifacts such as `node_modules`, lockfiles, project virtualenvs, and Guard's
+per-run home/temp directories. It also adds read denies for project and home
+credential files after broad project read grants, so install scripts cannot read
+`.env`, SSH keys, cloud credentials, package tokens, Git hooks, or similar
+sensitive files. Use `--install-sandbox` to force it for one run and
+`--install-sandbox-allow read=PATH|write=PATH|exec=PATH|domain=HOST` for a
+non-persistent exception.
+
+`threatIntelligence` blocks matching package PURLs before artifact download.
+Today this is wired through local block lists or an HTTP adapter endpoint, so a
+SafeDep Malysis adapter can be added without changing Guard's rule shape. Socket
+Firewall lookup can also feed this layer when `supplyChain.packageLookup` uses
+`provider: "socket-free"` and `blockPackageLookupAlerts` is enabled.
+`dependencyCooldown` filters npm and PyPI registry metadata in the built-in
+Guard proxy, removing versions published inside the configured cooldown window.
+`network.packageLookup.provider: "socket-free"` enables the undocumented free
+Socket package-URL lookup endpoint for artifact downloads. Guard sends the PURL,
+caches the NDJSON result for one hour by default, and attaches it to
+`package-fetch` events without using it as an automatic deny rule. Use
+`threatIntelligence.blockedPackages`, `blockPackageLookupAlerts: true`, or a
+threat-intelligence adapter when a package should be blocked deterministically.
+
+For pnpm, run installs as:
+
+```sh
+guard pnpm install
+```
+
+After `guard setup` or `guard install` installs shims, a plain `pnpm install`
+inside the managed code root goes through Guard automatically. The policy banner
+prints a `pkg ...` segment so the run is visibly using the install sandbox,
+blocklist/cooldown policy, and any observe-only Socket lookup cache.
 
 Add `process.denyByDefault` when a project should only launch the initial
 command plus a reviewed set of child processes. Add
