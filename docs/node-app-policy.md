@@ -101,7 +101,9 @@ For dependency installation or unknown package review, enable:
     "installSandbox": true,
     "dependencyCooldown": { "enabled": true, "days": 5 },
     "threatIntelligence": {
-      "blockedPackages": ["pkg:npm/safedep-test-pkg@1.0.0"]
+      "blockedPackages": ["pkg:npm/safedep-test-pkg@1.0.0"],
+      "blockPackageLookupAlerts": true,
+      "promptOnBlock": true
     },
     "sanitizeEnvironment": true
   },
@@ -140,6 +142,9 @@ Today this is wired through local block lists or an HTTP adapter endpoint, so a
 SafeDep Malysis adapter can be added without changing Guard's rule shape. Socket
 Firewall lookup can also feed this layer when `supplyChain.packageLookup` uses
 `provider: "socket-free"` and `blockPackageLookupAlerts` is enabled.
+Interactive runs ask before enforcing these known threat-intelligence blocks;
+Deny is the default, non-interactive runs deny, and packages with no known
+finding do not prompt.
 `dependencyCooldown` filters npm and PyPI registry metadata in the built-in
 Guard proxy, removing versions published inside the configured cooldown window.
 `network.packageLookup.provider: "socket-free"` enables the undocumented free

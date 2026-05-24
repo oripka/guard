@@ -8,11 +8,23 @@
   "supplyChain": {
     "installHardening": true,
     "sanitizeEnvironment": true,
-    "installSandbox": true
+    "installSandbox": true,
+    "threatIntelligence": {
+      "enabled": true,
+      "blockPackageLookupAlerts": true,
+      "promptOnBlock": true
+    }
   },
   "workingDirectory": "${GUARD_RUN_DIR}",
   "network": {
-    "allowedDomains": [],
+    "allowedDomains": [
+      "registry.npmjs.org"
+    ],
+    "packageLookup": {
+      "provider": "socket-free",
+      "ttlMs": 3600000,
+      "timeoutMs": 5000
+    },
     "deniedDomains": [],
     "allowLocalBinding": false,
     "allowLoopbackConnections": false,

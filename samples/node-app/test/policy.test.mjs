@@ -951,6 +951,40 @@ test('supply-chain install hardening denies package persistence writes and risky
   assert.match(profile, /\(deny file-write\*[\s\S]*\.zshrc/)
 })
 
+test('exploit hardening profile narrows debugging, kernel devices, persistence, and credentials', () => {
+  const profile = generateProfile(
+    {
+      hardening: {
+        denyDebugging: true,
+        denyPacketCapture: true,
+        denyKernelDeviceAccess: true,
+        denyRawSockets: true,
+        denyLaunchPersistenceWrites: true,
+        denyCredentialStores: true,
+      },
+      network: {},
+      filesystem: {
+        allowRead: [appRoot],
+        allowWrite: [appRoot],
+      },
+    },
+    {
+      cwd: appRoot,
+      projectDir: appRoot,
+      guardRunDir: join(appRoot, '.guard-run-test'),
+    },
+  )
+
+  assert.doesNotMatch(profile, /mach-priv-task-port/)
+  assert.doesNotMatch(profile, /process-info\*/)
+  assert.doesNotMatch(profile, /\(allow file-ioctl \(literal "\/dev\/dtracehelper"\)\)/)
+  assert.match(profile, /\(deny file-read\*[\s\S]*\/dev\/bpf/)
+  assert.match(profile, /\(deny file-write\*[\s\S]*\/dev\/dtrace/)
+  assert.match(profile, /\(deny file-write\*[\s\S]*Library\/LaunchAgents/)
+  assert.match(profile, /\(deny file-read\*[\s\S]*\.ssh/)
+  assert.match(profile, /\(deny file-write\*[\s\S]*\.aws/)
+})
+
 test('supply-chain install sandbox applies only to package installation commands', () => {
   assert.equal(isInstallSandboxCommand(['pnpm', 'install']), true)
   assert.equal(isInstallSandboxCommand(['npm', '--prefix', appRoot, 'ci']), true)
@@ -1223,6 +1257,49 @@ test('package policy can treat SFW lookup alerts as threat-intel blocks', async 
   assert.equal(decision.reason, 'threat-intelligence')
   assert.equal(decision.source, 'socket-free')
   assert.match(decision.summary, /malicious/)
+})
+
+test('package policy asks before enforcing interactive threat-intel blocks', async () => {
+  const events = []
+  const prompts = []
+  const policy = createPackagePolicy({
+    supplyChain: {
+      threatIntelligence: {
+        blockedPackages: ['pkg:npm/fixture@1.0.0'],
+      },
+    },
+    confirmBlock: async (pkg, decision) => {
+      prompts.push({ pkg, decision })
+      return { action: 'allow', duration: 'once' }
+    },
+    onEvent: (type, value) => events.push({ type, value }),
+  })
+  const decision = await policy.evaluatePackageFetch({
+    ecosystem: 'npm',
+    name: 'fixture',
+    version: '1.0.0',
+    purl: 'pkg:npm/fixture@1.0.0',
+  })
+
+  assert.equal(decision.allowed, true)
+  assert.equal(decision.reason, 'threat-intelligence-user-allow')
+  assert.equal(prompts.length, 1)
+  assert.equal(prompts[0].pkg.purl, 'pkg:npm/fixture@1.0.0')
+  assert.equal(events.some((event) => event.type === 'supply_chain.threat_intel.allowed_by_user'), true)
+  assert.equal(events.some((event) => event.type === 'supply_chain.threat_intel.blocked'), false)
+})
+
+test('default shim profiles enable controlled package lookup and prompt-on-block policy', () => {
+  const guardProfile = JSON.parse(readFileSync(resolve(repoRoot, 'profiles/guard.json'), 'utf8'))
+  const nodeDefaults = JSON.parse(readFileSync(resolve(repoRoot, 'templates/imports/node-app-defaults.json'), 'utf8'))
+  for (const cfg of [guardProfile, nodeDefaults]) {
+    assert.equal(cfg.network.packageLookup.provider, 'socket-free')
+    assert.equal(cfg.network.packageLookup.ttlMs, 3600000)
+    assert.equal(cfg.network.packageLookup.timeoutMs, 5000)
+    assert.equal(cfg.supplyChain.threatIntelligence.blockPackageLookupAlerts, true)
+    assert.equal(cfg.supplyChain.threatIntelligence.promptOnBlock, true)
+    assert.equal(cfg.network.allowedDomains.includes('registry.npmjs.org'), true)
+  }
 })
 
 test('Socket free package lookup parses NDJSON and caches PURLs for one TTL window', async () => {
@@ -5701,6 +5778,36 @@ test('GUARD_BANNER controls policy banner rendering', () => {
   })
   expectOk(off)
   assert.equal(off.stderr, '')
+})
+
+test('package-manager install commands get shim-safe package defaults even with legacy profiles', () => {
+  const tempRoot = mkdtempSync(join(appRoot, '.guard-test-pnpm-'))
+  const shimDir = join(tempRoot, 'shim')
+  const realBin = join(tempRoot, 'real')
+  mkdirSync(shimDir)
+  mkdirSync(realBin)
+  const fakePnpm = join(realBin, 'pnpm')
+  writeFileSync(fakePnpm, '#!/bin/sh\nexit 0\n')
+  chmodSync(fakePnpm, 0o755)
+  symlinkSync(guard, join(shimDir, 'pnpm'))
+  try {
+    const result = spawnSync(guard, ['pnpm', 'install', '--help'], {
+      cwd: appRoot,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${shimDir}:${realBin}:${process.env.PATH || ''}`,
+        GUARD_SHIM_DIRS: shimDir,
+        GUARD_COLOR: 'never',
+        GUARD_BANNER: 'compact',
+        NODE_GUARD_BYPASS: '1',
+      },
+    })
+    expectOk(result)
+    assert.match(result.stderr, /pkg install-sandbox blocklist lookup=socket-free cache=60m block/)
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
 })
 
 test('doctor reports the effective profile and runtime resolution', () => {

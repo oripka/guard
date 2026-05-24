@@ -36,6 +36,100 @@ That gives Guard three practical review surfaces today:
 - **Network**: constrain direct raw egress, route cooperative clients through
   HTTP/SOCKS proxy variables, and use `iron-proxy` for deeper HTTP/TLS policy.
 
+## Canonical Project Config
+
+A typical Node/Vite project can start with this `.guard/guard.json`. Guard
+resolves `${GUARD_PROJECT_DIR}` to the project root for each run and creates a
+fresh `${GUARD_RUN_DIR}` for temporary home, cache, proxy, and policy state.
+Profile files are strict JSON, so the notes are outside the snippet rather than
+inline comments.
+
+```json
+{
+  "imports": ["node-app-defaults"],
+  "network": {
+    "backend": "iron-proxy",
+    "ask": true,
+    "learnHttpRules": true,
+    "allowedDomains": ["registry.npmjs.org"],
+    "httpRules": [
+      {
+        "host": "api.openai.com",
+        "methods": ["POST"],
+        "paths": ["/v1/responses"]
+      }
+    ],
+    "allowedRawTcp": [
+      {
+        "host": "localhost",
+        "resolveAtLaunch": true,
+        "port": 8976,
+        "reason": "local OAuth callback"
+      }
+    ]
+  },
+  "filesystem": {
+    "allowRead": [
+      "${GUARD_PROJECT_DIR}",
+      "${GUARD_RUN_DIR}"
+    ],
+    "allowWrite": [
+      "${GUARD_PROJECT_DIR}",
+      "${GUARD_RUN_DIR}"
+    ],
+    "denyWrite": [".env", ".env.*", "secrets/", "*.key", "*.pem"]
+  },
+  "process": {
+    "denyByDefault": true,
+    "allowedExecutables": [
+      "/usr/bin/env",
+      "/bin/sh",
+      "/opt/homebrew/bin/node",
+      "/opt/homebrew/bin/pnpm",
+      "${GUARD_PROJECT_DIR}/node_modules/.bin/*"
+    ]
+  }
+}
+```
+
+Run the app through Guard:
+
+```sh
+guard pnpm install
+guard --ask-network pnpm run dev
+```
+
+At launch, Guard expands the dynamic paths before writing the sandbox profile:
+
+```text
+${GUARD_PROJECT_DIR} -> /Users/alex/code/my-project
+${GUARD_RUN_DIR}     -> /private/tmp/guard/run-<id>
+```
+
+This keeps the normal developer loop readable:
+
+- `imports: ["node-app-defaults"]` pulls in the standard project sandbox. Guard
+  dynamically wires the real project root into `${GUARD_PROJECT_DIR}` and a new
+  per-run scratch area into `${GUARD_RUN_DIR}`, then reopens only those paths by
+  default. Broad home and volume reads stay denied, localhost dev-server binding
+  is allowed, and package installs get the safer default install policy.
+- `network.allowedDomains` allows coarse proxied egress, such as npm registry
+  fetches. Direct raw sockets still stay constrained by the sandbox, so a tool
+  cannot bypass the domain policy just by opening its own socket.
+- `network.httpRules` is the path-based egress policy. The example allows only
+  `POST https://api.openai.com/v1/responses`; other API paths can prompt, deny,
+  or require a separate reviewed rule.
+- `network.allowedRawTcp` is only for narrow loopback exceptions that cannot use
+  the proxy path. Host rules must opt into launch-time resolution so the actual
+  `ip:port` rule is visible for the run.
+- `filesystem` keeps the checked-out project writable through
+  `${GUARD_PROJECT_DIR}` and gives tools a disposable workspace through
+  `${GUARD_RUN_DIR}`. Common secret file writes such as `.env`, private keys,
+  and `secrets/` still stay blocked.
+- `process.denyByDefault` makes child process execution explicit. Add each real
+  interpreter or project tool your `pnpm run dev` command needs; omit the
+  `process` block while you are still discovering a project's helper commands.
+
 Guard is not currently a system-wide Little Snitch replacement. Apps that are
 not launched through Guard are outside Guard's enforcement boundary unless they
 voluntarily use Guard's proxy settings. The native monitor, daemon, and Network
@@ -513,20 +607,30 @@ Package installs can opt into PMG-style controls in `.guard/guard.json`:
     "installSandbox": true,
     "dependencyCooldown": { "enabled": true, "days": 5 },
     "threatIntelligence": {
-      "blockedPackages": ["pkg:npm/safedep-test-pkg@1.0.0"]
+      "blockedPackages": ["pkg:npm/safedep-test-pkg@1.0.0"],
+      "blockPackageLookupAlerts": true,
+      "promptOnBlock": true
     }
   },
   "network": {
     "allowedDomains": ["registry.npmjs.org"],
-    "packageLookup": { "provider": "socket-free" }
+    "packageLookup": {
+      "provider": "socket-free",
+      "ttlMs": 3600000,
+      "timeoutMs": 5000
+    }
   }
 }
 ```
 
 `installSandbox` narrows package-manager writes during `pnpm install`,
 `npm install`, `pip install`, and similar install/download commands.
-`threatIntelligence` blocks known-bad package PURLs before artifact download
+`threatIntelligence` handles known-bad package PURLs before artifact download
 using local rules, Socket lookup alerts when configured, or an adapter endpoint.
+Interactive Guard runs ask before enforcing those known threat-intelligence
+blocks; Deny is the default, non-interactive runs deny, and safe packages do not
+prompt. The default shim profiles enable `socket-free` lookup with a one-hour
+cache and five-second timeout for npm registry installs.
 `dependencyCooldown` filters npm and PyPI metadata so freshly published versions
 inside the cooldown window are not selected. See
 [docs/supply-chain-policy.md](docs/supply-chain-policy.md) for the full schema,
@@ -970,6 +1074,33 @@ The Linux backend is intentionally narrower than the macOS backend today:
 - `network.linuxBackend: "host-proxy"` enables Guard proxy/domain allowlists, HTTP rules, `iron-proxy` TLS inspection, and `allowedRawTcp` for proxy-aware clients while keeping filesystem containment
 - `network.linuxBackend: "policy-helper"` creates a Linux network namespace, connects it through a veth pair to Guard's proxy, installs nftables allow rules for the proxy and `allowedRawTcp`, and records nftables denial counters as `sandbox.denial` events
 - `policy-helper` requires root plus `ip` and `nft`; use `host-proxy` when those privileges are unavailable and direct-socket kernel blocking is not required
+
+Profiles can also opt into exploit-surface hardening for guarded processes:
+
+```json
+{
+  "hardening": {
+    "denyDebugging": true,
+    "denyPacketCapture": true,
+    "denyKernelDeviceAccess": true,
+    "denyRawSockets": true,
+    "denyLaunchPersistenceWrites": true,
+    "denyCredentialStores": true
+  }
+}
+```
+
+This is defense in depth, not a kernel-exploit guarantee. Today Guard maps these
+flags onto existing profile controls: same-sandbox debugging allowances are
+withheld, packet-capture/kernel device paths are denied, launch-persistence
+locations are write-denied, and common credential stores are denied after broad
+read allows. `denyRawSockets` records the policy intent; direct raw egress is
+already denied by the default macOS sandbox and by Linux denied-network or
+`policy-helper` modes. Linux syscall filtering for exploit-prone primitives such
+as `bpf`, `perf_event_open`, `userfaultfd`, `io_uring_setup`, `ptrace`,
+`kexec_load`, module loading, `mount`, risky namespace creation, and raw socket
+creation still needs a dedicated seccomp backend before Guard can enforce those
+syscall-level denials.
 
 The native runtime now lives in:
 

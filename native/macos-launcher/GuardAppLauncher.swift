@@ -74,6 +74,66 @@ struct GuardAskHttpPolicyInput: Decodable {
     let parentChain: String?
 }
 
+struct GuardPackageIdentity: Decodable {
+    let ecosystem: String?
+    let name: String?
+    let version: String?
+    let purl: String?
+}
+
+struct GuardPackagePolicyDecisionInput: Decodable {
+    let reason: String?
+    let summary: String?
+    let source: String?
+    let referenceUrl: String?
+}
+
+struct GuardPackagePolicyRequestInput: Decodable {
+    let protocolName: String?
+    let transport: String?
+    let host: String?
+    let port: Int?
+    let method: String?
+    let path: String?
+
+    enum CodingKeys: String, CodingKey {
+        case protocolName = "protocol"
+        case transport
+        case host
+        case port
+        case method
+        case path
+    }
+}
+
+struct GuardAskPackagePolicyInput: Decodable {
+    let packageInfo: GuardPackageIdentity
+    let decision: GuardPackagePolicyDecisionInput
+    let request: GuardPackagePolicyRequestInput?
+    let profile: String?
+    let projectDir: String?
+    let runDir: String?
+    let command: String?
+    let launcherApp: String?
+    let launcherProcess: String?
+    let launcherPid: Int?
+    let parentChain: String?
+
+    enum CodingKeys: String, CodingKey {
+        case packageInfo = "package"
+        case decision
+        case request
+        case profile
+        case projectDir
+        case runDir
+        case command
+        case launcherApp
+        case launcherProcess
+        case launcherPid
+        case parentChain
+    }
+}
+
 struct GuardAskDecision: Encodable {
     let action: String
     let rule: GuardHttpPolicyRule?
@@ -335,9 +395,14 @@ final class GuardApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNot
     }
 }
 
-final class GuardStatusItemController: NSObject {
+protocol GuardMenuHighlighting: AnyObject {
+    func setHighlighted(_ highlighted: Bool)
+}
+
+final class GuardStatusItemController: NSObject, NSMenuDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     let popover = NSPopover()
+    let statusMenu = NSMenu()
     weak var monitor: MonitorWindowController?
     let modeLabel = NSTextField(labelWithString: "Monitoring")
     let modeValueLabel = NSTextField(labelWithString: "0 allowed, 0 denied")
@@ -352,7 +417,8 @@ final class GuardStatusItemController: NSObject {
     let recentStack = NSStackView()
     let deniedBadgeLabel = NSTextField(labelWithString: "0")
     let deniedRow = NSButton()
-    let popoverContentWidth: CGFloat = 286
+    let popoverContentWidth: CGFloat = 312
+    let menuContentInset: CGFloat = 16
     var lastNotifiedPendingCount = 0
     var seenSandboxDenialKeys: Set<String> = []
     var didPrimeSandboxDenials = false
@@ -370,14 +436,33 @@ final class GuardStatusItemController: NSObject {
             button.imagePosition = .imageOnly
             button.imageScaling = .scaleProportionallyDown
             button.contentTintColor = statusItemTintColor(active: false)
-            button.target = self
-            button.action = #selector(togglePopover(_:))
             button.toolTip = "Guard Monitor"
         }
+        statusMenu.autoenablesItems = false
+        statusMenu.delegate = self
+        statusItem.menu = statusMenu
+        populateStatusMenu()
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 310, height: 382)
+        popover.contentSize = NSSize(width: 336, height: 392)
         popover.contentViewController = NSViewController()
         popover.contentViewController?.view = makePopoverView()
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        refresh()
+        populateStatusMenu()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        for item in menu.items {
+            (item.view as? GuardMenuHighlighting)?.setHighlighted(false)
+        }
+    }
+
+    func menu(_ menu: NSMenu, willHighlight item: NSMenuItem?) {
+        for menuItem in menu.items {
+            (menuItem.view as? GuardMenuHighlighting)?.setHighlighted(menuItem == item && menuItem.isEnabled)
+        }
     }
 
     @available(macOS 11.0, *)
@@ -413,16 +498,15 @@ final class GuardStatusItemController: NSObject {
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .width
-        root.spacing = 6
-        root.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+        root.spacing = 8
+        root.edgeInsets = NSEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
         root.translatesAutoresizingMaskIntoConstraints = false
         background.addSubview(root)
         NSLayoutConstraint.activate([
-            root.leadingAnchor.constraint(equalTo: background.leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: background.trailingAnchor),
-            root.topAnchor.constraint(equalTo: background.topAnchor),
-            root.bottomAnchor.constraint(equalTo: background.bottomAnchor),
-            root.widthAnchor.constraint(equalToConstant: popoverContentWidth)
+            root.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 12),
+            root.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -12),
+            root.topAnchor.constraint(equalTo: background.topAnchor, constant: 12),
+            root.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -12),
         ])
 
         root.addArrangedSubview(popoverHeader())
@@ -433,6 +517,7 @@ final class GuardStatusItemController: NSObject {
         recentTitle.font = NSFont.systemFont(ofSize: 11, weight: .medium)
         recentTitle.textColor = .secondaryLabelColor
         recentTitle.alignment = .left
+        recentTitle.maximumNumberOfLines = 1
         recentTitle.translatesAutoresizingMaskIntoConstraints = false
         recentTitle.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
         root.addArrangedSubview(recentTitle)
@@ -453,97 +538,231 @@ final class GuardStatusItemController: NSObject {
         return background
     }
 
-    func popoverHeader() -> NSView {
+    func populateStatusMenu() {
+        statusMenu.removeAllItems()
+        let buckets = monitor?.trafficSparkline.buckets ?? []
+        let hasTraffic = buckets.contains { $0.allowed > 0 || $0.denied > 0 }
+
+        statusMenu.addItem(viewMenuItem(compactHeader(), height: 34, inset: 40))
+        statusMenu.addItem(infoItem(daemonBadgeLabel.stringValue, symbol: "bolt.horizontal.circle.fill"))
+        statusMenu.addItem(infoItem(extensionBadgeLabel.stringValue, symbol: "shield.lefthalf.filled"))
+        statusMenu.addItem(infoItem("\(allowedPillLabel.stringValue) allowed", symbol: "checkmark.circle"))
+        statusMenu.addItem(infoItem("\(deniedPillLabel.stringValue) denied", symbol: "xmark.circle"))
+        if hasTraffic {
+            statusMenu.addItem(viewMenuItem(trafficSummary(), height: 104, inset: 8))
+        }
+        statusMenu.addItem(.separator())
+        statusMenu.addItem(viewMenuItem(sectionLabel("Recent Network Activity"), height: 18, inset: 40))
+
+        let recentEvents = monitor?.events.filter { event in
+            event.type == "network.decision" ||
+                event.type == "sandbox.denial" ||
+                event.type.hasPrefix("guard.alert.") ||
+                (!event.host.isEmpty && event.result != "inactive")
+        }.prefix(4) ?? []
+
+        if recentEvents.isEmpty {
+            statusMenu.addItem(viewMenuItem(emptyRecentRow(), height: 24, inset: menuContentInset))
+        } else {
+            for event in recentEvents {
+                statusMenu.addItem(viewMenuItem(recentActivityRow(event), height: 34, inset: menuContentInset))
+            }
+        }
+
+        statusMenu.addItem(.separator())
+        let deniedTitle = deniedBadgeLabel.stringValue == "0" ? "Recently Denied" : "Recently Denied (\(deniedBadgeLabel.stringValue))"
+        statusMenu.addItem(menuItem(deniedTitle, symbol: "xmark.octagon", action: #selector(openDenied(_:))))
+        statusMenu.addItem(.separator())
+        statusMenu.addItem(menuItem("Open Monitor", symbol: "rectangle.3.group", action: #selector(openMonitor(_:)), keyEquivalent: "0"))
+        statusMenu.addItem(menuItem("Manage Rules...", symbol: "list.bullet.rectangle", action: #selector(openRules(_:)), keyEquivalent: "1"))
+        statusMenu.addItem(menuItem("Guard Settings...", symbol: "gearshape", action: #selector(openSettings(_:)), keyEquivalent: ","))
+    }
+
+    func viewMenuItem(_ view: NSView, height: CGFloat, inset: CGFloat = 0) -> NSMenuItem {
+        let item = NSMenuItem()
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: popoverContentWidth, height: height))
+        container.translatesAutoresizingMaskIntoConstraints = false
+        view.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(view)
+        NSLayoutConstraint.activate([
+            container.widthAnchor.constraint(equalToConstant: popoverContentWidth),
+            container.heightAnchor.constraint(greaterThanOrEqualToConstant: height),
+            view.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: inset),
+            view.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -inset),
+            view.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            view.topAnchor.constraint(greaterThanOrEqualTo: container.topAnchor),
+            view.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor),
+        ])
+        item.view = container
+        item.isEnabled = false
+        return item
+    }
+
+    func menuItem(_ title: String, symbol: String, action: Selector, keyEquivalent: String = "") -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
+        item.target = self
+        item.isEnabled = true
+        if let image = menuSymbol(symbol) {
+            item.image = image
+        }
+        return item
+    }
+
+    func infoItem(_ title: String, symbol: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        if let image = menuSymbol(symbol) {
+            item.image = image
+        }
+        return item
+    }
+
+    func menuSymbol(_ symbol: String) -> NSImage? {
+        if #available(macOS 11.0, *) {
+            let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+            let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(config)
+            image?.isTemplate = true
+            return image
+        }
+        return nil
+    }
+
+    func sectionLabel(_ title: String) -> NSView {
+        let label = NSTextField(labelWithString: title)
+        label.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        label.textColor = .secondaryLabelColor
+        label.alignment = .left
+        label.maximumNumberOfLines = 1
+        return label
+    }
+
+    func compactHeader() -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 8
 
+        modeLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        modeLabel.textColor = .labelColor
+        modeLabel.maximumNumberOfLines = 1
+
+        modeValueLabel.font = NSFont.systemFont(ofSize: 11)
+        modeValueLabel.textColor = .secondaryLabelColor
+        modeValueLabel.lineBreakMode = .byTruncatingTail
+        modeValueLabel.maximumNumberOfLines = 1
+
+        let labels = NSStackView(views: [modeLabel, modeValueLabel])
+        labels.orientation = .vertical
+        labels.alignment = .leading
+        labels.spacing = 0
+        labels.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        row.addArrangedSubview(labels)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(headerIconButton("bell.badge", action: #selector(openSettings(_:)), tooltip: "Alert settings"))
+        row.addArrangedSubview(headerIconButton("network", action: #selector(openMonitor(_:)), tooltip: "Open live monitor"))
+        return row
+    }
+
+    func popoverHeader() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+
         row.addArrangedSubview(symbolImage("shield.lefthalf.filled", tint: .controlAccentColor, size: 16, weight: .regular))
         let labelStack = NSStackView()
         labelStack.orientation = .vertical
-        labelStack.spacing = 0
+        labelStack.spacing = 1
         modeLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
         modeLabel.textColor = .labelColor
         modeValueLabel.font = NSFont.systemFont(ofSize: 11)
         modeValueLabel.textColor = .secondaryLabelColor
         modeValueLabel.lineBreakMode = .byTruncatingTail
+        modeLabel.maximumNumberOfLines = 1
+        modeValueLabel.maximumNumberOfLines = 1
+        labelStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         labelStack.addArrangedSubview(modeLabel)
         labelStack.addArrangedSubview(modeValueLabel)
         row.addArrangedSubview(labelStack)
         row.addArrangedSubview(NSView())
 
-        row.addArrangedSubview(iconButton("bell.slash", action: #selector(openSettings(_:)), tint: .secondaryLabelColor, tooltip: "Alert settings"))
+        row.addArrangedSubview(iconButton("bell.badge", action: #selector(openSettings(_:)), tint: .secondaryLabelColor, tooltip: "Alert settings"))
         row.addArrangedSubview(iconButton("network", action: #selector(openMonitor(_:)), tint: .secondaryLabelColor, tooltip: "Open live monitor"))
-        row.addArrangedSubview(iconButton("xmark", action: #selector(closePopover(_:)), tint: .secondaryLabelColor, tooltip: "Close"))
         return row
     }
 
     func statusBadgeRow() -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+        stack.addArrangedSubview(statusLine(daemonBadgeLabel, symbol: "bolt.horizontal.circle.fill"))
+        stack.addArrangedSubview(statusLine(extensionBadgeLabel, symbol: "shield.lefthalf.filled"))
+        return stack
+    }
+
+    func statusLine(_ label: NSTextField, symbol: String) -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 6
-        row.addArrangedSubview(statusBadge(daemonBadgeLabel, symbol: "bolt.horizontal.circle.fill", width: 126))
-        row.addArrangedSubview(statusBadge(extensionBadgeLabel, symbol: "shield.lefthalf.filled", width: 162))
-        return row
-    }
-
-    func statusBadge(_ label: NSTextField, symbol: String, width: CGFloat) -> NSView {
-        let badge = NSStackView()
-        badge.orientation = .horizontal
-        badge.alignment = .centerY
-        badge.spacing = 5
-        badge.edgeInsets = NSEdgeInsets(top: 3, left: 7, bottom: 3, right: 7)
-        badge.wantsLayer = true
-        badge.layer?.cornerRadius = 6
-        badge.layer?.cornerCurve = .continuous
-        badge.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.18).cgColor
-        badge.translatesAutoresizingMaskIntoConstraints = false
-        badge.widthAnchor.constraint(equalToConstant: width).isActive = true
-        badge.addArrangedSubview(symbolImage(symbol, tint: .secondaryLabelColor, size: 10, weight: .regular))
+        row.spacing = 0
+        row.addArrangedSubview(customRowSymbol(symbol, tint: .secondaryLabelColor))
         label.font = NSFont.systemFont(ofSize: 11)
         label.textColor = .secondaryLabelColor
         label.lineBreakMode = .byTruncatingTail
         label.maximumNumberOfLines = 1
-        badge.addArrangedSubview(label)
-        return badge
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(label)
+        return row
     }
 
     func trafficSummary() -> NSView {
+        let buckets = monitor?.trafficSparkline.buckets ?? []
+        let hasTraffic = buckets.contains { $0.allowed > 0 || $0.denied > 0 }
         let card = NSStackView()
         card.orientation = .vertical
         card.alignment = .width
-        card.spacing = 6
-        card.edgeInsets = NSEdgeInsets(top: 8, left: 9, bottom: 8, right: 9)
-        card.wantsLayer = true
-        card.layer?.cornerRadius = 8
-        card.layer?.cornerCurve = .continuous
-        card.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.14).cgColor
-        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.18).cgColor
-        card.layer?.borderWidth = 0.5
+        card.spacing = hasTraffic ? 8 : 0
+        card.edgeInsets = hasTraffic
+            ? NSEdgeInsets(top: 9, left: 10, bottom: 9, right: 10)
+            : NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+        if hasTraffic {
+            card.wantsLayer = true
+            card.layer?.cornerRadius = 8
+            card.layer?.cornerCurve = .continuous
+            card.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.20).cgColor
+            card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.22).cgColor
+            card.layer?.borderWidth = 0.5
+        }
 
         let metrics = NSStackView()
         metrics.orientation = .horizontal
         metrics.alignment = .centerY
-        metrics.spacing = 12
+        metrics.spacing = 18
         metrics.addArrangedSubview(metricLabel(label: allowedPillLabel, symbol: "checkmark.circle", tint: .systemGreen))
         metrics.addArrangedSubview(metricLabel(label: deniedPillLabel, symbol: "xmark.circle", tint: .systemRed))
         metrics.addArrangedSubview(NSView())
         card.addArrangedSubview(metrics)
 
-        sparkline.heightAnchor.constraint(equalToConstant: 36).isActive = true
-        card.addArrangedSubview(sparkline)
+        if hasTraffic {
+            trafficTimeline.arrangedSubviews.forEach { view in
+                trafficTimeline.removeArrangedSubview(view)
+                view.removeFromSuperview()
+            }
+            sparkline.heightAnchor.constraint(equalToConstant: 38).isActive = true
+            card.addArrangedSubview(sparkline)
 
-        trafficTimeline.orientation = .horizontal
-        trafficEmptyLabel.font = NSFont.systemFont(ofSize: 10)
-        trafficEmptyLabel.textColor = .tertiaryLabelColor
-        trafficNowLabel.font = NSFont.systemFont(ofSize: 10)
-        trafficNowLabel.textColor = .tertiaryLabelColor
-        trafficTimeline.addArrangedSubview(trafficEmptyLabel)
-        trafficTimeline.addArrangedSubview(NSView())
-        trafficTimeline.addArrangedSubview(trafficNowLabel)
-        card.addArrangedSubview(trafficTimeline)
+            trafficTimeline.orientation = .horizontal
+            trafficEmptyLabel.font = NSFont.systemFont(ofSize: 10)
+            trafficEmptyLabel.textColor = .tertiaryLabelColor
+            trafficNowLabel.font = NSFont.systemFont(ofSize: 10)
+            trafficNowLabel.textColor = .tertiaryLabelColor
+            trafficTimeline.addArrangedSubview(trafficEmptyLabel)
+            trafficTimeline.addArrangedSubview(NSView())
+            trafficTimeline.addArrangedSubview(trafficNowLabel)
+            card.addArrangedSubview(trafficTimeline)
+        }
         return card
     }
 
@@ -551,8 +770,8 @@ final class GuardStatusItemController: NSObject {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 5
-        row.addArrangedSubview(symbolImage(symbol, tint: tint, size: 11, weight: .regular))
+        row.spacing = 0
+        row.addArrangedSubview(customRowSymbol(symbol, tint: tint))
         label.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
         label.textColor = .labelColor
         row.addArrangedSubview(label)
@@ -567,6 +786,7 @@ final class GuardStatusItemController: NSObject {
         deniedRow.wantsLayer = true
         deniedRow.layer?.cornerRadius = 6
         deniedRow.layer?.cornerCurve = .continuous
+        deniedRow.layer?.backgroundColor = NSColor.clear.cgColor
         deniedRow.contentTintColor = .labelColor
         deniedRow.translatesAutoresizingMaskIntoConstraints = false
         deniedRow.heightAnchor.constraint(equalToConstant: 30).isActive = true
@@ -576,7 +796,7 @@ final class GuardStatusItemController: NSObject {
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 8
-        row.edgeInsets = NSEdgeInsets(top: 0, left: 6, bottom: 0, right: 4)
+        row.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 8)
         row.translatesAutoresizingMaskIntoConstraints = false
         deniedRow.addSubview(row)
         NSLayoutConstraint.activate([
@@ -599,6 +819,7 @@ final class GuardStatusItemController: NSObject {
 
         let label = NSTextField(labelWithString: "Recently Denied")
         label.font = NSFont.systemFont(ofSize: 13)
+        label.textColor = .labelColor
         row.addArrangedSubview(label)
         row.addArrangedSubview(NSView())
         row.addArrangedSubview(symbolImage("chevron.right", tint: .tertiaryLabelColor, size: 10, weight: .regular))
@@ -606,21 +827,23 @@ final class GuardStatusItemController: NSObject {
     }
 
     func menuAction(_ title: String, symbol: String, action: Selector) -> NSButton {
-        let button = NSButton()
+        let button = GuardPopoverButton()
         button.title = ""
         button.target = self
         button.action = action
         button.isBordered = false
-        button.wantsLayer = false
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 6
+        button.layer?.cornerCurve = .continuous
         button.translatesAutoresizingMaskIntoConstraints = false
-        button.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 28).isActive = true
         button.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
 
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 0
-        row.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+        row.spacing = 8
+        row.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 8)
         row.translatesAutoresizingMaskIntoConstraints = false
         button.addSubview(row)
         NSLayoutConstraint.activate([
@@ -630,27 +853,49 @@ final class GuardStatusItemController: NSObject {
             row.bottomAnchor.constraint(equalTo: button.bottomAnchor)
         ])
 
+        row.addArrangedSubview(symbolImage(symbol, tint: .secondaryLabelColor, size: 13, weight: .regular))
         let label = NSTextField(labelWithString: title)
         label.font = NSFont.systemFont(ofSize: 13)
         label.textColor = .labelColor
         label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
         row.addArrangedSubview(label)
         row.addArrangedSubview(NSView())
+        row.addArrangedSubview(symbolImage("chevron.right", tint: .tertiaryLabelColor, size: 9, weight: .regular))
         return button
     }
 
     func iconButton(_ symbol: String, action: Selector, tint: NSColor, tooltip: String) -> NSButton {
         let button = NSButton()
-        button.isBordered = true
+        button.isBordered = false
         button.target = self
         button.action = action
         button.toolTip = tooltip
         button.image = symbolImage(symbol, tint: tint, size: 16, weight: .regular).image
         button.imagePosition = .imageOnly
-        button.bezelStyle = .texturedRounded
+        button.bezelStyle = .regularSquare
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 5
+        button.layer?.cornerCurve = .continuous
+        button.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.16).cgColor
         button.translatesAutoresizingMaskIntoConstraints = false
-        button.widthAnchor.constraint(equalToConstant: 26).isActive = true
+        button.widthAnchor.constraint(equalToConstant: 24).isActive = true
         button.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        return button
+    }
+
+    func headerIconButton(_ symbol: String, action: Selector, tooltip: String) -> NSButton {
+        let button = NSButton()
+        button.isBordered = false
+        button.target = self
+        button.action = action
+        button.toolTip = tooltip
+        button.image = symbolImage(symbol, tint: .secondaryLabelColor, size: 15, weight: .regular).image
+        button.imagePosition = .imageOnly
+        button.bezelStyle = .regularSquare
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 20).isActive = true
         return button
     }
 
@@ -773,35 +1018,32 @@ final class GuardStatusItemController: NSObject {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 7
-        row.edgeInsets = NSEdgeInsets(top: 1, left: 0, bottom: 1, right: 0)
-        row.translatesAutoresizingMaskIntoConstraints = false
-        row.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
-
+        row.spacing = 0
+        row.edgeInsets = NSEdgeInsets(top: 2, left: 0, bottom: 2, right: 0)
         let denied = event.result == "deny" || event.result == "denied"
-        row.addArrangedSubview(miniSymbolCircle(denied ? "xmark.shield.fill" : "checkmark.shield.fill", tint: denied ? .systemRed : .systemBlue))
+        row.addArrangedSubview(customRowSymbol(denied ? "xmark.shield.fill" : "checkmark.shield.fill", tint: denied ? .systemRed : .systemBlue))
 
         let text = NSStackView()
         text.orientation = .vertical
         text.alignment = .leading
-        text.spacing = 0
+        text.spacing = 1
         text.translatesAutoresizingMaskIntoConstraints = false
-        text.widthAnchor.constraint(equalToConstant: popoverContentWidth - 28).isActive = true
+        text.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let title = NSTextField(labelWithString: compactActorLabel(for: event))
         title.font = NSFont.systemFont(ofSize: 12.5, weight: .semibold)
-        title.maximumNumberOfLines = 2
-        title.lineBreakMode = .byWordWrapping
+        title.maximumNumberOfLines = 1
+        title.lineBreakMode = .byTruncatingTail
         title.alignment = .left
         title.translatesAutoresizingMaskIntoConstraints = false
-        title.widthAnchor.constraint(equalToConstant: popoverContentWidth - 28).isActive = true
+        title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let detail = NSTextField(labelWithString: compactDestinationLabel(for: event))
         detail.font = NSFont.systemFont(ofSize: 11)
         detail.textColor = denied ? .systemRed : .secondaryLabelColor
-        detail.maximumNumberOfLines = 2
+        detail.maximumNumberOfLines = 1
         detail.lineBreakMode = .byTruncatingMiddle
         detail.alignment = .left
         detail.translatesAutoresizingMaskIntoConstraints = false
-        detail.widthAnchor.constraint(equalToConstant: popoverContentWidth - 28).isActive = true
+        detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         text.addArrangedSubview(title)
         text.addArrangedSubview(detail)
         row.addArrangedSubview(text)
@@ -812,6 +1054,8 @@ final class GuardStatusItemController: NSObject {
         let label = NSTextField(labelWithString: "No recent network activity")
         label.font = NSFont.systemFont(ofSize: 13)
         label.textColor = .tertiaryLabelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
         return label
     }
 
@@ -832,6 +1076,32 @@ final class GuardStatusItemController: NSObject {
             image.centerYAnchor.constraint(equalTo: holder.centerYAnchor)
         ])
         return holder
+    }
+
+    func customRowSymbol(_ symbol: String, tint: NSColor) -> NSView {
+        let slot = NSView()
+        slot.translatesAutoresizingMaskIntoConstraints = false
+        slot.widthAnchor.constraint(equalToConstant: 31).isActive = true
+        slot.heightAnchor.constraint(equalToConstant: 18).isActive = true
+
+        let imageView = NSImageView()
+        if #available(macOS 11.0, *) {
+            let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+            let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(config)
+            image?.isTemplate = true
+            imageView.image = image
+        }
+        imageView.contentTintColor = tint
+        imageView.imageScaling = .scaleProportionallyDown
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        slot.addSubview(imageView)
+        NSLayoutConstraint.activate([
+            imageView.leadingAnchor.constraint(equalTo: slot.leadingAnchor),
+            imageView.centerYAnchor.constraint(equalTo: slot.centerYAnchor),
+        ])
+        imageView.widthAnchor.constraint(equalToConstant: 18).isActive = true
+        imageView.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        return slot
     }
 
     func compactActorLabel(for event: GuardMonitorEvent) -> String {
@@ -979,7 +1249,9 @@ final class GuardStatusItemController: NSObject {
         if popover.isShown {
             popover.performClose(sender)
         } else {
+            popover.contentSize = NSSize(width: 336, height: 392)
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.makeKey()
         }
     }
 
@@ -1009,6 +1281,62 @@ final class GuardStatusItemController: NSObject {
         monitor?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         popover.performClose(sender)
+    }
+}
+
+final class GuardPopoverButton: NSButton {
+    private var trackingAreaRef: NSTrackingArea?
+    private var isHovering = false {
+        didSet { updateBackground() }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        updateBackground()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingAreaRef {
+            removeTrackingArea(trackingAreaRef)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        trackingAreaRef = area
+        addTrackingArea(area)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovering = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovering = false
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        layer?.backgroundColor = NSColor.selectedContentBackgroundColor.withAlphaComponent(0.28).cgColor
+        super.mouseDown(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        super.mouseUp(with: event)
+        updateBackground()
+    }
+
+    private func updateBackground() {
+        layer?.backgroundColor = (isHovering
+            ? NSColor.selectedContentBackgroundColor.withAlphaComponent(0.16)
+            : NSColor.clear).cgColor
     }
 }
 
@@ -1482,6 +1810,12 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
             if action.choice == .deny {
                 button.hasDestructiveAction = true
             }
+            if action.isDefault {
+                button.keyEquivalent = "\r"
+            }
+            if let tint = action.tint {
+                button.contentTintColor = tint
+            }
             row.addArrangedSubview(button)
         }
         return row
@@ -1754,6 +2088,52 @@ func runAskHttpPolicyPanel(input: GuardAskHttpPolicyInput) -> GuardAskDecision {
     }
 }
 
+func runAskPackagePolicyPanel(input: GuardAskPackagePolicyInput) -> GuardAskDecision {
+    let pkg = input.packageInfo
+    let packageLabel = pkg.purl?.nilIfEmpty ??
+        [pkg.ecosystem, pkg.name].compactMap { $0?.nilIfEmpty }.joined(separator: "/") +
+        (pkg.version?.nilIfEmpty.map { "@\($0)" } ?? "")
+    let actorCommand = input.command?.isEmpty == false ? input.command! : "Guard run"
+    let actor = input.launcherApp?.isEmpty == false ? "\(actorCommand) via \(input.launcherApp!)" : actorCommand
+    let request = input.request
+    let requestTarget = [
+        request?.method?.nilIfEmpty,
+        request?.host?.nilIfEmpty.map { host in "\(host)\(request?.path?.nilIfEmpty ?? "")" }
+    ].compactMap { $0 }.joined(separator: " ")
+    let controller = GuardConnectionPromptController(
+        titleText: "Package Warning",
+        actor: actor,
+        destination: packageLabel.isEmpty ? "Unknown package" : packageLabel,
+        context: "Guard found a known package risk. Deny unless you have reviewed this package.",
+        scopeRows: [],
+        detailRows: [
+            ("Package", packageLabel),
+            ("Ecosystem", pkg.ecosystem ?? "Unknown"),
+            ("Version", pkg.version ?? "Unknown"),
+            ("Source", input.decision.source ?? "Threat intelligence"),
+            ("Reason", input.decision.summary ?? input.decision.reason ?? "Package risk"),
+            ("Reference", input.decision.referenceUrl ?? ""),
+            ("Request", requestTarget),
+            ("Transport", request?.transport ?? "Proxy"),
+            ("Profile", input.profile ?? "guard"),
+            ("Project", input.projectDir ?? "Unknown"),
+            ("Run", input.runDir ?? "Unknown")
+        ],
+        actions: [
+            GuardPromptAction(title: "Deny", choice: .deny, duration: "run", isDefault: true, tint: nil),
+            GuardPromptAction(title: "Allow Once", choice: .allowOnce, duration: "once", isDefault: false, tint: nil)
+        ],
+        lifetimeOptions: [],
+        defaultLifetimeValue: "run"
+    )
+    let choice = controller.run()
+    return GuardAskDecision(
+        action: choice == .deny ? "deny" : "allow",
+        rule: nil,
+        duration: controller.selectedDuration
+    )
+}
+
 func promptLifetimeOptions() -> [(String, String)] {
     [
         ("Once", "once"),
@@ -1782,7 +2162,7 @@ func wildcardDomainForHost(_ host: String) -> String? {
 func runCliAskModeIfNeeded() -> Bool {
     guard CommandLine.arguments.count > 1 else { return false }
     let mode = CommandLine.arguments[1]
-    guard mode == "ask-network" || mode == "ask-http-policy" else { return false }
+    guard mode == "ask-network" || mode == "ask-http-policy" || mode == "ask-package-policy" else { return false }
     NSApp.setActivationPolicy(.accessory)
     do {
         if mode == "ask-network" {
@@ -1793,6 +2173,11 @@ func runCliAskModeIfNeeded() -> Bool {
         if mode == "ask-http-policy" {
             let input = try decodeJsonArgument(GuardAskHttpPolicyInput.self)
             emitDecision(runAskHttpPolicyPanel(input: input))
+            return true
+        }
+        if mode == "ask-package-policy" {
+            let input = try decodeJsonArgument(GuardAskPackagePolicyInput.self)
+            emitDecision(runAskPackagePolicyPanel(input: input))
             return true
         }
     } catch {

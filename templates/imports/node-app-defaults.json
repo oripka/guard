@@ -1,10 +1,22 @@
 {
   "allowPty": true,
   "supplyChain": {
-    "installSandbox": true
+    "installSandbox": true,
+    "threatIntelligence": {
+      "enabled": true,
+      "blockPackageLookupAlerts": true,
+      "promptOnBlock": true
+    }
   },
   "network": {
-    "allowedDomains": [],
+    "allowedDomains": [
+      "registry.npmjs.org"
+    ],
+    "packageLookup": {
+      "provider": "socket-free",
+      "ttlMs": 3600000,
+      "timeoutMs": 5000
+    },
     "deniedDomains": [],
     "allowLocalBinding": true,
     "allowLoopbackConnections": false,

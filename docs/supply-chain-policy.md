@@ -40,7 +40,9 @@ Enable all checked-in package policy layers:
     "threatIntelligence": {
       "blockedPackages": [
         "pkg:npm/safedep-test-pkg@1.0.0"
-      ]
+      ],
+      "blockPackageLookupAlerts": true,
+      "promptOnBlock": true
     },
     "sanitizeEnvironment": true
   },
@@ -73,8 +75,11 @@ guard --install-sandbox \
 ## Layer 1: Threat Intelligence
 
 `supplyChain.threatIntelligence` evaluates detected package artifact downloads
-before forwarding the request upstream. When a package is blocked, Guard returns
-a `403` response and the artifact never reaches disk through the proxied path.
+before forwarding the request upstream. When an interactive run finds a known
+threat-intelligence block candidate, Guard opens the same native prompt surface
+used for network decisions and asks whether to deny or allow that one download.
+Deny is the default. Non-interactive runs deny without prompting. Packages with
+no known finding do not prompt.
 
 Current implementation:
 
@@ -128,7 +133,8 @@ Optional Socket Firewall lookup:
     },
     "threatIntelligence": {
       "enabled": true,
-      "blockPackageLookupAlerts": true
+      "blockPackageLookupAlerts": true,
+      "promptOnBlock": true
     }
   }
 }
@@ -138,7 +144,9 @@ Optional Socket Firewall lookup:
 records the result on `package-fetch` events as `packageLookup`. By default this
 is observe-only. Set `threatIntelligence.blockPackageLookupAlerts: true` when
 Socket lookup alerts should become blocking threat-intelligence decisions. This
-keeps existing SFW telemetry behavior compatible with stricter profiles.
+keeps existing SFW telemetry behavior compatible with stricter profiles. With
+`promptOnBlock` enabled, those blocking lookup alerts ask the user by default in
+interactive Guard runs.
 
 The lookup provider can also be enabled for one run with:
 
