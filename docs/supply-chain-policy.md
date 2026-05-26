@@ -490,6 +490,9 @@ active:
 - deny writes to common persistence paths
 - block risky child executables such as `curl`, `wget`, `python`, `ruby`,
   `perl`, `osascript`, and `nc`
+- force package-manager script suppression for npm, pnpm, and Yarn
+- scan Node manifests for lifecycle scripts and record the findings
+- block pnpm installs that set `dangerouslyAllowAllBuilds: true`
 - inject package-manager environment settings such as
   `NPM_CONFIG_IGNORE_SCRIPTS=true`
 - clear the inherited environment unless `sanitizeEnvironment` is false

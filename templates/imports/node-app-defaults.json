@@ -2,6 +2,11 @@
   "allowPty": true,
   "supplyChain": {
     "installSandbox": true,
+    "lifecycleScripts": {
+      "enabled": true,
+      "scanNodeModules": true,
+      "blockUnsafePnpmConfig": true
+    },
     "threatIntelligence": {
       "enabled": true,
       "blockPackageLookupAlerts": true,

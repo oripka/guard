@@ -123,8 +123,14 @@ persistence paths: shells, `curl`/`wget`, `gh`, `git`, package-manager
 subprocesses, Python/Ruby/Perl helpers, `.github/workflows`, Git hooks, shell
 startup files, package credentials, and Python `.pth` startup files. Guard also
 injects package-manager environment defaults such as
-`NPM_CONFIG_IGNORE_SCRIPTS=true` and clears the inherited environment unless
+`NPM_CONFIG_IGNORE_SCRIPTS=true`, `PNPM_CONFIG_IGNORE_SCRIPTS=true`, and
+`YARN_ENABLE_SCRIPTS=false`, then clears the inherited environment unless
 `supplyChain.sanitizeEnvironment` is set to `false`.
+
+`lifecycleScripts` scans Node dependency manifests for `preinstall`, `install`,
+`postinstall`, and `prepare` scripts after guarded install runs, records the
+findings in Guard events, and blocks pnpm installs when
+`dangerouslyAllowAllBuilds: true` is present in `pnpm-workspace.yaml`.
 
 `installSandbox` adds a PMG-style installation sandbox for package-manager
 install/download commands. It keeps normal `pnpm run dev` style commands on the

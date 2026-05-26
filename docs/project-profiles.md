@@ -1,49 +1,86 @@
-# Project Guard Profiles
+# Project Profiles and Templates
 
-## PacketSafari
+Project profiles are the durable policy files that Guard applies to commands
+run inside a repo.
 
-Use the default profile for host-side development commands:
+## Benefit
 
-```sh
-guard pnpm --dir frontend run dev
-guard python scripts/some_tool.py
+A profile lets a project declare its expected filesystem, subprocess, and
+network behavior once, then reuse that policy for developers, local CI-like
+runs, and coding agents.
+
+## Defaults
+
+`guard init` creates `.guard/guard.json` using the `node-app` template:
+
+```json
+{
+  "imports": ["node-app-defaults"]
+}
 ```
 
-Use the Docker profile only for Docker commands:
+Template imports live under `templates/imports`. The current Node defaults
+enable the project filesystem sandbox, npm registry access, local dev-server
+binding, install sandboxing, lifecycle-script scanning, and package lookup.
 
-```sh
-guard --profile docker docker compose -f docker-compose-dev.yml config
-guard --profile docker docker compose -f docker-compose-dev.yml up
+## Project Config
+
+Use imports for shared defaults, then override only project-specific rules:
+
+```json
+{
+  "imports": ["node-app-defaults"],
+  "network": {
+    "httpRules": [
+      {
+        "host": "api.openai.com",
+        "methods": ["POST"],
+        "paths": ["/v1/responses"]
+      }
+    ]
+  },
+  "filesystem": {
+    "allowRead": ["${GUARD_PROJECT_DIR}/fixtures"],
+    "allowWrite": ["${GUARD_PROJECT_DIR}/dist"]
+  }
+}
 ```
 
-The Docker profile opens the Docker Desktop socket. Treat that as a high
-privilege profile: Docker can mount host paths and can run containers that reach
-the network even when the local guard policy says `net=none`.
-
-PacketSafari currently mounts `~/packetsafari-data` into several dev services.
-That means Docker-side isolation depends on the compose file, not only on
-guard.
-Prefer narrower bind mounts and `:ro` for inputs whenever the service does not
-need to write.
-
-## Wireshark
-
-Use the default profile for local build and test commands:
+Common commands:
 
 ```sh
-guard cmake -S . -B build-anoncap-min
-guard cmake --build build-anoncap-min
-guard python3 tools/some_test.py
+guard init
+guard doctor
+guard audit
+guard list templates
+guard profile doctor
+guard diff-profile zoom teams
 ```
 
-The Wireshark profile denies reads from `~`, `/Volumes`, `/Applications`,
-`/cores`, and `/home`, then re-opens the Wireshark checkout, the guard runtime
-directory, and the related local anoncap guidance paths from `~/code/waveanalyzer`.
+## What Profiles Protect
 
-## On-Prem Bootstrap
+Profiles protect against policy drift. Instead of approving broad ad-hoc access
+for each run, a repo can record the expected paths, hosts, HTTP paths, child
+executables, and package-install behavior.
 
-The on-prem profile protects host home and volume reads, and denies writes to
-`keys/`, `secrets/`, and common key file names. Real long-lived keys should not
-live inside a project directory that is opened with `allowRead`, because
-guard's
-read carve-out model re-opens the allowed project subtree.
+## Global Defaults
+
+`guard setup` writes global local-machine settings such as:
+
+- managed code root, for example `~/code`.
+- shim install directory, for example `~/.local/bin`.
+- whether package-manager shims are installed.
+
+Those settings live outside the project and should not be used for durable
+security policy. Put durable allow/deny rules in `.guard/guard.json`.
+
+## Agent Guidance
+
+For repos maintained with coding agents, run:
+
+```sh
+guard init-agent
+```
+
+This writes `AGENTS.md` guidance that tells agents to use narrow profile edits,
+run `guard profile doctor`, and summarize policy changes before committing.

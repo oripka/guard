@@ -12,9 +12,11 @@ import { fileURLToPath } from 'node:url'
 
 import { generateProfile } from '../../../lib/guard-manager.mjs'
 import {
+  analyzePnpmBuildPolicy,
   applyInstallSandboxPolicy,
   isInstallSandboxCommand,
   parseInstallSandboxAllow,
+  scanNodeLifecycleScripts,
 } from '../../../lib/guard-install-sandbox.mjs'
 import { assertLinuxBubblewrapSupported, buildBubblewrapArgs, linuxSandboxBackend } from '../../../lib/guard-bubblewrap.mjs'
 import { classifySandboxDenialSensitivity, parseSandboxDenialMessage } from '../../../lib/guard-sandbox-log.mjs'
@@ -263,6 +265,66 @@ test('scan npm skips node_modules unless requested', () => {
       JSON.parse(includeResult.stdout).domains.map((item) => item.host),
       ['dep.example.com'],
     )
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('scan npm can report dependency lifecycle scripts', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-npm-lifecycle-scan-'))
+  try {
+    mkdirSync(join(tempRoot, 'node_modules', '.pnpm', 'native-helper@1.2.3', 'node_modules', 'native-helper'), { recursive: true })
+    writeFileSync(join(tempRoot, 'package.json'), JSON.stringify({ name: 'scan-fixture' }))
+    writeFileSync(
+      join(tempRoot, 'node_modules', '.pnpm', 'native-helper@1.2.3', 'node_modules', 'native-helper', 'package.json'),
+      JSON.stringify({
+        name: 'native-helper',
+        version: '1.2.3',
+        scripts: {
+          postinstall: 'node build.js',
+          test: 'node test.js',
+        },
+      }),
+    )
+
+    const direct = scanNodeLifecycleScripts({ projectDir: tempRoot, includeNodeModules: true })
+    assert.equal(direct.summary.packagesWithLifecycleScripts, 1)
+    assert.equal(direct.findings[0].package, 'native-helper@1.2.3')
+    assert.deepEqual(direct.findings[0].lifecycleScripts.map((script) => script.name), ['postinstall'])
+
+    const result = spawnSync(guard, ['scan', 'npm', '--dir', tempRoot, '--include-node-modules', '--lifecycle', '--json'], {
+      cwd: appRoot,
+      encoding: 'utf8',
+      env: { ...process.env, GUARD_QUIET: '1' },
+    })
+    expectOk(result)
+    const report = JSON.parse(result.stdout)
+    assert.equal(report.lifecycleScripts.summary.packagesWithLifecycleScripts, 1)
+    assert.equal(report.lifecycleScripts.findings[0].package, 'native-helper@1.2.3')
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('pnpm build policy blocks dangerouslyAllowAllBuilds', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-pnpm-build-policy-'))
+  try {
+    writeMinimalGuardProfile(tempRoot)
+    writeFileSync(join(tempRoot, 'package.json'), JSON.stringify({ name: 'pnpm-policy-fixture', packageManager: 'pnpm@11.1.1' }))
+    writeFileSync(join(tempRoot, '.npmrc'), 'minimumReleaseAge=10080\n')
+    writeFileSync(join(tempRoot, 'pnpm-workspace.yaml'), 'dangerouslyAllowAllBuilds: true\n')
+
+    const analysis = analyzePnpmBuildPolicy({ projectDir: tempRoot })
+    assert.equal(analysis.dangerouslyAllowAllBuilds, true)
+    assert.equal(analysis.issues.some((issue) => issue.code === 'pnpm-dangerously-allow-all-builds'), true)
+
+    const blocked = spawnSync(guard, ['pnpm', 'install', '--offline'], {
+      cwd: tempRoot,
+      encoding: 'utf8',
+      env: { ...process.env, GUARD_QUIET: '1' },
+    })
+    assert.notEqual(blocked.status, 0)
+    assert.match(blocked.stderr, /dangerouslyAllowAllBuilds|lifecycle-script policy/)
   } finally {
     rmSync(tempRoot, { recursive: true, force: true })
   }
@@ -3810,6 +3872,232 @@ test('guard off runs command without guard runtime', () => {
 
   expectOk(result)
   assert.equal(result.stdout, 'unset')
+})
+
+test('guard off asks guardd before running an unprotected command', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-bypass-allow-'))
+  const eventLog = join(tempRoot, 'events.jsonl')
+  const daemon = await startGuarddForTest({ policyRoot: appRoot, eventLog, extraEnv: { GUARD_STATE_DIR: tempRoot } })
+  try {
+    const run = runGuardCommandAsync([
+      'off',
+      process.execPath,
+      '-e',
+      'process.stdout.write("bypass-ok")',
+    ], {
+      GUARD_DAEMON_URL: daemon.base,
+      GUARD_DAEMON_TOKEN: daemon.token,
+      GUARD_BYPASS_DECISION_TIMEOUT_MS: '5000',
+      GUARD_STATE_DIR: tempRoot,
+    })
+    const alert = await waitForGuarddPendingAlert(daemon, (candidate) =>
+      candidate.operationKind === 'process.bypass' &&
+      candidate.bypassReason === 'guard-off' &&
+      /bypass-ok/.test(candidate.childCommand || ''),
+    )
+    assert.equal(alert.resourceKind, 'process')
+    assert.match(alert.childCommand, /bypass-ok/)
+    assert.ok(alert.parentChain !== undefined)
+    await resolveGuarddPendingAlert(daemon, alert, { action: 'allow', duration: 'once' })
+    const result = await run
+    expectOk(result)
+    assert.equal(result.stdout, 'bypass-ok')
+  } finally {
+    await daemon.stop()
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('guard off exits when guardd denies a bypass request', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-bypass-deny-'))
+  const eventLog = join(tempRoot, 'events.jsonl')
+  const daemon = await startGuarddForTest({ policyRoot: appRoot, eventLog, extraEnv: { GUARD_STATE_DIR: tempRoot } })
+  try {
+    const run = runGuardCommandAsync([
+      'off',
+      process.execPath,
+      '-e',
+      'process.stdout.write("should-not-run")',
+    ], {
+      GUARD_DAEMON_URL: daemon.base,
+      GUARD_DAEMON_TOKEN: daemon.token,
+      GUARD_BYPASS_DECISION_TIMEOUT_MS: '5000',
+      GUARD_STATE_DIR: tempRoot,
+    })
+    const alert = await waitForGuarddPendingAlert(daemon, (candidate) =>
+      candidate.operationKind === 'process.bypass' && /should-not-run/.test(candidate.childCommand || ''),
+    )
+    await resolveGuarddPendingAlert(daemon, alert, { action: 'deny', duration: 'once' })
+    const result = await run
+    assert.equal(result.status, 130)
+    assert.equal(result.stdout, '')
+    assert.match(result.stderr, /bypass denied/)
+  } finally {
+    await daemon.stop()
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('guardd rejects duplicate pending alert resolves without recording a second decision', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-duplicate-resolve-'))
+  const eventLog = join(tempRoot, 'events.jsonl')
+  const daemon = await startGuarddForTest({ policyRoot: appRoot, eventLog, extraEnv: { GUARD_STATE_DIR: tempRoot } })
+  try {
+    const create = await fetch(`${daemon.base}/alerts/pending`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${daemon.token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        profile: 'guard',
+        command: '/usr/bin/true',
+        childCommand: '/usr/bin/true',
+        childExecutablePath: '/usr/bin/true',
+        projectDir: appRoot,
+        reason: 'guard-off',
+        bypassReason: 'guard-off',
+        decisionRequest: {
+          id: 'duplicate-resolve-test',
+          subject: {
+            kind: 'process',
+            executablePath: '/usr/bin/true',
+            commandLine: '/usr/bin/true',
+            projectDir: appRoot,
+            profile: 'guard',
+          },
+          operation: { kind: 'process.bypass', intent: 'run-unprotected' },
+          resource: {
+            kind: 'process',
+            command: '/usr/bin/true',
+            executablePath: '/usr/bin/true',
+            cwd: appRoot,
+            bypassReason: 'guard-off',
+          },
+        },
+      }),
+    })
+    assert.equal(create.status, 201)
+    const created = await create.json()
+    const alert = created.alert
+    assert.ok(alert.id)
+
+    const first = await fetch(`${daemon.base}/alerts/${alert.id}/resolve`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${daemon.token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ action: 'deny', duration: 'once' }),
+    })
+    assert.equal(first.status, 200)
+
+    const second = await fetch(`${daemon.base}/alerts/${alert.id}/resolve`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${daemon.token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ action: 'deny', duration: 'once' }),
+    })
+    assert.equal(second.status, 409)
+    assert.equal((await second.json()).error, 'alert_not_pending')
+
+    const decisions = readFileSync(eventLog, 'utf8')
+      .trim()
+      .split(/\n+/)
+      .map((line) => JSON.parse(line))
+      .filter((event) => event.type === 'guard.alert.decision' && event.alertId === alert.id)
+    assert.equal(decisions.length, 1)
+  } finally {
+    await daemon.stop()
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('guardd exposes cached process bypass decisions as removable temporary rules', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-bypass-rules-'))
+  const eventLog = join(tempRoot, 'events.jsonl')
+  const daemon = await startGuarddForTest({ policyRoot: appRoot, eventLog, extraEnv: { GUARD_STATE_DIR: tempRoot } })
+  try {
+    const create = await fetch(`${daemon.base}/alerts/pending`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${daemon.token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        profile: 'guard',
+        command: '/usr/bin/true',
+        childCommand: '/usr/bin/true',
+        childExecutablePath: '/usr/bin/true',
+        projectDir: appRoot,
+        reason: 'guard-off',
+        bypassReason: 'guard-off',
+        decisionRequest: {
+          id: 'bypass-rules-test',
+          subject: {
+            kind: 'process',
+            executablePath: '/usr/bin/true',
+            commandLine: '/usr/bin/true',
+            projectDir: appRoot,
+            profile: 'guard',
+          },
+          operation: { kind: 'process.bypass', intent: 'run-unprotected' },
+          resource: {
+            kind: 'process',
+            command: '/usr/bin/true',
+            executablePath: '/usr/bin/true',
+            cwd: appRoot,
+            bypassReason: 'guard-off',
+          },
+        },
+      }),
+    })
+    assert.equal(create.status, 201)
+    const alert = (await create.json()).alert
+    const resolved = await fetch(`${daemon.base}/alerts/${alert.id}/resolve`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${daemon.token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ action: 'deny', duration: 'forever' }),
+    })
+    assert.equal(resolved.status, 200)
+
+    const rulesResponse = await fetch(`${daemon.base}/rules?profile=guard`, {
+      headers: { authorization: `Bearer ${daemon.token}` },
+    })
+    assert.equal(rulesResponse.status, 200)
+    const rules = await rulesResponse.json()
+    const bypassRule = rules.temporaryRules.find((rule) => rule.field === 'process.bypass')
+    assert.ok(bypassRule)
+    assert.equal(bypassRule.action, 'deny')
+    assert.equal(bypassRule.scope, '/usr/bin/true')
+    assert.equal(bypassRule.value.decisionKey, 'bypass-rules-test')
+
+    const remove = await fetch(`${daemon.base}/decisions/cache`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${daemon.token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ action: 'remove', ruleId: bypassRule.id }),
+    })
+    assert.equal(remove.status, 200)
+    assert.equal((await remove.json()).changed, true)
+
+    const afterResponse = await fetch(`${daemon.base}/rules?profile=guard`, {
+      headers: { authorization: `Bearer ${daemon.token}` },
+    })
+    assert.equal(afterResponse.status, 200)
+    const after = await afterResponse.json()
+    assert.equal(after.temporaryRules.some((rule) => rule.field === 'process.bypass'), false)
+  } finally {
+    await daemon.stop()
+    rmSync(tempRoot, { recursive: true, force: true })
+  }
 })
 
 test('guard unprotected runs command without guard runtime', () => {
