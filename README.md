@@ -92,10 +92,14 @@ guard profile doctor
 
 - [pnpm and supply-chain installs](docs/pnpm-supply-chain.md)
 - [Network policy and proxying](docs/network-policy.md)
+- [Secret injection](docs/secret-injection.md)
+- [PATH shims](docs/shims.md)
 - [Subprocess policy](docs/subprocess-policy.md)
 - [Filesystem policy](docs/filesystem-policy.md)
 - [Project profiles and templates](docs/project-profiles.md)
-- [Native macOS app profiles](docs/native-apps.md)
+- [Experimental native macOS app profiles](docs/native-apps.md)
+- [guardd daemon](docs/guardd.md)
+- [Guard UI](docs/ui.md)
 - [TLS inspection scaffold](docs/tls-inspection-policy-scaffold.md)
 - [Network Extension roadmap](docs/network-extension-roadmap.md)
 

@@ -82,6 +82,8 @@ Network policy protects against:
 
 - dependency installers calling unexpected hosts.
 - API clients reaching broader paths than reviewed.
+- real API tokens being exposed to a guarded workload when paired with
+  [secret injection](secret-injection.md).
 - direct raw egress bypassing proxy-based domain policy.
 - accidental telemetry or update checks from high-risk repos.
 - SSH/Git/package helper flows that need a SOCKS-compatible proxy path.

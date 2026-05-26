@@ -1,7 +1,8 @@
-# Native macOS App Profiles
+# Experimental Native macOS App Profiles
 
-Native app profiles launch selected macOS apps with a Guard policy instead of
-letting the app inherit broad local filesystem and network access.
+Native app profiles are experimental. They launch selected macOS apps with a
+Guard policy instead of letting the app inherit broad local filesystem and
+network access.
 
 ## Benefit
 
@@ -11,7 +12,7 @@ keep unrelated local files out of scope.
 
 ## Defaults
 
-Guard ships experimental built-in profiles for:
+Guard currently ships experimental built-in profiles for:
 
 - Zoom
 - Microsoft Teams
