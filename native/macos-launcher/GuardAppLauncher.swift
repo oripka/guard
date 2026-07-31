@@ -10705,6 +10705,16 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         var rows: [MonitorActivityRow] = dockerActivityRows()
         for app in order {
             let groupEvents = grouped[app] ?? []
+            let visibleEvents = showingFiles
+                ? groupEvents
+                : groupEvents.filter { isNetworkActivity($0) || isBypassActivity($0) || isRunLifecycleActivity($0) }
+            let processGroups = Dictionary(grouping: visibleEvents, by: { processLabel(for: $0) })
+            let visibleProcessNames = processGroups.keys
+                .filter { processName in
+                    shouldShowProcessGroup(processGroups[processName] ?? [], showingFiles: showingFiles)
+                }
+                .sorted(by: sortProcessNames)
+            let subprocessCount = visibleProcessNames.filter { $0 != app }.count
             let summary = projectSummary(for: groupEvents, allowSubprocess: false)
             let network = groupEvents.filter { isNetworkActivity($0) }
             let flows = network.filter { $0.type == "network.flow" && !$0.host.isEmpty }
@@ -10721,6 +10731,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 flows.isEmpty ? nil : "\(flows.count) proxied",
                 network.contains { $0.type == "proxy.started" } ? "proxy ready" : nil,
                 showingFiles && fileLike > 0 ? "\(fileLike) file event\(fileLike == 1 ? "" : "s")" : nil,
+                subprocessCount == 0 ? nil : "\(subprocessCount) subprocess\(subprocessCount == 1 ? "" : "es")",
                 summary == nil ? nil : "Guarded"
             ].compactMap { $0 }
             let appKey = "app:\(app)"
@@ -10737,24 +10748,14 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 performance: performanceSummary(for: groupEvents),
                 event: groupEvents.first
             ))
-            let visibleEvents = showingFiles
-                ? groupEvents
-                : groupEvents.filter { isNetworkActivity($0) || isBypassActivity($0) || isRunLifecycleActivity($0) }
-            let processGroups = Dictionary(grouping: visibleEvents, by: { processLabel(for: $0) })
-            for process in processGroups.keys.sorted(by: sortProcessNames) {
+            for process in visibleProcessNames {
                 let processEvents = processGroups[process] ?? []
                 let processNetwork = processEvents.filter { isNetworkActivity($0) }
                 let processFlows = processNetwork.filter { $0.type == "network.flow" && !$0.host.isEmpty }
                 let processDecisions = processNetwork.filter { isPolicyDecisionActivity($0) && !$0.host.isEmpty }
                 let processTraffic = processNetwork.filter { !$0.host.isEmpty }
                 let processBypasses = processEvents.filter { isBypassActivity($0) }
-                let hasFilePolicy = processEvents.contains(where: isFileActivity)
                 let hasKnownConfig = processEvents.contains { $0.type == "guard.project.profile" }
-                let hasRunLifecycle = processEvents.contains(where: isRunLifecycleActivity)
-                let hasProxy = processEvents.contains { $0.type == "proxy.started" }
-                if processTraffic.isEmpty && processBypasses.isEmpty && !hasProxy && !hasRunLifecycle && (!showingFiles || !hasFilePolicy) && !hasKnownConfig {
-                    continue
-                }
                 let processDenied = processTraffic.filter { isDeniedTraffic($0) }.count
                 let bypassDenied = processBypasses.filter { isDeniedTraffic($0) || $0.result == "deny" }.count
                 let processAllowed = processDecisions.filter { $0.result == "allow" }.count
@@ -10980,6 +10981,17 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             }
         }
         return rows
+    }
+
+    func shouldShowProcessGroup(_ processEvents: [GuardMonitorEvent], showingFiles: Bool) -> Bool {
+        let hasTraffic = processEvents.contains { isNetworkActivity($0) && !$0.host.isEmpty }
+        let hasBypass = processEvents.contains(where: isBypassActivity)
+        let hasProxy = processEvents.contains { $0.type == "proxy.started" }
+        let hasRunLifecycle = processEvents.contains(where: isRunLifecycleActivity)
+        let hasFilePolicy = processEvents.contains(where: isFileActivity)
+        let hasKnownConfig = processEvents.contains { $0.type == "guard.project.profile" }
+        return hasTraffic || hasBypass || hasProxy || hasRunLifecycle ||
+            (showingFiles && hasFilePolicy) || hasKnownConfig
     }
 
     func inactiveProjectKey(for event: GuardMonitorEvent) -> String {
