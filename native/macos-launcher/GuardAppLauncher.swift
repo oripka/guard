@@ -5189,20 +5189,160 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        guard selectedRule() != nil else { return }
-        menu.addItem(withTitle: "Enable Rule", action: #selector(enableSelected(_:)), keyEquivalent: "")
-        menu.addItem(withTitle: "Disable Rule", action: #selector(disableSelected(_:)), keyEquivalent: "")
-        menu.addItem(withTitle: "Delete Rule", action: #selector(deleteSelected(_:)), keyEquivalent: "")
+        if tableView.clickedRow >= 0 && !tableView.selectedRowIndexes.contains(tableView.clickedRow) {
+            tableView.selectRowIndexes(IndexSet(integer: tableView.clickedRow), byExtendingSelection: false)
+        }
+        guard let rule = selectedRule() else { return }
+        let affected = expandedRuleRows(selectedRules())
+        let mutable = affected.contains(where: isMutableRule)
+        let actorName = rule.actor.isEmpty ? "Any Process" : rule.actor
+
+        if rule.isActorGroup {
+            addRuleMenuItem(
+                menu,
+                title: expandedActorKeys.contains(rule.groupKey) ? "Collapse Rules for \(actorName)" : "Expand Rules for \(actorName)",
+                symbol: expandedActorKeys.contains(rule.groupKey) ? "chevron.up" : "chevron.down",
+                action: #selector(toggleSelectedRuleGroup(_:))
+            )
+        } else if rule.groupCount > 1 && !rule.isGroupChild {
+            addRuleMenuItem(
+                menu,
+                title: expandedGroupKeys.contains(rule.groupKey) ? "Collapse Exact Rules" : "Expand Exact Rules",
+                symbol: expandedGroupKeys.contains(rule.groupKey) ? "chevron.up" : "chevron.down",
+                action: #selector(toggleSelectedRuleGroup(_:))
+            )
+        }
+        if menu.numberOfItems > 0 { menu.addItem(.separator()) }
+
+        let allEnabled = !affected.isEmpty && affected.allSatisfy(\.enabled)
+        let toggle = addRuleMenuItem(
+            menu,
+            title: allEnabled ? "Disable" : "Enable",
+            symbol: allEnabled ? "pause.circle" : "checkmark.circle",
+            action: allEnabled ? #selector(disableSelected(_:)) : #selector(enableSelected(_:))
+        )
+        toggle.isEnabled = mutable
+        addRuleMenuItem(menu, title: "Show Rule Details…", symbol: "info.circle", action: #selector(showSelectedRuleInspector(_:)))
+
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Copy Scope", action: #selector(copySelectedRuleScope(_:)), keyEquivalent: "")
-        menu.addItem(withTitle: "Open Inspector", action: #selector(showSelectedRuleInspector(_:)), keyEquivalent: "")
-        for item in menu.items { item.target = self }
+        addRuleMenuItem(menu, title: "Copy Rule", symbol: "doc.on.doc", action: #selector(copySelectedRule(_:)))
+        addRuleMenuItem(menu, title: "Copy Scope", symbol: "scope", action: #selector(copySelectedRuleScope(_:)))
+        if ruleHost(rule) != nil {
+            addRuleMenuItem(menu, title: "Copy Hostname", symbol: "globe", action: #selector(copySelectedRuleHost(_:)))
+        }
+        if !rule.actor.isEmpty {
+            addRuleMenuItem(menu, title: "Copy App or Process Name", symbol: "app", action: #selector(copySelectedRuleActor(_:)))
+        }
+
+        menu.addItem(.separator())
+        addRuleMenuItem(
+            menu,
+            title: "Focus on Rules for \(actorName)",
+            symbol: "binoculars",
+            action: #selector(focusSelectedRuleActor(_:))
+        )
+
+        menu.addItem(.separator())
+        let delete = addRuleMenuItem(
+            menu,
+            title: affected.count == 1 ? "Delete Rule…" : "Delete \(affected.count) Rules…",
+            symbol: "trash",
+            action: #selector(confirmDeleteSelected(_:))
+        )
+        delete.isEnabled = mutable || affected.contains { $0.field == "process.bypass" || $0.source == "alert-decision" }
+    }
+
+    @discardableResult
+    func addRuleMenuItem(_ menu: NSMenu, title: String, symbol: String, action: Selector) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        if #available(macOS 11.0, *) {
+            item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+        }
+        menu.addItem(item)
+        return item
     }
 
     @objc func copySelectedRuleScope(_ sender: Any?) {
         guard let rule = selectedRule() else { return }
+        copyRuleText(rule.scope)
+    }
+
+    @objc func copySelectedRule(_ sender: Any?) {
+        guard let rule = selectedRule() else { return }
+        let payload: [String: Any] = [
+            "app": rule.actor.isEmpty ? "Any Process" : rule.actor,
+            "action": rule.action,
+            "kind": rule.kind,
+            "scope": rule.scope,
+            "field": rule.field,
+            "value": rule.value,
+            "lifetime": rule.lifetime,
+            "enabled": rule.enabled
+        ]
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]),
+              let text = String(data: data, encoding: .utf8) else {
+            copyRuleText(rule.scope)
+            return
+        }
+        copyRuleText(text)
+    }
+
+    @objc func copySelectedRuleHost(_ sender: Any?) {
+        guard let rule = selectedRule(), let host = ruleHost(rule) else { return }
+        copyRuleText(host)
+    }
+
+    @objc func copySelectedRuleActor(_ sender: Any?) {
+        guard let actor = selectedRule()?.actor, !actor.isEmpty else { return }
+        copyRuleText(actor)
+    }
+
+    func copyRuleText(_ text: String) {
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(rule.scope, forType: .string)
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    func ruleHost(_ rule: MonitorRuleRow) -> String? {
+        if let value = rule.value as? [String: Any] {
+            let host = value["host"] as? String ?? value["cidr"] as? String ?? ""
+            if !host.isEmpty { return host }
+        }
+        if ["network.allowedDomains", "network.deniedDomains"].contains(rule.field),
+           let host = rule.value as? String, !host.isEmpty {
+            return host
+        }
+        return nil
+    }
+
+    @objc func focusSelectedRuleActor(_ sender: Any?) {
+        guard let rule = selectedRule() else { return }
+        ruleActorFilter = rule.actor.isEmpty ? "profile" : "app"
+        let query = rule.actor.trimmingCharacters(in: .whitespacesAndNewlines)
+        searchField.stringValue = query
+        rulesToolbarSearchField?.stringValue = query
+        renderRows()
+    }
+
+    @objc func confirmDeleteSelected(_ sender: Any?) {
+        let selected = selectedRules()
+        let affected = expandedRuleRows(selected)
+        guard !affected.isEmpty else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = affected.count == 1 ? "Delete this rule?" : "Delete \(affected.count) rules?"
+        alert.informativeText = "Deleted persistent rules are removed from the \(selectedProfile) profile. Deleted cached decisions will ask again next time."
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        guard let window else {
+            if alert.runModal() == .alertFirstButtonReturn { mutateRules(selected, action: "remove") }
+            return
+        }
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.mutateRules(selected, action: "remove")
+        }
     }
 
     @objc func showSelectedRuleInspector(_ sender: Any?) {
