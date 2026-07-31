@@ -3408,6 +3408,8 @@ struct MonitorRuleRow {
     let notes: String
     let expiresAt: String
     let groupCount: Int
+    let groupKey: String
+    let memberSearchText: String
 
     init(
         id: String = "",
@@ -3424,7 +3426,9 @@ struct MonitorRuleRow {
         approvalState: String = "approved",
         notes: String = "",
         expiresAt: String = "",
-        groupCount: Int = 1
+        groupCount: Int = 1,
+        groupKey: String = "",
+        memberSearchText: String = ""
     ) {
         self.id = id
         self.kind = kind
@@ -3441,6 +3445,8 @@ struct MonitorRuleRow {
         self.notes = notes
         self.expiresAt = expiresAt
         self.groupCount = groupCount
+        self.groupKey = groupKey
+        self.memberSearchText = memberSearchText
     }
 }
 
@@ -4075,7 +4081,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         let rawRows = ungroupedRuleRows()
         let sourceRows = groupedRuleRows(rawRows)
         renderedRows = sourceRows.filter { row in
-            let text = [row.kind, row.action, row.scope, row.detail, row.source].joined(separator: " ").lowercased()
+            let text = [row.kind, row.action, row.scope, row.detail, row.source, row.memberSearchText].joined(separator: " ").lowercased()
             let matchesSearch = search.isEmpty || text.contains(search)
             let matchesFilter: Bool
             switch filter {
@@ -4134,18 +4140,28 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         var groups: [String: [MonitorRuleRow]] = [:]
         var order: [String] = []
         for row in sourceRows {
-            let key = semanticRuleKey(row)
+            let key = ruleGroupingKey(row)
             if groups[key] == nil { order.append(key) }
             groups[key, default: []].append(row)
         }
         return order.compactMap { key in
             guard let members = groups[key], let row = members.first else { return nil }
+            let httpDescriptor = members.count > 1 ? httpGroupDescriptor(row) : nil
+            let paths = httpPaths(in: members)
+            let groupedDetail: String
+            if httpDescriptor != nil {
+                let pathSummary = paths.isEmpty ? "\(members.count) rules" : "\(paths.count) path\(paths.count == 1 ? "" : "s")"
+                let entrySummary = members.count == paths.count || paths.isEmpty ? "" : " · \(members.count) entries"
+                groupedDetail = "\(pathSummary)\(entrySummary) · \(row.detail)"
+            } else {
+                groupedDetail = row.detail
+            }
             return MonitorRuleRow(
                 id: row.id,
                 kind: row.kind,
                 action: row.action,
-                scope: row.scope,
-                detail: row.detail,
+                scope: httpDescriptor?.scope ?? row.scope,
+                detail: groupedDetail,
                 enabled: row.enabled,
                 source: row.source,
                 field: row.field,
@@ -4155,9 +4171,43 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
                 approvalState: row.approvalState,
                 notes: row.notes,
                 expiresAt: row.expiresAt,
-                groupCount: members.count
+                groupCount: members.count,
+                groupKey: key,
+                memberSearchText: members.map { "\($0.scope) \($0.detail)" }.joined(separator: " ")
             )
         }
+    }
+
+    func ruleGroupingKey(_ row: MonitorRuleRow) -> String {
+        httpGroupDescriptor(row)?.key ?? semanticRuleKey(row)
+    }
+
+    func httpGroupDescriptor(_ row: MonitorRuleRow) -> (key: String, scope: String)? {
+        guard row.kind == "HTTP", row.field == "network.httpRules",
+              var rule = row.value as? [String: Any] else { return nil }
+        let host = rule["host"] as? String ?? rule["cidr"] as? String ?? ""
+        guard !host.isEmpty else { return nil }
+        let methods = (rule["methods"] as? [String] ?? []).map { $0.uppercased() }.sorted()
+        rule["methods"] = methods
+        rule.removeValue(forKey: "paths")
+        let context = [
+            row.kind,
+            row.action,
+            row.field,
+            row.layer,
+            row.enabled ? "enabled" : "disabled",
+            row.lifetime,
+            row.approvalState,
+            row.source
+        ].joined(separator: "|")
+        let methodText = methods.isEmpty ? "Any method" : methods.joined(separator: ",")
+        return ("\(context)|http-family|\(canonicalRuleValue(rule))", "\(methodText) \(host)")
+    }
+
+    func httpPaths(in rows: [MonitorRuleRow]) -> [String] {
+        Array(Set(rows.flatMap { row in
+            (row.value as? [String: Any])?["paths"] as? [String] ?? []
+        })).sorted()
     }
 
     func semanticRuleKey(_ row: MonitorRuleRow) -> String {
@@ -4185,14 +4235,16 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
     }
 
     func expandedRuleRows(_ displayRows: [MonitorRuleRow]) -> [MonitorRuleRow] {
-        let grouped = Dictionary(grouping: ungroupedRuleRows(), by: semanticRuleKey)
+        let grouped = Dictionary(grouping: ungroupedRuleRows(), by: ruleGroupingKey)
         var expanded: [MonitorRuleRow] = []
         var seen = Set<String>()
         for row in displayRows {
-            let members = grouped[semanticRuleKey(row)] ?? [row]
-            let actionableMembers = row.field == "process.bypass" ? members : Array(members.prefix(1))
-            for member in actionableMembers {
-                let key = member.id.isEmpty ? semanticRuleKey(member) : member.id
+            let key = row.groupKey.isEmpty ? ruleGroupingKey(row) : row.groupKey
+            let members = grouped[key] ?? [row]
+            for member in members {
+                let key = member.field == "process.bypass" && !member.id.isEmpty
+                    ? member.id
+                    : "\(member.field)|\(canonicalRuleValue(member.value))"
                 guard seen.insert(key).inserted else { continue }
                 expanded.append(member)
             }
@@ -4323,7 +4375,16 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         inspectorStack.addArrangedSubview(inspectorLabel(rule.scope, weight: .semibold))
         inspectorStack.addArrangedSubview(inspectorBadge(rule.enabled ? "Enabled" : "Disabled", color: rule.enabled ? .systemGreen : .secondaryLabelColor))
         if rule.groupCount > 1 {
-            inspectorStack.addArrangedSubview(inspectorBadge("\(rule.groupCount) equivalent entries", color: .systemBlue))
+            let paths = httpPaths(in: expandedRuleRows([rule]))
+            let groupLabel = paths.isEmpty
+                ? "\(rule.groupCount) equivalent entries"
+                : "\(paths.count) path\(paths.count == 1 ? "" : "s") · \(rule.groupCount) entries"
+            inspectorStack.addArrangedSubview(inspectorBadge(groupLabel, color: .systemBlue))
+            if !paths.isEmpty {
+                let shown = paths.prefix(10).joined(separator: "\n")
+                let remaining = paths.count > 10 ? "\n+ \(paths.count - 10) more" : ""
+                inspectorStack.addArrangedSubview(inspectorLabel("Paths\n\(shown)\(remaining)", color: .secondaryLabelColor))
+            }
         }
         for (key, value) in [
             ("Action", rule.action.capitalized),
