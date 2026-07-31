@@ -420,6 +420,8 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
     var lastNotifiedPendingCount = 0
     var seenSandboxDenialKeys: Set<String> = []
     var didPrimeSandboxDenials = false
+    var cachedRecentRowCount = 0
+    var cachedHasTraffic = false
 
     init(monitor: MonitorWindowController) {
         self.monitor = monitor
@@ -443,6 +445,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         statusMenu.delegate = self
         populateStatusMenu()
         popover.behavior = .transient
+        popover.animates = false
         popover.contentSize = NSSize(width: 336, height: 330)
         popover.contentViewController = NSViewController()
         popover.contentViewController?.view = makePopoverView()
@@ -1027,6 +1030,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         deniedBadgeLabel.stringValue = "\(denied)"
         let buckets = monitor.trafficSparkline.buckets
         let hasTraffic = buckets.contains { $0.allowed > 0 || $0.denied > 0 }
+        cachedHasTraffic = hasTraffic
         sparkline.buckets = buckets
         sparkline.isHidden = !hasTraffic
         trafficTimeline.isHidden = !hasTraffic
@@ -1037,6 +1041,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
             }
             let recentEvents = statusRecentEvents()
             let recentViews = recentActivityViews(from: recentEvents)
+            cachedRecentRowCount = recentViews.count
             if recentEvents.isEmpty {
                 recentStack.addArrangedSubview(emptyRecentRow())
             } else {
@@ -1462,9 +1467,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         if popover.isShown {
             popover.performClose(sender)
         } else {
-            let recentRows = recentActivityViews(from: statusRecentEvents()).count
-            let hasTraffic = (monitor?.trafficSparkline.buckets ?? []).contains { $0.allowed > 0 || $0.denied > 0 }
-            resizePopover(recentRowCount: recentRows, hasTraffic: hasTraffic)
+            resizePopover(recentRowCount: cachedRecentRowCount, hasTraffic: cachedHasTraffic)
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
             DispatchQueue.main.async { [weak self] in
@@ -2941,7 +2944,7 @@ final class LauncherWindowController: NSObject, NSWindowDelegate {
 
 }
 
-struct GuardMonitorEvent {
+struct GuardMonitorEvent: Sendable {
     let id: String
     let at: String
     let type: String
@@ -3070,7 +3073,7 @@ func performGuardDaemonRequest(
 struct GuardEventFetchPayload: Sendable {
     let daemonEventsData: Data?
     let projectsData: Data?
-    let localEventsData: Data?
+    let localEvents: [GuardMonitorEvent]?
 }
 
 struct GuardPolicyFetchPayload: Sendable {
@@ -8802,15 +8805,34 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 projectsData: projectsResponse.flatMap {
                     (200..<300).contains($0.statusCode) ? $0.data : nil
                 },
-                localEventsData: try? Data(contentsOf: URL(fileURLWithPath: localEventLogPath))
+                localEvents: localEvents(from: readEventLogTail(at: localEventLogPath))
             )
         }
 
         return GuardEventFetchPayload(
             daemonEventsData: nil,
             projectsData: nil,
-            localEventsData: try? Data(contentsOf: URL(fileURLWithPath: localEventLogPath))
+            localEvents: localEvents(from: readEventLogTail(at: localEventLogPath))
         )
+    }
+
+    func readEventLogTail(at path: String, maximumBytes: UInt64 = 4 * 1024 * 1024) -> Data? {
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else {
+            return nil
+        }
+        defer { try? handle.close() }
+        guard let size = try? handle.seekToEnd() else { return nil }
+        let offset = size > maximumBytes ? size - maximumBytes : 0
+        do {
+            try handle.seek(toOffset: offset)
+            guard var data = try handle.readToEnd(), !data.isEmpty else { return Data() }
+            if offset > 0, let newline = data.firstIndex(of: 0x0A) {
+                data = Data(data[data.index(after: newline)...])
+            }
+            return data
+        } catch {
+            return nil
+        }
     }
 
     func applyEventPayload(
@@ -8850,7 +8872,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             daemonStateLabel.stringValue = daemonStatusText
             daemonStateLabel.textColor = managedDaemon?.isRunning == true ? .secondaryLabelColor : .tertiaryLabelColor
             loadDaemonPolicyState(profile: config.profile)
-            loaded = localEvents(from: payload.localEventsData)
+            loaded = payload.localEvents ?? []
         }
 
         events = Array(loaded.prefix(250))
@@ -8889,6 +8911,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         }
         return content
             .split(whereSeparator: \.isNewline)
+            .suffix(250)
             .compactMap { line in
                 guard let data = String(line).data(using: .utf8),
                       let object = try? JSONSerialization.jsonObject(with: data),
