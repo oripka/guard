@@ -6228,10 +6228,10 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             monitorBody.leadingAnchor.constraint(equalTo: background.leadingAnchor),
             monitorBody.trailingAnchor.constraint(equalTo: background.trailingAnchor),
             monitorBody.topAnchor.constraint(equalTo: background.topAnchor),
-            actionBar.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 12),
-            actionBar.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -12),
+            actionBar.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 10),
+            actionBar.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -10),
             actionBar.topAnchor.constraint(equalTo: monitorBody.bottomAnchor),
-            actionBar.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -8)
+            actionBar.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -5)
         ])
 
         self.window = window
@@ -6583,13 +6583,12 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         let listPane = NSStackView()
         listPane.orientation = .vertical
         listPane.alignment = .width
-        listPane.spacing = 6
+        listPane.spacing = 0
         listPane.translatesAutoresizingMaskIntoConstraints = false
         listPane.setContentHuggingPriority(.defaultLow, for: .horizontal)
         listPane.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let table = makeTable()
         listPane.addArrangedSubview(table)
-        listPane.addArrangedSubview(makeTrafficFooter())
 
         let inspector = makeInspector()
         inspector.setContentHuggingPriority(.required, for: .horizontal)
@@ -6605,29 +6604,6 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     func splitViewDidResizeSubviews(_ notification: Notification) {
         DispatchQueue.main.async { self.resizeActivityColumns() }
-    }
-
-    func makeTrafficFooter() -> NSView {
-        let container = NSView()
-        container.translatesAutoresizingMaskIntoConstraints = false
-        container.heightAnchor.constraint(equalToConstant: 62).isActive = true
-
-        let windowLabel = label("Recent policy decisions", size: 11, weight: .medium, color: .tertiaryLabelColor)
-        windowLabel.alignment = .right
-        windowLabel.translatesAutoresizingMaskIntoConstraints = false
-        trafficSparkline.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(windowLabel)
-        container.addSubview(trafficSparkline)
-        NSLayoutConstraint.activate([
-            windowLabel.leadingAnchor.constraint(greaterThanOrEqualTo: container.leadingAnchor),
-            windowLabel.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            windowLabel.topAnchor.constraint(equalTo: container.topAnchor),
-            trafficSparkline.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            trafficSparkline.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            trafficSparkline.topAnchor.constraint(equalTo: windowLabel.bottomAnchor, constant: 5),
-            trafficSparkline.bottomAnchor.constraint(equalTo: container.bottomAnchor)
-        ])
-        return container
     }
 
     func makeTable() -> NSView {
@@ -8130,9 +8106,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 8
+        row.spacing = 6
 
-        statusLabel.font = NSFont.systemFont(ofSize: 12)
+        statusLabel.font = NSFont.systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -10210,8 +10186,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         renderSelectedInspectorIfNeeded(force: forceInspectorRender)
         let containerStatus = dockerContainers.isEmpty
             ? ""
-            : " · \(dockerContainers.count) running container\(dockerContainers.count == 1 ? "" : "s")"
-        statusLabel.stringValue = "\(events.count) recent event\(events.count == 1 ? "" : "s")\(containerStatus) · \(daemonStatusText) · auto-refresh on"
+            : " · \(dockerContainers.count) container\(dockerContainers.count == 1 ? "" : "s")"
+        let daemonSummary = daemonConnected ? "guardd active" : daemonStatusText
+        statusLabel.stringValue = "\(events.count) event\(events.count == 1 ? "" : "s")\(containerStatus) · \(daemonSummary)"
         (NSApp.delegate as? GuardApplicationDelegate)?.statusController?.refresh()
     }
 
