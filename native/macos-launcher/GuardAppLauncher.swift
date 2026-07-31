@@ -1778,10 +1778,20 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
             openMonitor(sender)
             return
         }
-        monitor?.revealRecentActivity(button.representedEvents)
-        NSApp.activate(ignoringOtherApps: true)
-        popover.performClose(sender)
-        statusMenu.cancelTracking()
+        // Let NSButton finish its mouse-up tracking before removing its
+        // popover hierarchy. Opening an accessory-app window while the
+        // transient popover is still closing can otherwise order the new
+        // window straight back out and leave the control in a stale state.
+        let targetEvents = button.representedEvents
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if self.popover.isShown {
+                self.popover.performClose(nil)
+            }
+            DispatchQueue.main.async { [weak self] in
+                self?.monitor?.revealRecentActivity(targetEvents)
+            }
+        }
     }
 }
 
@@ -10517,7 +10527,16 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             renderSelectedInspectorIfNeeded(force: true)
             tableView.scrollRowToVisible(tableView.selectedRow)
         }
-        window?.makeKeyAndOrderFront(nil)
+        NSApp.setActivationPolicy(.regular)
+        if let window {
+            if window.isMiniaturized {
+                window.deminiaturize(nil)
+            }
+            window.makeKeyAndOrderFront(nil)
+            window.orderFrontRegardless()
+        }
+        NSApp.unhide(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     @discardableResult
