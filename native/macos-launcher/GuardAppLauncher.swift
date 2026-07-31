@@ -496,6 +496,12 @@ protocol GuardMenuHighlighting: AnyObject {
     func setHighlighted(_ highlighted: Bool)
 }
 
+final class GuardButtonContentStackView: NSStackView {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+}
+
 private enum GuardMarkState {
     case monitoring
     case starting
@@ -768,7 +774,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
             statusMenu.addItem(viewMenuItem(emptyRecentRow(), height: 24, inset: menuContentInset))
         } else {
             for row in recentActivityViews(from: recentEvents) {
-                statusMenu.addItem(viewMenuItem(row, height: 38, inset: menuContentInset))
+                statusMenu.addItem(viewMenuItem(row, height: 38, inset: menuContentInset, enabled: true))
             }
         }
 
@@ -781,7 +787,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         statusMenu.addItem(menuItem("Guard Settings...", symbol: "gearshape", action: #selector(openSettings(_:)), keyEquivalent: ","))
     }
 
-    func viewMenuItem(_ view: NSView, height: CGFloat, inset: CGFloat = 0) -> NSMenuItem {
+    func viewMenuItem(_ view: NSView, height: CGFloat, inset: CGFloat = 0, enabled: Bool = false) -> NSMenuItem {
         let item = NSMenuItem()
         let container = NSView(frame: NSRect(x: 0, y: 0, width: popoverContentWidth, height: height))
         container.translatesAutoresizingMaskIntoConstraints = false
@@ -797,7 +803,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
             view.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor),
         ])
         item.view = container
-        item.isEnabled = false
+        item.isEnabled = enabled
         return item
     }
 
@@ -1332,7 +1338,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
     }
 
     func recentActivityRow(_ event: GuardMonitorEvent) -> NSView {
-        let row = NSStackView()
+        let row = GuardButtonContentStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 9
@@ -1344,7 +1350,10 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         let symbol = bypass ? "figure.run" : (denied ? "xmark.shield.fill" : "checkmark.shield.fill")
         let tint: NSColor = denied ? .systemRed : (bypass ? .systemOrange : .systemBlue)
         if bypass,
-           let applicationIcon = originatingApplicationIcon(named: guardBypassActorLabel(for: event)) {
+           let applicationIcon = originatingApplicationIcon(
+               named: guardBypassActorLabel(for: event),
+               processIdentifier: event.launcherPid
+           ) {
             row.addArrangedSubview(customRowApplicationIcon(
                 applicationIcon,
                 description: guardBypassActorLabel(for: event)
@@ -1378,6 +1387,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         text.addArrangedSubview(detail)
         row.addArrangedSubview(text)
         row.addArrangedSubview(NSView())
+        row.addArrangedSubview(symbolImage("chevron.right", tint: .tertiaryLabelColor, size: 8, weight: .semibold))
         return row
     }
 
@@ -1407,12 +1417,42 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         }
         return orderedActors.prefix(4).compactMap { actor in
             guard let events = grouped[actor], let first = events.first else { return nil }
-            return events.count == 1 ? recentActivityRow(first) : recentActivityGroupRow(actor: actor, events: events)
+            let content = events.count == 1
+                ? recentActivityRow(first)
+                : recentActivityGroupRow(actor: actor, events: events)
+            return recentActivityButton(content: content, events: events)
         }
     }
 
+    func recentActivityButton(content: NSView, events: [GuardMonitorEvent]) -> NSView {
+        let button = GuardPopoverButton()
+        button.title = ""
+        button.isBordered = false
+        button.target = self
+        button.action = #selector(openRecentActivity(_:))
+        button.representedEvents = events
+        button.toolTip = events.count == 1
+            ? "Open this activity in Guard Monitor"
+            : "Open these \(events.count) activities in Guard Monitor"
+        button.setAccessibilityLabel(events.count == 1
+            ? "Open recent Guard activity"
+            : "Open \(events.count) recent Guard activities")
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.heightAnchor.constraint(equalToConstant: 30).isActive = true
+
+        content.translatesAutoresizingMaskIntoConstraints = false
+        button.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: button.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: button.trailingAnchor),
+            content.topAnchor.constraint(equalTo: button.topAnchor),
+            content.bottomAnchor.constraint(equalTo: button.bottomAnchor)
+        ])
+        return button
+    }
+
     func recentActivityGroupRow(actor: String, events: [GuardMonitorEvent]) -> NSView {
-        let row = NSStackView()
+        let row = GuardButtonContentStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 9
@@ -1423,7 +1463,16 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         let bypass = events.contains(where: isGuardBypassActivity)
         let symbol = bypass ? "figure.run" : (denied ? "xmark.shield.fill" : "checkmark.shield.fill")
         let tint: NSColor = denied ? .systemRed : (bypass ? .systemOrange : .secondaryLabelColor)
-        row.addArrangedSubview(customRowSymbol(symbol, tint: tint))
+        if bypass,
+           let event = events.first,
+           let applicationIcon = originatingApplicationIcon(
+               named: guardBypassActorLabel(for: event),
+               processIdentifier: event.launcherPid
+           ) {
+            row.addArrangedSubview(customRowApplicationIcon(applicationIcon, description: actor))
+        } else {
+            row.addArrangedSubview(customRowSymbol(symbol, tint: tint))
+        }
 
         let text = NSStackView()
         text.orientation = .vertical
@@ -1450,6 +1499,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         text.addArrangedSubview(detail)
         row.addArrangedSubview(text)
         row.addArrangedSubview(NSView())
+        row.addArrangedSubview(symbolImage("chevron.right", tint: .tertiaryLabelColor, size: 8, weight: .semibold))
         return row
     }
 
@@ -1764,9 +1814,21 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
         popover.performClose(sender)
     }
+
+    @objc func openRecentActivity(_ sender: Any?) {
+        guard let button = sender as? GuardPopoverButton, !button.representedEvents.isEmpty else {
+            openMonitor(sender)
+            return
+        }
+        monitor?.revealRecentActivity(button.representedEvents)
+        NSApp.activate(ignoringOtherApps: true)
+        popover.performClose(sender)
+        statusMenu.cancelTracking()
+    }
 }
 
-final class GuardPopoverButton: NSButton {
+class GuardPopoverButton: NSButton {
+    var representedEvents: [GuardMonitorEvent] = []
     private var trackingAreaRef: NSTrackingArea?
     private var isHovering = false {
         didSet { updateBackground() }
@@ -10471,6 +10533,33 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         guard selectEventFromNotification(userInfo: userInfo) else { return }
         renderSelectedInspectorIfNeeded(force: true)
         tableView.scrollRowToVisible(tableView.selectedRow)
+    }
+
+    func revealRecentActivity(_ targetEvents: [GuardMonitorEvent]) {
+        guard !targetEvents.isEmpty else { return }
+        monitorSearchField.stringValue = ""
+        if targetEvents.allSatisfy(isBypassActivity) {
+            monitorFilterControl.selectedSegment = 4
+        } else {
+            monitorFilterControl.selectedSegment = 0
+        }
+        rebuildActivityRows(keepSelection: false)
+
+        let targetKeys = Set(targetEvents.map(eventKey))
+        let preferredKinds = ["bypass", "bypass-summary", "destination", "event", "process"]
+        var selected = false
+        for kind in preferredKinds where !selected {
+            if let row = activityRows.first(where: { row in
+                row.kind == kind && row.event.map { targetKeys.contains(eventKey($0)) } == true
+            }) {
+                selected = selectActivityRow(rowKey: row.rowKey)
+            }
+        }
+        if selected {
+            renderSelectedInspectorIfNeeded(force: true)
+            tableView.scrollRowToVisible(tableView.selectedRow)
+        }
+        window?.makeKeyAndOrderFront(nil)
     }
 
     @discardableResult
