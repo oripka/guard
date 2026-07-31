@@ -4187,8 +4187,13 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
               var rule = row.value as? [String: Any] else { return nil }
         let host = rule["host"] as? String ?? rule["cidr"] as? String ?? ""
         guard !host.isEmpty else { return nil }
-        let methods = (rule["methods"] as? [String] ?? []).map { $0.uppercased() }.sorted()
+        let singularMethod = rule["method"] as? String ?? ""
+        let methods = ((rule["methods"] as? [String] ?? []) + (singularMethod.isEmpty ? [] : [singularMethod]))
+            .map { $0.uppercased() }
+            .sorted()
+        rule.removeValue(forKey: "method")
         rule["methods"] = methods
+        rule.removeValue(forKey: "path")
         rule.removeValue(forKey: "paths")
         let context = [
             row.kind,
@@ -4205,8 +4210,10 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
     }
 
     func httpPaths(in rows: [MonitorRuleRow]) -> [String] {
-        Array(Set(rows.flatMap { row in
-            (row.value as? [String: Any])?["paths"] as? [String] ?? []
+        Array(Set(rows.flatMap { row -> [String] in
+            guard let value = row.value as? [String: Any] else { return [] }
+            let singularPath = value["path"] as? String ?? ""
+            return (value["paths"] as? [String] ?? []) + (singularPath.isEmpty ? [] : [singularPath])
         })).sorted()
     }
 
@@ -4561,14 +4568,14 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             return
         }
         let targetRows = expandedRuleRows(targetRows)
-        let cacheRows = targetRows.filter { $0.field == "process.bypass" }
+        let cacheRows = targetRows.filter { $0.field == "process.bypass" || $0.source == "alert-decision" }
         if !cacheRows.isEmpty && action != "remove" {
-            statusLabel.stringValue = "Bypass decisions are cached decisions; delete them to ask again."
+            statusLabel.stringValue = "Alert decisions are cached decisions; delete them to ask again."
             return
         }
         if !cacheRows.isEmpty && action == "remove" {
             let skipped = targetRows.count - cacheRows.count
-            statusLabel.stringValue = "Deleting cached bypass decisions…"
+            statusLabel.stringValue = "Deleting cached decisions…"
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 var changed = 0
                 var failure: GuardDaemonResponse?
@@ -4592,7 +4599,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
                         self.statusLabel.stringValue = "Bypass decision update failed."
                         return
                     }
-                    self.statusLabel.stringValue = "Deleted \(changed) bypass decision\(changed == 1 ? "" : "s")\(skipped > 0 ? "; \(skipped) profile rule\(skipped == 1 ? "" : "s") skipped." : ".")"
+                    self.statusLabel.stringValue = "Deleted \(changed) cached decision\(changed == 1 ? "" : "s")\(skipped > 0 ? "; \(skipped) profile rule\(skipped == 1 ? "" : "s") skipped." : ".")"
                     self.parent?.didMutateRules(profile: self.selectedProfile)
                 }
             }
