@@ -3411,6 +3411,7 @@ struct MonitorRuleRow {
     let groupKey: String
     let memberSearchText: String
     let isGroupChild: Bool
+    let actor: String
 
     init(
         id: String = "",
@@ -3430,7 +3431,8 @@ struct MonitorRuleRow {
         groupCount: Int = 1,
         groupKey: String = "",
         memberSearchText: String = "",
-        isGroupChild: Bool = false
+        isGroupChild: Bool = false,
+        actor: String = ""
     ) {
         self.id = id
         self.kind = kind
@@ -3450,6 +3452,7 @@ struct MonitorRuleRow {
         self.groupKey = groupKey
         self.memberSearchText = memberSearchText
         self.isGroupChild = isGroupChild
+        self.actor = actor
     }
 }
 
@@ -3931,7 +3934,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
     func makeTable() -> NSView {
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
-        scroll.hasHorizontalScroller = false
+        scroll.hasHorizontalScroller = true
         scroll.borderType = .noBorder
         scroll.translatesAutoresizingMaskIntoConstraints = false
         scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 500).isActive = true
@@ -3951,6 +3954,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         tableView.addTableColumn(column("state", "State", 54))
         tableView.addTableColumn(column("action", "Action", 82))
         tableView.addTableColumn(column("kind", "Kind", 108))
+        tableView.addTableColumn(column("app", "App", 130))
         tableView.addTableColumn(column("scope", "Scope", 320))
         tableView.addTableColumn(column("detail", "Detail", 210))
         tableView.addTableColumn(column("lifetime", "Lifetime", 86))
@@ -4033,7 +4037,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         guard tableView.numberOfColumns >= 6 else { return }
         let available = tableView.enclosingScrollView?.contentView.bounds.width ?? tableView.bounds.width
         guard available > 0 else { return }
-        let fixed: CGFloat = 54 + 82 + 108 + 86 + 76
+        let fixed: CGFloat = 54 + 82 + 108 + 130 + 86 + 76
         let remaining = max(320, available - fixed - 12)
         let scopeWidth = floor(remaining * 0.58)
         let detailWidth = floor(remaining - scopeWidth)
@@ -4041,6 +4045,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             "state": 54,
             "action": 82,
             "kind": 108,
+            "app": 130,
             "scope": max(260, scopeWidth),
             "detail": max(160, detailWidth),
             "lifetime": 86,
@@ -4088,7 +4093,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         let collapsedRows = groupedRuleRows(rawRows, includeExpanded: false)
         let sourceRows = groupedRuleRows(rawRows, includeExpanded: true)
         renderedRows = sourceRows.filter { row in
-            let text = [row.kind, row.action, row.scope, row.detail, row.source, row.memberSearchText].joined(separator: " ").lowercased()
+            let text = [row.kind, row.action, row.actor, row.scope, row.detail, row.source, row.memberSearchText].joined(separator: " ").lowercased()
             let matchesSearch = search.isEmpty || text.contains(search)
             let matchesFilter: Bool
             switch filter {
@@ -4181,7 +4186,8 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
                 expiresAt: row.expiresAt,
                 groupCount: members.count,
                 groupKey: key,
-                memberSearchText: members.map { "\($0.scope) \($0.detail)" }.joined(separator: " ")
+                memberSearchText: members.map { "\($0.actor) \($0.scope) \($0.detail)" }.joined(separator: " "),
+                actor: row.actor
             ))
             if includeExpanded && members.count > 1 && expandedGroupKeys.contains(key) {
                 output.append(contentsOf: members.map { member in
@@ -4202,7 +4208,8 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
                         expiresAt: member.expiresAt,
                         groupCount: 1,
                         groupKey: key,
-                        isGroupChild: true
+                        isGroupChild: true,
+                        actor: member.actor
                     )
                 })
             }
@@ -4235,7 +4242,8 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             row.enabled ? "enabled" : "disabled",
             row.lifetime,
             row.approvalState,
-            row.source
+            row.source,
+            row.actor
         ].joined(separator: "|")
         let methodText = methods.isEmpty ? "Any method" : methods.joined(separator: ",")
         return ("\(context)|http-family|\(canonicalRuleValue(rule))", "\(methodText) \(host)")
@@ -4260,6 +4268,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             row.lifetime,
             row.approvalState,
             row.source,
+            row.actor,
             canonicalRuleValue(row.value)
         ].joined(separator: "|")
     }
@@ -4279,7 +4288,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         var seen = Set<String>()
         for row in displayRows {
             if row.isGroupChild {
-                let memberKey = row.field == "process.bypass" && !row.id.isEmpty
+                let memberKey = (row.field == "process.bypass" || row.source == "alert-decision") && !row.id.isEmpty
                     ? row.id
                     : "\(row.field)|\(canonicalRuleValue(row.value))"
                 if seen.insert(memberKey).inserted { expanded.append(row) }
@@ -4288,7 +4297,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             let key = row.groupKey.isEmpty ? ruleGroupingKey(row) : row.groupKey
             let members = grouped[key] ?? [row]
             for member in members {
-                let key = member.field == "process.bypass" && !member.id.isEmpty
+                let key = (member.field == "process.bypass" || member.source == "alert-decision") && !member.id.isEmpty
                     ? member.id
                     : "\(member.field)|\(canonicalRuleValue(member.value))"
                 guard seen.insert(key).inserted else { continue }
@@ -4312,6 +4321,9 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             let profile = decision["profile"] as? String ?? ""
             if !selectedProfile.isEmpty && !profile.isEmpty && profile != selectedProfile { return nil }
             let action = decision["action"] as? String ?? "allow"
+            let actor = decision["launcherApp"] as? String
+                ?? decision["launcherProcess"] as? String
+                ?? ""
             let rule = decision["rule"] as? [String: Any] ?? [:]
             let host = rule["host"] as? String ?? decision["host"] as? String ?? ""
             let methods = (rule["methods"] as? [String] ?? []).joined(separator: ", ")
@@ -4336,7 +4348,8 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
                 lifetime: decision["duration"] as? String ?? "temporary",
                 approvalState: "approved",
                 notes: "Timed HTTP decision active until \(expiresAt).",
-                expiresAt: expiresAt
+                expiresAt: expiresAt,
+                actor: actor
             )
         }
     }
@@ -4391,7 +4404,8 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
                     lifetime: lifetime,
                     approvalState: event.rulePersisted ? "approved" : "unapproved",
                     notes: event.rulePersisted ? "Persisted from prompt" : "Runtime decision; review before making persistent",
-                    expiresAt: event.expiresAt
+                    expiresAt: event.expiresAt,
+                    actor: event.launcherApp.isEmpty ? event.launcherProcess : event.launcherApp
                 )
             }
     }
@@ -4434,6 +4448,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         }
         for (key, value) in [
             ("Action", rule.action.capitalized),
+            ("App", rule.actor.isEmpty ? "Profile-wide" : rule.actor),
             ("Layer", rule.layer.isEmpty ? rule.kind : rule.layer),
             ("Lifetime", rule.lifetime),
             ("Review", rule.approvalState),
@@ -4712,6 +4727,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         case "state": text = rule.enabled ? "On" : "Off"
         case "action": text = rule.action
         case "kind": text = rule.groupCount > 1 ? "\(rule.kind) ×\(rule.groupCount)" : rule.kind
+        case "app": text = rule.actor.isEmpty ? "Profile-wide" : rule.actor
         case "scope": text = rule.scope
         case "detail": text = rule.detail
         case "lifetime": text = rule.lifetime
@@ -10297,6 +10313,10 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 let expiresAt = typedRule["expiresAt"] as? String ?? ""
                 let approval = typedRule["approvalState"] as? String ?? "approved"
                 let notes = typedRule["notes"] as? String ?? ""
+                let processIdentity = typedRule["processIdentity"] as? [String: Any] ?? [:]
+                let launcherApp = processIdentity["launcherApp"] as? String ?? ""
+                let launcherProcess = processIdentity["launcherProcess"] as? String ?? ""
+                let actor = launcherApp.isEmpty ? launcherProcess : launcherApp
                 let detail = [
                     layer.isEmpty ? nil : layer,
                     lifetime.isEmpty ? nil : lifetime,
@@ -10318,7 +10338,8 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                     lifetime: lifetime,
                     approvalState: approval,
                     notes: notes,
-                    expiresAt: expiresAt
+                    expiresAt: expiresAt,
+                    actor: actor
                 )
             }.sorted { lhs, rhs in
                 if lhs.enabled != rhs.enabled { return lhs.enabled && !rhs.enabled }
