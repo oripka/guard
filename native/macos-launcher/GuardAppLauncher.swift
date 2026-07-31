@@ -6472,6 +6472,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         window.isMovableByWindowBackground = true
         window.minSize = NSSize(width: 900, height: 500)
         window.isRestorable = false
+        window.isReleasedWhenClosed = false
         window.center()
         window.delegate = self
 
@@ -6548,6 +6549,15 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         // The monitor window is only one surface of the menu-bar app. Keep the
         // event timers and managed daemon alive when the user closes it so the
         // status item and native alerts continue to receive current state.
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        // Guard is a menu-bar app. Treat the red close button as Hide so the
+        // same native window, outline state, and inspector can be presented
+        // again from the status popover. A closed NSWindow cannot reliably be
+        // ordered front a second time even while guardd remains active.
+        sender.orderOut(nil)
+        return false
     }
 
     @objc func applicationWillTerminate(_ notification: Notification) {
