@@ -415,7 +415,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
     let recentStack = NSStackView()
     let deniedBadgeLabel = NSTextField(labelWithString: "0")
     let deniedRow = NSButton()
-    let popoverContentWidth: CGFloat = 312
+    let popoverContentWidth: CGFloat = 288
     let menuContentInset: CGFloat = 16
     var lastNotifiedPendingCount = 0
     var seenSandboxDenialKeys: Set<String> = []
@@ -446,7 +446,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         populateStatusMenu()
         popover.behavior = .transient
         popover.animates = false
-        popover.contentSize = NSSize(width: 336, height: 330)
+        popover.contentSize = NSSize(width: 312, height: 292)
         popover.contentViewController = NSViewController()
         popover.contentViewController?.view = makePopoverView()
     }
@@ -507,28 +507,28 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .width
-        root.spacing = 6
+        root.spacing = 4
         root.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
         root.translatesAutoresizingMaskIntoConstraints = false
         background.addSubview(root)
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 12),
             root.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -12),
-            root.topAnchor.constraint(equalTo: background.topAnchor, constant: 10),
-            root.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -10),
+            root.topAnchor.constraint(equalTo: background.topAnchor, constant: 8),
+            root.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -8),
         ])
 
         root.addArrangedSubview(popoverHeader())
         root.addArrangedSubview(trafficSummary())
 
         let recentTitle = NSTextField(labelWithString: "Recent Guard Activity")
-        recentTitle.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        recentTitle.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
         recentTitle.textColor = .secondaryLabelColor
         recentTitle.alignment = .left
         recentTitle.maximumNumberOfLines = 1
         recentTitle.translatesAutoresizingMaskIntoConstraints = false
         recentTitle.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
-        recentTitle.heightAnchor.constraint(equalToConstant: 16).isActive = true
+        recentTitle.heightAnchor.constraint(equalToConstant: 15).isActive = true
         root.addArrangedSubview(recentTitle)
         root.setCustomSpacing(4, after: recentTitle)
 
@@ -680,8 +680,8 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         let card = NSStackView()
         card.orientation = .vertical
         card.alignment = .width
-        card.spacing = 7
-        card.edgeInsets = NSEdgeInsets(top: 9, left: 10, bottom: 8, right: 8)
+        card.spacing = 5
+        card.edgeInsets = NSEdgeInsets(top: 7, left: 8, bottom: 6, right: 6)
         card.wantsLayer = true
         card.layer?.cornerRadius = 9
         card.layer?.cornerCurve = .continuous
@@ -692,7 +692,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 9
+        row.spacing = 7
 
         row.addArrangedSubview(symbolCircle("shield.lefthalf.filled", tint: .controlAccentColor, fallback: "G"))
         let labelStack = NSStackView()
@@ -718,7 +718,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         let health = NSStackView()
         health.orientation = .horizontal
         health.alignment = .centerY
-        health.spacing = 10
+        health.spacing = 8
         health.addArrangedSubview(statusLine(daemonBadgeLabel, symbol: "bolt.horizontal.circle.fill"))
         health.addArrangedSubview(statusLine(extensionBadgeLabel, symbol: "shield.lefthalf.filled"))
         health.addArrangedSubview(NSView())
@@ -756,8 +756,8 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         let card = NSStackView()
         card.orientation = .vertical
         card.alignment = .width
-        card.spacing = 6
-        card.edgeInsets = NSEdgeInsets(top: 7, left: 9, bottom: 7, right: 9)
+        card.spacing = 5
+        card.edgeInsets = NSEdgeInsets(top: 5, left: 7, bottom: 5, right: 7)
         card.wantsLayer = true
         card.layer?.cornerRadius = 8
         card.layer?.cornerCurve = .continuous
@@ -768,7 +768,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         let metrics = NSStackView()
         metrics.orientation = .horizontal
         metrics.alignment = .centerY
-        metrics.spacing = 18
+        metrics.spacing = 14
         metrics.addArrangedSubview(metricLabel(label: allowedPillLabel, symbol: "checkmark.circle", tint: .systemGreen))
         metrics.addArrangedSubview(metricLabel(label: deniedPillLabel, symbol: "xmark.circle", tint: .systemRed))
         metrics.addArrangedSubview(NSView())
@@ -778,7 +778,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
             trafficTimeline.removeArrangedSubview(view)
             view.removeFromSuperview()
         }
-        sparkline.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        sparkline.heightAnchor.constraint(equalToConstant: 26).isActive = true
         card.addArrangedSubview(sparkline)
 
         trafficTimeline.orientation = .horizontal
@@ -866,7 +866,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         deniedRow.layer?.backgroundColor = NSColor.clear.cgColor
         deniedRow.contentTintColor = .labelColor
         deniedRow.translatesAutoresizingMaskIntoConstraints = false
-        deniedRow.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        deniedRow.heightAnchor.constraint(equalToConstant: 28).isActive = true
         deniedRow.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
 
         let row = NSStackView()
@@ -895,7 +895,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         row.addArrangedSubview(deniedBadgeLabel)
 
         let label = NSTextField(labelWithString: "Recently Denied")
-        label.font = NSFont.systemFont(ofSize: 13.5, weight: .medium)
+        label.font = NSFont.systemFont(ofSize: 13, weight: .medium)
         label.textColor = .labelColor
         row.addArrangedSubview(label)
         row.addArrangedSubview(NSView())
@@ -913,7 +913,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         button.layer?.cornerRadius = 6
         button.layer?.cornerCurve = .continuous
         button.translatesAutoresizingMaskIntoConstraints = false
-        button.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 24).isActive = true
         button.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
 
         let row = NSStackView()
@@ -931,7 +931,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         ])
 
         let label = NSTextField(labelWithString: title)
-        label.font = NSFont.systemFont(ofSize: 13.5, weight: .regular)
+        label.font = NSFont.systemFont(ofSize: 13, weight: .regular)
         label.textColor = .labelColor
         label.lineBreakMode = .byTruncatingTail
         label.maximumNumberOfLines = 1
@@ -955,8 +955,8 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         button.layer?.cornerCurve = .continuous
         button.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.16).cgColor
         button.translatesAutoresizingMaskIntoConstraints = false
-        button.widthAnchor.constraint(equalToConstant: 32).isActive = true
-        button.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        button.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 28).isActive = true
         return button
     }
 
@@ -978,13 +978,13 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
     func symbolCircle(_ symbol: String, tint: NSColor, fallback: String) -> NSView {
         let holder = NSView()
         holder.wantsLayer = true
-        holder.layer?.cornerRadius = 18
+        holder.layer?.cornerRadius = 15
         holder.layer?.cornerCurve = .continuous
         holder.layer?.backgroundColor = tint.cgColor
         holder.translatesAutoresizingMaskIntoConstraints = false
-        holder.widthAnchor.constraint(equalToConstant: 36).isActive = true
-        holder.heightAnchor.constraint(equalToConstant: 36).isActive = true
-        let image = symbolImage(symbol, tint: .white, size: 18, weight: .regular)
+        holder.widthAnchor.constraint(equalToConstant: 30).isActive = true
+        holder.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        let image = symbolImage(symbol, tint: .white, size: 15, weight: .regular)
         image.translatesAutoresizingMaskIntoConstraints = false
         holder.addSubview(image)
         NSLayoutConstraint.activate([
@@ -1063,9 +1063,9 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
 
     func resizePopover(recentRowCount: Int, hasTraffic: Bool) {
         let visibleRows = max(1, min(4, recentRowCount))
-        let activityHeight = CGFloat(visibleRows - 1) * 36
-        let chartHeight: CGFloat = hasTraffic ? 50 : 0
-        popover.contentSize = NSSize(width: 336, height: 330 + activityHeight + chartHeight)
+        let activityHeight = CGFloat(visibleRows - 1) * 32
+        let chartHeight: CGFloat = hasTraffic ? 44 : 0
+        popover.contentSize = NSSize(width: 312, height: 292 + activityHeight + chartHeight)
     }
 
     func statusItemTintColor(active: Bool) -> NSColor? {
@@ -1104,7 +1104,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         row.spacing = 9
         row.edgeInsets = NSEdgeInsets(top: 2, left: 2, bottom: 2, right: 2)
         row.translatesAutoresizingMaskIntoConstraints = false
-        row.heightAnchor.constraint(equalToConstant: 34).isActive = true
+        row.heightAnchor.constraint(equalToConstant: 30).isActive = true
         let denied = event.result == "deny" || event.result == "denied"
         let bypass = isGuardBypassActivity(event)
         let symbol = bypass ? "figure.run" : (denied ? "xmark.shield.fill" : "checkmark.shield.fill")
@@ -1118,14 +1118,14 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         text.translatesAutoresizingMaskIntoConstraints = false
         text.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let title = NSTextField(labelWithString: compactActorLabel(for: event))
-        title.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        title.font = NSFont.systemFont(ofSize: 12.5, weight: .semibold)
         title.maximumNumberOfLines = 1
         title.lineBreakMode = .byTruncatingTail
         title.alignment = .left
         title.translatesAutoresizingMaskIntoConstraints = false
         title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let detail = NSTextField(labelWithString: compactDestinationLabel(for: event))
-        detail.font = NSFont.systemFont(ofSize: 11.5)
+        detail.font = NSFont.systemFont(ofSize: 11)
         detail.textColor = denied ? .systemRed : (bypass ? .systemOrange : .secondaryLabelColor)
         detail.maximumNumberOfLines = 1
         detail.lineBreakMode = .byTruncatingMiddle
@@ -1176,7 +1176,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         row.spacing = 9
         row.edgeInsets = NSEdgeInsets(top: 2, left: 2, bottom: 2, right: 2)
         row.translatesAutoresizingMaskIntoConstraints = false
-        row.heightAnchor.constraint(equalToConstant: 34).isActive = true
+        row.heightAnchor.constraint(equalToConstant: 30).isActive = true
         let denied = events.contains { $0.result == "deny" || $0.result == "denied" || $0.status == "denied" }
         let bypass = events.contains(where: isGuardBypassActivity)
         let symbol = bypass ? "figure.run" : (denied ? "xmark.shield.fill" : "checkmark.shield.fill")
@@ -1191,13 +1191,13 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         text.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         let title = NSTextField(labelWithString: recentActivityGroupTitle(actor: actor, events: events))
-        title.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        title.font = NSFont.systemFont(ofSize: 12.5, weight: .semibold)
         title.maximumNumberOfLines = 1
         title.lineBreakMode = .byTruncatingTail
         title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         let detail = NSTextField(labelWithString: recentActivityGroupDetail(for: events))
-        detail.font = NSFont.systemFont(ofSize: 11.5)
+        detail.font = NSFont.systemFont(ofSize: 11)
         detail.textColor = denied ? .systemRed : (bypass ? .systemOrange : .secondaryLabelColor)
         detail.maximumNumberOfLines = 1
         detail.lineBreakMode = .byTruncatingMiddle
@@ -1257,7 +1257,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
 
     func emptyRecentRow() -> NSView {
         let label = NSTextField(labelWithString: "No recent Guard activity")
-        label.font = NSFont.systemFont(ofSize: 13)
+        label.font = NSFont.systemFont(ofSize: 12)
         label.textColor = .tertiaryLabelColor
         label.translatesAutoresizingMaskIntoConstraints = false
         label.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
@@ -1286,12 +1286,12 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
     func customRowSymbol(_ symbol: String, tint: NSColor) -> NSView {
         let slot = NSView()
         slot.translatesAutoresizingMaskIntoConstraints = false
-        slot.widthAnchor.constraint(equalToConstant: 31).isActive = true
-        slot.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        slot.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        slot.heightAnchor.constraint(equalToConstant: 16).isActive = true
 
         let imageView = NSImageView()
         if #available(macOS 11.0, *) {
-            let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+            let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .regular)
             let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(config)
             image?.isTemplate = true
             imageView.image = image
@@ -1304,8 +1304,8 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
             imageView.leadingAnchor.constraint(equalTo: slot.leadingAnchor),
             imageView.centerYAnchor.constraint(equalTo: slot.centerYAnchor),
         ])
-        imageView.widthAnchor.constraint(equalToConstant: 18).isActive = true
-        imageView.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        imageView.widthAnchor.constraint(equalToConstant: 16).isActive = true
+        imageView.heightAnchor.constraint(equalToConstant: 16).isActive = true
         return slot
     }
 
