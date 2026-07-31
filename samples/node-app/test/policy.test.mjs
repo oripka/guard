@@ -2290,6 +2290,17 @@ test('iron-proxy backend swaps proxy tokens for scoped secrets without exposing 
     assert.equal(json.authorization, 'Bearer real-secret-value-from-parent-only')
     assert.equal(result.stdout.includes('guard-proxy-token-for-test'), false)
 
+    const environment = await runGuardCommandAsync([
+      '--profile',
+      'network-iron-secret-injection',
+      '/usr/bin/env',
+    ], {
+      GUARD_TEST_REAL_SECRET: 'real-secret-value-from-parent-only',
+    })
+    expectOk(environment)
+    assert.equal(environment.stdout.includes('GUARD_TEST_REAL_SECRET='), false)
+    assert.equal(environment.stdout.includes('real-secret-value-from-parent-only'), false)
+
     const missingProxyToken = await runGuardCommandAsync([
       '--profile',
       'network-iron-secret-injection',

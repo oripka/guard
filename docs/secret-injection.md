@@ -16,6 +16,11 @@ The workload sees only a harmless proxy token. When a matching request passes
 through `iron-proxy`, Guard swaps that proxy token for the real secret only for
 the configured host, method, path, and header.
 
+For environment-backed secrets, Guard also strips the configured source
+variables from the sandboxed child process environment. The runner and proxy can
+read the real value before launch, but the workload does not inherit that env
+var by default.
+
 ## Defaults
 
 Secret injection is off by default. Enable it per project in
@@ -98,6 +103,9 @@ Authorization: Bearer sk-real-value-from-your-shell
 ```
 
 The guarded process never receives `sk-real-value-from-your-shell` from Guard.
+It can still read the committed project profile and see the proxy token, so the
+security boundary is the scoped proxy rewrite, `require: true`, and the narrow
+HTTP rules, not secrecy of the placeholder token.
 
 ## Fields
 
@@ -137,10 +145,10 @@ Secret injection protects against:
 - bypass attempts where code sends its own credential value instead of the
   configured proxy token, when `require` is true.
 
-It does not protect against a malicious dependency that can intentionally send
-requests to an allowed route with the proxy token. Pair secret injection with
-narrow `network.httpRules`, filesystem secret denies, subprocess policy, and
-package-install hardening.
+It does not protect against a malicious dependency that can intentionally read
+the project profile, find the proxy token, and send requests to an allowed route.
+Pair secret injection with narrow `network.httpRules`, `require: true`,
+filesystem secret denies, subprocess policy, and package-install hardening.
 
 ## Global Defaults
 
