@@ -333,6 +333,7 @@ final class GuardApplicationDelegate: NSObject, NSApplicationDelegate, UNUserNot
     @discardableResult
     func revealMonitor() -> Bool {
         guard let controller = monitorController else { return false }
+        NSApp.setActivationPolicy(.regular)
         if let window = controller.window {
             if window.isMiniaturized {
                 window.deminiaturize(nil)
@@ -2388,6 +2389,7 @@ enum GuardUISetting {
     static let trafficWindow = "dev.guard.settings.trafficWindow"
     static let defaultLifetime = "dev.guard.settings.defaultLifetime"
     static let defaultScope = "dev.guard.settings.defaultScope"
+    static let performanceMetrics = "dev.guard.settings.performanceMetrics"
 }
 
 func monitorDefaultLifetimeValue() -> String {
@@ -3026,6 +3028,7 @@ struct MonitorActivityRow {
     let activity: String
     let decision: String
     let time: String
+    let performance: String
     let event: GuardMonitorEvent?
 
     init(
@@ -3038,6 +3041,7 @@ struct MonitorActivityRow {
         activity: String,
         decision: String,
         time: String,
+        performance: String = "",
         event: GuardMonitorEvent?
     ) {
         self.isGroup = isGroup
@@ -3049,8 +3053,41 @@ struct MonitorActivityRow {
         self.activity = activity
         self.decision = decision
         self.time = time
+        self.performance = performance
         self.event = event
     }
+}
+
+struct GuardProcessMetric: Sendable {
+    let pid: Int
+    let cpuPercent: Double
+    let residentBytes: UInt64
+}
+
+struct GuardDockerProcess: Sendable {
+    let pid: Int
+    let parentPid: Int
+    let user: String
+    let cpuPercent: Double
+    let residentBytes: UInt64
+    let executable: String
+    let command: String
+}
+
+struct GuardDockerContainer: Sendable {
+    let id: String
+    let name: String
+    let image: String
+    let command: String
+    let status: String
+    let ports: String
+    let cpuPercent: String
+    let memoryUsage: String
+    let memoryPercent: String
+    let blockIO: String
+    let networkIO: String
+    let processCount: String
+    let processes: [GuardDockerProcess]
 }
 
 struct GuardDaemonResponse: Sendable {
@@ -3074,6 +3111,8 @@ struct GuardEventFetchPayload: Sendable {
     let daemonEventsData: Data?
     let projectsData: Data?
     let localEvents: [GuardMonitorEvent]?
+    let dockerContainers: [GuardDockerContainer]
+    let processMetrics: [Int: GuardProcessMetric]
 }
 
 struct GuardPolicyFetchPayload: Sendable {
@@ -4933,6 +4972,8 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     var window: NSWindow?
     var events: [GuardMonitorEvent] = []
     var activityRows: [MonitorActivityRow] = []
+    var dockerContainers: [GuardDockerContainer] = []
+    var processMetrics: [Int: GuardProcessMetric] = [:]
     var refreshTimer: Timer?
     var pendingAlertTimer: Timer?
     var pendingAlertPollInFlight = false
@@ -4989,6 +5030,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     let clearMonitorSearchButton = NSButton()
     let focusMonitorSearchButton = NSButton()
     let monitorTimeWindowButton = NSButton()
+    let performanceMetricsButton = NSButton()
     weak var toolbarSearchField: NSSearchField?
     let monitorFilterControl = NSSegmentedControl(labels: ["All", "Network", "Blocked", "Files", "Bypass", "Alerts"], trackingMode: .selectOne, target: nil, action: nil)
     let statusLabel = NSTextField(labelWithString: "")
@@ -5044,6 +5086,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     var logTextView: NSTextView?
     var eventLogWindowController: EventLogWindowController?
     var monitorTimeWindowMinutes: Int? = 60
+    var showsPerformanceMetrics = false
     var didCleanUp = false
 
     init(config: GuardAppConfig) {
@@ -5052,9 +5095,11 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         monitorTimeWindowMinutes = Self.trafficWindowMinutes(
             for: UserDefaults.standard.string(forKey: GuardUISetting.trafficWindow)
         )
+        showsPerformanceMetrics = UserDefaults.standard.bool(forKey: GuardUISetting.performanceMetrics)
         monitorFilterControl.selectedSegment = 0
         configureMonitorFilterControl()
         configureMonitorTimeWindowButton()
+        configurePerformanceMetricsButton()
     }
 
     static func trafficWindowMinutes(for value: String?) -> Int? {
@@ -5071,6 +5116,19 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         monitorTimeWindowMinutes = Self.trafficWindowMinutes(for: value)
         rebuildActivityRows(keepSelection: true)
         updateMonitorSearchChrome()
+    }
+
+    @objc func togglePerformanceMetrics(_ sender: Any?) {
+        showsPerformanceMetrics.toggle()
+        UserDefaults.standard.set(showsPerformanceMetrics, forKey: GuardUISetting.performanceMetrics)
+        configurePerformanceMetricsButton()
+        tableView.tableColumns.first(where: { $0.identifier.rawValue == "performance" })?.isHidden = !showsPerformanceMetrics
+        if showsPerformanceMetrics {
+            reloadEvents(sender)
+        } else {
+            rebuildActivityRows(keepSelection: true)
+        }
+        resizeActivityColumns()
     }
 
     func show() {
@@ -5291,6 +5349,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             NSToolbarItem.Identifier("search"),
             NSToolbarItem.Identifier("timeWindow"),
             NSToolbarItem.Identifier("filter"),
+            NSToolbarItem.Identifier("performance"),
             .space,
             NSToolbarItem.Identifier("log"),
             NSToolbarItem.Identifier("syncExtension")
@@ -5352,6 +5411,11 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             item.label = "Filter"
             item.paletteLabel = "Activity Filter"
             item.view = monitorFilterControl
+        case "performance":
+            configurePerformanceMetricsButton()
+            item.label = "Performance"
+            item.paletteLabel = "Performance Metrics"
+            item.view = performanceMetricsButton
         case "log":
             item.label = "Log"
             item.paletteLabel = "Log"
@@ -5396,6 +5460,25 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         monitorTimeWindowButton.toolTip = "Cycle the activity time window."
         monitorTimeWindowButton.translatesAutoresizingMaskIntoConstraints = false
         updateMonitorSearchChrome()
+    }
+
+    func configurePerformanceMetricsButton() {
+        performanceMetricsButton.target = self
+        performanceMetricsButton.action = #selector(togglePerformanceMetrics(_:))
+        performanceMetricsButton.bezelStyle = .texturedRounded
+        performanceMetricsButton.controlSize = .small
+        performanceMetricsButton.title = ""
+        performanceMetricsButton.state = showsPerformanceMetrics ? .on : .off
+        performanceMetricsButton.toolTip = showsPerformanceMetrics
+            ? "Hide live CPU, memory, disk, and network metrics."
+            : "Show live CPU, memory, disk, and network metrics."
+        if #available(macOS 11.0, *) {
+            let symbol = showsPerformanceMetrics ? "gauge.with.dots.needle.67percent" : "gauge.with.dots.needle.0percent"
+            performanceMetricsButton.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Performance Metrics")
+            performanceMetricsButton.imagePosition = .imageOnly
+        } else {
+            performanceMetricsButton.title = "Metrics"
+        }
     }
 
     @objc func toolbarSearchChanged(_ sender: NSSearchField) {
@@ -5530,6 +5613,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         tableView.indentationMarkerFollowsCell = true
         tableView.addTableColumn(column("destination", title: "Resource", width: 280))
         tableView.addTableColumn(column("activity", title: "Activity / Reason", width: 360))
+        let performanceColumn = column("performance", title: "Performance", width: 230)
+        performanceColumn.isHidden = !showsPerformanceMetrics
+        tableView.addTableColumn(performanceColumn)
         tableView.addTableColumn(column("decision", title: "Decision", width: 112))
         tableView.autosaveTableColumns = false
         scroll.documentView = tableView
@@ -5587,11 +5673,13 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             tableView.frame = frame
         }
 
-        let decisionWidth: CGFloat = available < 760 ? 96 : 112
-        var appWidth = min(max(available * 0.36, 280), 420)
-        var destinationWidth = min(max(available * 0.22, 170), 320)
+        let performanceWidth: CGFloat = showsPerformanceMetrics ? min(max(available * 0.21, 190), 250) : 0
+        let contentAvailable = max(420, available - performanceWidth)
+        let decisionWidth: CGFloat = contentAvailable < 760 ? 96 : 112
+        var appWidth = min(max(contentAvailable * 0.36, 260), 420)
+        var destinationWidth = min(max(contentAvailable * 0.22, 150), 320)
         let activityMinimum: CGFloat = available < 760 ? 160 : 220
-        var activityWidth = available - appWidth - destinationWidth - decisionWidth
+        var activityWidth = contentAvailable - appWidth - destinationWidth - decisionWidth
 
         if activityWidth < activityMinimum {
             var deficit = activityMinimum - activityWidth
@@ -5600,17 +5688,18 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             deficit -= appReduction
             let destinationReduction = min(deficit, max(0, destinationWidth - 150))
             destinationWidth -= destinationReduction
-            activityWidth = max(activityMinimum, available - appWidth - destinationWidth - decisionWidth)
+            activityWidth = max(activityMinimum, contentAvailable - appWidth - destinationWidth - decisionWidth)
         }
 
-        if appWidth + destinationWidth + activityWidth + decisionWidth > available {
-            activityWidth = max(activityMinimum, available - appWidth - destinationWidth - decisionWidth)
+        if appWidth + destinationWidth + activityWidth + decisionWidth > contentAvailable {
+            activityWidth = max(activityMinimum, contentAvailable - appWidth - destinationWidth - decisionWidth)
         }
 
         let widths: [String: CGFloat] = [
             "app": floor(appWidth),
             "destination": floor(destinationWidth),
             "activity": floor(activityWidth),
+            "performance": floor(performanceWidth),
             "decision": floor(decisionWidth)
         ]
         for column in tableView.tableColumns {
@@ -8793,6 +8882,8 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     }
 
     func fetchEventPayload(client: GuardDaemonClient?, localEventLogPath: String) -> GuardEventFetchPayload {
+        let containers = collectDockerContainers(includeMetrics: showsPerformanceMetrics)
+        let metrics = showsPerformanceMetrics ? collectHostProcessMetrics() : [:]
         if let client,
            let eventResponse = client.request(
                path: "/events",
@@ -8805,15 +8896,138 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 projectsData: projectsResponse.flatMap {
                     (200..<300).contains($0.statusCode) ? $0.data : nil
                 },
-                localEvents: localEvents(from: readEventLogTail(at: localEventLogPath))
+                localEvents: localEvents(from: readEventLogTail(at: localEventLogPath)),
+                dockerContainers: containers,
+                processMetrics: metrics
             )
         }
 
         return GuardEventFetchPayload(
             daemonEventsData: nil,
             projectsData: nil,
-            localEvents: localEvents(from: readEventLogTail(at: localEventLogPath))
+            localEvents: localEvents(from: readEventLogTail(at: localEventLogPath)),
+            dockerContainers: containers,
+            processMetrics: metrics
         )
+    }
+
+    func runtimeCommand(_ executable: String, _ arguments: [String], timeout: TimeInterval = 1.5) -> String? {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in finished.signal() }
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+        if finished.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
+            if finished.wait(timeout: .now() + 0.2) == .timedOut {
+                kill(process.processIdentifier, SIGKILL)
+            }
+            return nil
+        }
+        guard process.terminationStatus == 0 else { return nil }
+        return String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+    }
+
+    func dockerExecutablePath() -> String? {
+        ["/usr/local/bin/docker", "/opt/homebrew/bin/docker", "/usr/bin/docker"].first {
+            FileManager.default.isExecutableFile(atPath: $0)
+        }
+    }
+
+    func collectDockerContainers(includeMetrics: Bool) -> [GuardDockerContainer] {
+        guard let docker = dockerExecutablePath(),
+              let listing = runtimeCommand(
+                  docker,
+                  ["ps", "--format", "{{.ID}}\\t{{.Names}}\\t{{.Image}}\\t{{.Command}}\\t{{.Status}}\\t{{.Ports}}"],
+                  timeout: 1.2
+              ) else {
+            return []
+        }
+        var stats: [String: [String]] = [:]
+        if includeMetrics,
+           let statsOutput = runtimeCommand(
+               docker,
+               ["stats", "--no-stream", "--format", "{{.ID}}\\t{{.CPUPerc}}\\t{{.MemUsage}}\\t{{.MemPerc}}\\t{{.BlockIO}}\\t{{.NetIO}}\\t{{.PIDs}}"],
+               timeout: 2.5
+           ) {
+            for line in statsOutput.split(whereSeparator: \.isNewline) {
+                let fields = String(line).components(separatedBy: "\t")
+                if let id = fields.first, fields.count >= 7 {
+                    stats[id] = fields
+                }
+            }
+        }
+        return listing.split(whereSeparator: \.isNewline).prefix(32).compactMap { line in
+            let fields = String(line).components(separatedBy: "\t")
+            guard fields.count >= 6 else { return nil }
+            let id = fields[0]
+            let stat = stats[id] ?? []
+            let processOutput = runtimeCommand(
+                docker,
+                ["top", id, "-eo", "pid,ppid,user,pcpu,rss,comm,args"],
+                timeout: 1.0
+            )
+            return GuardDockerContainer(
+                id: id,
+                name: fields[1],
+                image: fields[2],
+                command: fields[3].trimmingCharacters(in: CharacterSet(charactersIn: "\"")),
+                status: fields[4],
+                ports: fields[5],
+                cpuPercent: stat[safe: 1] ?? "",
+                memoryUsage: stat[safe: 2] ?? "",
+                memoryPercent: stat[safe: 3] ?? "",
+                blockIO: stat[safe: 4] ?? "",
+                networkIO: stat[safe: 5] ?? "",
+                processCount: stat[safe: 6] ?? "",
+                processes: dockerProcesses(from: processOutput)
+            )
+        }
+    }
+
+    func dockerProcesses(from output: String?) -> [GuardDockerProcess] {
+        guard let output else { return [] }
+        return output.split(whereSeparator: \.isNewline).dropFirst().prefix(48).compactMap { line in
+            let fields = line.split(maxSplits: 6, whereSeparator: \.isWhitespace).map(String.init)
+            guard fields.count >= 6 else { return nil }
+            return GuardDockerProcess(
+                pid: Int(fields[0]) ?? 0,
+                parentPid: Int(fields[1]) ?? 0,
+                user: fields[2],
+                cpuPercent: Double(fields[3]) ?? 0,
+                residentBytes: (UInt64(fields[4]) ?? 0) * 1024,
+                executable: fields[5],
+                command: fields[safe: 6] ?? fields[5]
+            )
+        }
+    }
+
+    func collectHostProcessMetrics() -> [Int: GuardProcessMetric] {
+        guard let output = runtimeCommand(
+            "/bin/ps",
+            ["-axo", "pid=,pcpu=,rss="],
+            timeout: 1.2
+        ) else {
+            return [:]
+        }
+        var result: [Int: GuardProcessMetric] = [:]
+        for line in output.split(whereSeparator: \.isNewline) {
+            let fields = line.split(whereSeparator: \.isWhitespace)
+            guard fields.count >= 3,
+                  let pid = Int(fields[0]),
+                  let cpu = Double(fields[1]),
+                  let rss = UInt64(fields[2]) else { continue }
+            result[pid] = GuardProcessMetric(pid: pid, cpuPercent: cpu, residentBytes: rss * 1024)
+        }
+        return result
     }
 
     func readEventLogTail(at path: String, maximumBytes: UInt64 = 4 * 1024 * 1024) -> Data? {
@@ -8876,6 +9090,8 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         }
 
         events = Array(loaded.prefix(250))
+        dockerContainers = payload.dockerContainers
+        processMetrics = payload.processMetrics
         updateTrafficSummary()
         if managedDaemon?.isRunning == true && !daemonConnected {
             daemonStatusText = "guardd starting"
@@ -8901,7 +9117,10 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         }
         suppressSelectionChange = false
         renderSelectedInspectorIfNeeded(force: forceInspectorRender)
-        statusLabel.stringValue = "\(events.count) recent event\(events.count == 1 ? "" : "s") · \(daemonStatusText) · auto-refresh on"
+        let containerStatus = dockerContainers.isEmpty
+            ? ""
+            : " · \(dockerContainers.count) running container\(dockerContainers.count == 1 ? "" : "s")"
+        statusLabel.stringValue = "\(events.count) recent event\(events.count == 1 ? "" : "s")\(containerStatus) · \(daemonStatusText) · auto-refresh on"
         (NSApp.delegate as? GuardApplicationDelegate)?.statusController?.refresh()
     }
 
@@ -10236,6 +10455,129 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         )
     }
 
+    func formattedByteCount(_ bytes: UInt64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .memory
+        formatter.allowedUnits = [.useKB, .useMB, .useGB]
+        formatter.includesUnit = true
+        formatter.isAdaptive = true
+        return formatter.string(fromByteCount: Int64(bytes))
+    }
+
+    func performanceSummary(for events: [GuardMonitorEvent]) -> String {
+        guard showsPerformanceMetrics else { return "" }
+        let metrics = Set(events.map(\.pid).filter { $0 > 0 }).compactMap { processMetrics[$0] }
+        guard !metrics.isEmpty else { return "—" }
+        let cpu = metrics.reduce(0) { $0 + $1.cpuPercent }
+        let memory = metrics.reduce(UInt64(0)) { $0 + $1.residentBytes }
+        return String(format: "CPU %.1f%% · %@", cpu, formattedByteCount(memory))
+    }
+
+    func dockerPerformanceSummary(_ container: GuardDockerContainer) -> String {
+        guard showsPerformanceMetrics else { return "" }
+        let parts = [
+            container.cpuPercent.isEmpty ? nil : "CPU \(container.cpuPercent)",
+            container.memoryUsage.isEmpty ? nil : "MEM \(container.memoryUsage.components(separatedBy: " / ").first ?? container.memoryUsage)",
+            container.blockIO.isEmpty ? nil : "DISK \(container.blockIO)"
+        ].compactMap { $0 }
+        return parts.isEmpty ? "—" : parts.joined(separator: " · ")
+    }
+
+    func meaningfulDockerProcessLabel(_ process: GuardDockerProcess) -> String {
+        let executable = URL(fileURLWithPath: process.executable).lastPathComponent
+        let lower = executable.lowercased()
+        let tokens = process.command.split(whereSeparator: \.isWhitespace).map(String.init)
+        if lower == "celery",
+           let queues = tokens.first(where: { $0.hasPrefix("--queues=") })?.components(separatedBy: "=").last,
+           !queues.isEmpty {
+            return "celery · \(compactMiddle(queues, limit: 28))"
+        }
+        let interpreters = ["python", "python3", "node", "nodejs", "ruby", "bash", "sh", "zsh"]
+        let isInterpreter = interpreters.contains(where: { lower == $0 || lower.hasPrefix("\($0).") })
+        guard isInterpreter else {
+            return executable.isEmpty ? compactMiddle(process.command, limit: 42) : executable
+        }
+        if let moduleIndex = tokens.firstIndex(of: "-m"), tokens.indices.contains(moduleIndex + 1) {
+            return "\(executable) · \(tokens[moduleIndex + 1])"
+        }
+        let meaningful = tokens.dropFirst().first { token in
+            !token.hasPrefix("-") &&
+                token != "python" && token != "python3" && token != "node" &&
+                token != "bash" && token != "sh" && token != "zsh"
+        }
+        guard let meaningful else { return executable }
+        let display = meaningful.contains("/") ? URL(fileURLWithPath: meaningful).lastPathComponent : meaningful
+        return "\(executable) · \(compactMiddle(display, limit: 32))"
+    }
+
+    func dockerProcessContext(_ process: GuardDockerProcess) -> String {
+        let tokens = process.command.split(whereSeparator: \.isWhitespace).map(String.init)
+        let contextTokens = tokens.dropFirst().filter { token in
+            token != process.executable && URL(fileURLWithPath: token).lastPathComponent != process.executable
+        }
+        if process.executable.lowercased() == "celery" {
+            let useful = contextTokens.filter {
+                $0.hasPrefix("--queues=") ||
+                    $0.hasPrefix("--hostname=") ||
+                    $0.hasPrefix("--concurrency=") ||
+                    $0.hasPrefix("--pool=")
+            }
+            if !useful.isEmpty {
+                return compactMiddle(useful.joined(separator: " "), limit: 68)
+            }
+        }
+        let context = contextTokens.joined(separator: " ")
+        return context.isEmpty ? process.user : compactMiddle(context, limit: 68)
+    }
+
+    func dockerActivityRows() -> [MonitorActivityRow] {
+        guard monitorFilterControl.selectedSegment == 0 else { return [] }
+        let query = monitorSearchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var rows: [MonitorActivityRow] = []
+        for container in dockerContainers {
+            let processText = container.processes.map { "\($0.executable) \($0.command)" }.joined(separator: " ")
+            let searchable = "\(container.name) \(container.image) \(container.command) \(container.status) \(container.ports) \(processText)".lowercased()
+            guard query.isEmpty || searchable.contains(query) else { continue }
+            let key = "docker:\(container.id)"
+            let activityParts = [
+                container.status,
+                container.processes.isEmpty ? nil : "\(container.processes.count) live command\(container.processes.count == 1 ? "" : "s")",
+                container.ports.isEmpty ? nil : container.ports
+            ].compactMap { $0 }
+            rows.append(MonitorActivityRow(
+                isGroup: true,
+                kind: "docker-container",
+                level: 0,
+                rowKey: key,
+                app: container.name,
+                destination: container.image,
+                activity: activityParts.joined(separator: " · "),
+                decision: "running",
+                time: "",
+                performance: dockerPerformanceSummary(container),
+                event: nil
+            ))
+            for (index, process) in container.processes.enumerated() {
+                rows.append(MonitorActivityRow(
+                    isGroup: false,
+                    kind: "docker-process",
+                    level: 1,
+                    rowKey: "\(key)/process:\(process.pid):\(index)",
+                    app: meaningfulDockerProcessLabel(process),
+                    destination: dockerProcessContext(process),
+                    activity: "PID \(process.pid) · parent \(process.parentPid) · \(process.user)",
+                    decision: "container",
+                    time: "",
+                    performance: showsPerformanceMetrics
+                        ? String(format: "CPU %.1f%% · %@", process.cpuPercent, formattedByteCount(process.residentBytes))
+                        : "",
+                    event: nil
+                ))
+            }
+        }
+        return rows
+    }
+
     func buildActivityRows(from events: [GuardMonitorEvent]) -> [MonitorActivityRow] {
         let showingFiles = monitorFilterControl.selectedSegment == 0 || monitorFilterControl.selectedSegment == 3
         let showingBypass = monitorFilterControl.selectedSegment == 0 || monitorFilterControl.selectedSegment == 4
@@ -10264,7 +10606,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             didAutoExpandActivityGroups = true
         }
 
-        var rows: [MonitorActivityRow] = []
+        var rows: [MonitorActivityRow] = dockerActivityRows()
         for app in order {
             let groupEvents = grouped[app] ?? []
             let summary = projectSummary(for: groupEvents, allowSubprocess: false)
@@ -10296,6 +10638,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 activity: summaryParts.isEmpty ? fallbackActivitySummary(for: groupEvents) : summaryParts.joined(separator: " · "),
                 decision: denied > 0 ? "review" : "active",
                 time: "",
+                performance: performanceSummary(for: groupEvents),
                 event: groupEvents.first
             ))
             let visibleEvents = showingFiles
@@ -10340,6 +10683,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                     activity: processSummaryParts.isEmpty ? fallbackActivitySummary(for: processEvents) : processSummaryParts.joined(separator: " · "),
                     decision: processDenied > 0 || bypassDenied > 0 || !processBypasses.isEmpty ? "review" : "active",
                     time: shortTime(processEvents.first?.at ?? ""),
+                    performance: performanceSummary(for: processEvents),
                     event: processEvents.first
                 ))
 
@@ -11196,6 +11540,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             return appCell(for: activityRow, rowIndex: row)
         case "destination": text = activityRow.destination
         case "activity": text = activityRow.activity
+        case "performance": text = activityRow.performance
         case "decision":
             return policySwitchCell(for: activityRow, rowIndex: row)
         case "time": text = activityRow.time
@@ -11207,7 +11552,10 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         label.font = activityRow.isGroup
             ? NSFont.systemFont(ofSize: 12.4, weight: id == "activity" ? .regular : .medium)
             : NSFont.systemFont(ofSize: 11.5)
-        if id == "decision" {
+        if id == "performance" {
+            label.font = NSFont.monospacedDigitSystemFont(ofSize: activityRow.isGroup ? 11.2 : 10.8, weight: .regular)
+            label.textColor = activityRow.performance.isEmpty ? .tertiaryLabelColor : .secondaryLabelColor
+        } else if id == "decision" {
             label.textColor = decisionColor(text)
         } else if activityRow.kind.hasPrefix("policy-") && id != "activity" {
             label.textColor = activityRow.isGroup ? .labelColor : .secondaryLabelColor
@@ -11576,6 +11924,11 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     }
 
     func iconForActivityRow(_ row: MonitorActivityRow) -> NSImage? {
+        if row.kind == "docker-container" || row.kind == "docker-process" {
+            let symbol = row.kind == "docker-container" ? "shippingbox.fill" : "terminal.fill"
+            if let image = configuredSymbol(symbol, description: row.app, pointSize: 17, weight: .semibold) { return image }
+            return NSImage(named: NSImage.applicationIconName)
+        }
         if row.kind == "inactive-root" || row.kind == "inactive-project" || row.kind == "inactive-profile" {
             if #available(macOS 11.0, *) {
                 let symbol = row.kind == "inactive-root" ? "archivebox" : row.kind == "inactive-project" ? "folder" : "doc.text"
@@ -11657,6 +12010,12 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     }
 
     func activityIconTint(for row: MonitorActivityRow) -> NSColor {
+        if row.kind == "docker-container" {
+            return .systemBlue
+        }
+        if row.kind == "docker-process" {
+            return .secondaryLabelColor
+        }
         if row.kind == "inactive-root" || row.kind == "inactive-project" || row.kind == "inactive-profile" {
             return .tertiaryLabelColor
         }
@@ -11876,6 +12235,34 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             return
         }
         renderedInspectorRowKey = activityRow.rowKey
+        if activityRow.kind == "docker-container" || activityRow.kind == "docker-process" {
+            selectedEventKey = nil
+            let containerId = activityRow.rowKey
+                .replacingOccurrences(of: "docker:", with: "")
+                .components(separatedBy: "/").first ?? ""
+            let container = dockerContainers.first { $0.id == containerId }
+            inspectorHelpLabel.stringValue = activityRow.kind == "docker-container" ? "Docker Container" : "Container Process"
+            inspectorTitleLabel.stringValue = activityRow.app
+            inspectorSummaryStack.isHidden = true
+            inspectorBodyLabel.isHidden = false
+            inspectorBodyLabel.stringValue = [
+                container.map { "Container: \($0.name)" },
+                container.map { "Image: \($0.image)" },
+                container.map { "State: \($0.status)" },
+                activityRow.kind == "docker-process" ? "Identity: \(activityRow.activity)" : nil,
+                container?.ports.isEmpty == false ? "Ports: \(container?.ports ?? "")" : nil,
+                container?.cpuPercent.isEmpty == false ? "CPU: \(container?.cpuPercent ?? "")" : nil,
+                container?.memoryUsage.isEmpty == false ? "Memory: \(container?.memoryUsage ?? "")" : nil,
+                container?.blockIO.isEmpty == false ? "Disk I/O: \(container?.blockIO ?? "")" : nil,
+                container?.networkIO.isEmpty == false ? "Network I/O: \(container?.networkIO ?? "")" : nil
+            ].compactMap { $0 }.joined(separator: "\n")
+            inspectorRuleLabel.isHidden = false
+            inspectorNoteLabel.isHidden = false
+            inspectorRuleLabel.stringValue = "Docker runtime state is read-only and refreshes with Guard activity."
+            inspectorNoteLabel.stringValue = "Container commands are grouped under the container; performance metrics come from Docker when enabled."
+            updateActionButtons(nil)
+            return
+        }
         if activityRow.kind == "app" {
             selectedEventKey = nil
             let appEvents = events.filter { appLabel(for: $0) == activityRow.app }
