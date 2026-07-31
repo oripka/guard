@@ -5039,7 +5039,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate, NSToolbarDeleg
     }
 }
 
-final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSOutlineViewDataSource, NSOutlineViewDelegate, NSMenuDelegate, NSToolbarDelegate {
+final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSOutlineViewDataSource, NSOutlineViewDelegate, NSMenuDelegate, NSToolbarDelegate, NSSplitViewDelegate {
     let config: GuardAppConfig
     var window: NSWindow?
     var events: [GuardMonitorEvent] = []
@@ -5213,7 +5213,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     private func show(makeVisible: Bool) {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1100, height: 680),
+            contentRect: NSRect(x: 0, y: 0, width: 1280, height: 720),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -5232,7 +5232,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             window.toolbarStyle = .unified
         }
         window.isMovableByWindowBackground = true
-        window.minSize = NSSize(width: 700, height: 440)
+        window.minSize = NSSize(width: 900, height: 500)
         window.isRestorable = false
         window.center()
         window.delegate = self
@@ -5293,8 +5293,8 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     func applyPreferredWindowFrame(_ window: NSWindow) {
         let screenFrame = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
-        let width = min(CGFloat(1100), screenFrame.width - 80)
-        let height = min(CGFloat(680), screenFrame.height - 80)
+        let width = min(CGFloat(1280), screenFrame.width - 60)
+        let height = min(CGFloat(720), screenFrame.height - 60)
         window.setFrame(
             NSRect(
                 x: screenFrame.midX - width / 2,
@@ -5545,7 +5545,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             ? "Hide live CPU, memory, disk, and network metrics."
             : "Show live CPU, memory, disk, and network metrics."
         if #available(macOS 11.0, *) {
-            let symbol = showsPerformanceMetrics ? "gauge.with.dots.needle.67percent" : "gauge.with.dots.needle.0percent"
+            let symbol = showsPerformanceMetrics ? "chart.bar.fill" : "chart.bar"
             performanceMetricsButton.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Performance Metrics")
             performanceMetricsButton.imagePosition = .imageOnly
         } else {
@@ -5602,6 +5602,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         let body = NSSplitView()
         body.isVertical = true
         body.dividerStyle = .thin
+        body.delegate = self
         body.translatesAutoresizingMaskIntoConstraints = false
         body.heightAnchor.constraint(greaterThanOrEqualToConstant: 360).isActive = true
 
@@ -5626,6 +5627,10 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         inspectorWidthConstraint = inspector.widthAnchor.constraint(equalToConstant: 320)
         inspectorWidthConstraint?.isActive = true
         return body
+    }
+
+    func splitViewDidResizeSubviews(_ notification: Notification) {
+        DispatchQueue.main.async { self.resizeActivityColumns() }
     }
 
     func makeTrafficFooter() -> NSView {
@@ -5654,6 +5659,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     func makeTable() -> NSView {
         let scroll = NSScrollView()
         configureOverlayScrollView(scroll)
+        scroll.hasHorizontalScroller = true
         scroll.contentInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 0)
         scroll.drawsBackground = true
         scroll.backgroundColor = .controlBackgroundColor
@@ -5689,6 +5695,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         performanceColumn.isHidden = !showsPerformanceMetrics
         tableView.addTableColumn(performanceColumn)
         tableView.addTableColumn(column("decision", title: "Decision", width: 112))
+        tableView.addTableColumn(column("time", title: "Time", width: 72))
         tableView.autosaveTableColumns = false
         scroll.documentView = tableView
         tableView.frame = scroll.contentView.bounds
@@ -5745,39 +5752,26 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             tableView.frame = frame
         }
 
-        let performanceWidth: CGFloat = showsPerformanceMetrics ? min(max(available * 0.21, 190), 250) : 0
-        let contentAvailable = max(420, available - performanceWidth)
-        let decisionWidth: CGFloat = contentAvailable < 760 ? 96 : 112
-        var appWidth = min(max(contentAvailable * 0.36, 260), 420)
-        var destinationWidth = min(max(contentAvailable * 0.22, 150), 320)
-        let activityMinimum: CGFloat = available < 760 ? 160 : 220
-        var activityWidth = contentAvailable - appWidth - destinationWidth - decisionWidth
-
-        if activityWidth < activityMinimum {
-            var deficit = activityMinimum - activityWidth
-            let appReduction = min(deficit * 0.35, max(0, appWidth - 260))
-            appWidth -= appReduction
-            deficit -= appReduction
-            let destinationReduction = min(deficit, max(0, destinationWidth - 150))
-            destinationWidth -= destinationReduction
-            activityWidth = max(activityMinimum, contentAvailable - appWidth - destinationWidth - decisionWidth)
-        }
-
-        if appWidth + destinationWidth + activityWidth + decisionWidth > contentAvailable {
-            activityWidth = max(activityMinimum, contentAvailable - appWidth - destinationWidth - decisionWidth)
-        }
+        let performanceWidth: CGFloat = showsPerformanceMetrics ? min(max(available * 0.18, 150), 220) : 0
+        let decisionWidth: CGFloat = available < 820 ? 84 : 100
+        let timeWidth: CGFloat = available < 820 ? 58 : 72
+        let flexibleWidth = max(360, available - performanceWidth - decisionWidth - timeWidth - 4)
+        let appWidth = max(150, flexibleWidth * 0.42)
+        let destinationWidth = max(105, flexibleWidth * 0.25)
+        let activityWidth = max(125, flexibleWidth - appWidth - destinationWidth)
 
         let widths: [String: CGFloat] = [
             "app": floor(appWidth),
             "destination": floor(destinationWidth),
             "activity": floor(activityWidth),
             "performance": floor(performanceWidth),
-            "decision": floor(decisionWidth)
+            "decision": floor(decisionWidth),
+            "time": floor(timeWidth)
         ]
         for column in tableView.tableColumns {
             guard let width = widths[column.identifier.rawValue] else { continue }
             column.width = width
-            column.minWidth = min(width, column.identifier.rawValue == "app" ? 260 : column.identifier.rawValue == "destination" ? 150 : column.identifier.rawValue == "activity" ? 160 : 70)
+            column.minWidth = min(width, column.identifier.rawValue == "app" ? 150 : column.identifier.rawValue == "destination" ? 105 : column.identifier.rawValue == "activity" ? 125 : 48)
         }
     }
 
@@ -7623,7 +7617,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     @objc func openRulesWindow(_ sender: Any?) {
         guard daemonConnected else {
-            statusLabel.stringValue = "guardd must be connected before opening the full rules window."
+            showDaemonRequired(feature: "Rules")
             return
         }
         let profile = selectedProfileName.isEmpty ? "guard" : selectedProfileName
@@ -7644,7 +7638,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     @objc func openTemplatesWindow(_ sender: Any?) {
         guard daemonConnected else {
-            statusLabel.stringValue = "guardd must be connected before opening templates."
+            showDaemonRequired(feature: "Templates")
             return
         }
         loadDaemonPolicyState(profile: selectedProfileName.isEmpty ? "guard" : selectedProfileName)
@@ -7696,6 +7690,30 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         actions.addArrangedSubview(apply)
         root.addArrangedSubview(actions)
         window.makeKeyAndOrderFront(nil)
+    }
+
+    func showDaemonRequired(feature: String) {
+        if managedDaemon == nil {
+            startDaemon(nil)
+        }
+        let starting = managedDaemon?.isRunning == true
+        statusLabel.stringValue = starting
+            ? "guardd is starting; \(feature.lowercased()) will be available shortly."
+            : "Start guardd to use \(feature.lowercased())."
+        guard let window else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = starting ? "Guard Is Starting" : "Guard Daemon Required"
+        alert.informativeText = starting
+            ? "Guard is loading local policy and recent activity. Try \(feature) again in a moment."
+            : "\(feature) needs the local Guard policy daemon. Open Settings to start it and review its status."
+        alert.addButton(withTitle: "Open Settings")
+        alert.addButton(withTitle: "OK")
+        alert.beginSheetModal(for: window) { response in
+            if response == .alertFirstButtonReturn {
+                self.openSettingsWindow(nil)
+            }
+        }
     }
 
     @objc func openSettingsWindow(_ sender: Any?) {
@@ -7938,7 +7956,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         generateTLSCAButton.isEnabled = daemonConnected
         rotateTLSCAButton.isEnabled = daemonConnected
         revokeTLSCAButton.isEnabled = daemonConnected
-        openRulesWindowButton.isEnabled = daemonConnected
+        openRulesWindowButton.isEnabled = true
         previewTemplateButton.isEnabled = daemonConnected && !templateNames.isEmpty
         applyTemplateButton.isEnabled = daemonConnected && !templateNames.isEmpty
     }
