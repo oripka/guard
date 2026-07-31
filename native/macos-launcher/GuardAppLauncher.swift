@@ -3942,6 +3942,8 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         tableView.rowHeight = 30
         tableView.dataSource = self
         tableView.delegate = self
+        tableView.target = self
+        tableView.doubleAction = #selector(toggleSelectedRuleGroup(_:))
         let menu = NSMenu(title: "Rule Actions")
         menu.delegate = self
         tableView.menu = menu
@@ -4738,14 +4740,23 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             rowView.translatesAutoresizingMaskIntoConstraints = false
             if id == "kind" {
                 if rule.groupCount > 1 && !rule.isGroupChild {
-                    let disclosure = NSButton()
-                    disclosure.setButtonType(.onOff)
-                    disclosure.bezelStyle = .disclosure
-                    disclosure.state = expandedGroupKeys.contains(rule.groupKey) ? .on : .off
-                    disclosure.target = self
-                    disclosure.action = #selector(toggleRuleGroup(_:))
+                    let expanded = expandedGroupKeys.contains(rule.groupKey)
+                    let disclosure = NSButton(
+                        image: NSImage(
+                            systemSymbolName: expanded ? "chevron.down" : "chevron.right",
+                            accessibilityDescription: expanded ? "Hide exact rules" : "Show exact rules"
+                        ) ?? NSImage(),
+                        target: self,
+                        action: #selector(toggleRuleGroup(_:))
+                    )
+                    disclosure.isBordered = false
+                    disclosure.imageScaling = .scaleProportionallyDown
+                    disclosure.contentTintColor = .secondaryLabelColor
                     disclosure.tag = row
-                    disclosure.toolTip = disclosure.state == .on ? "Hide exact rules" : "Show exact rules"
+                    disclosure.toolTip = expanded ? "Hide exact rules" : "Show exact rules"
+                    disclosure.translatesAutoresizingMaskIntoConstraints = false
+                    disclosure.widthAnchor.constraint(equalToConstant: 16).isActive = true
+                    disclosure.heightAnchor.constraint(equalToConstant: 18).isActive = true
                     rowView.addArrangedSubview(disclosure)
                 } else if rule.isGroupChild {
                     let indent = NSView()
@@ -4817,8 +4828,16 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
     }
 
     @objc func toggleRuleGroup(_ sender: NSButton) {
-        guard sender.tag >= 0 && sender.tag < renderedRows.count else { return }
-        let row = renderedRows[sender.tag]
+        toggleRuleGroup(at: sender.tag)
+    }
+
+    @objc func toggleSelectedRuleGroup(_ sender: Any?) {
+        toggleRuleGroup(at: tableView.clickedRow >= 0 ? tableView.clickedRow : tableView.selectedRow)
+    }
+
+    func toggleRuleGroup(at index: Int) {
+        guard index >= 0 && index < renderedRows.count else { return }
+        let row = renderedRows[index]
         guard row.groupCount > 1, !row.groupKey.isEmpty else { return }
         if expandedGroupKeys.contains(row.groupKey) {
             expandedGroupKeys.remove(row.groupKey)
