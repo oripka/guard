@@ -6312,6 +6312,33 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         let allowed = network.filter { $0.result == "allow" || $0.result == "allowed" }.count
         let fileEvents = groupEvents.filter { isFileActivity($0) }
         let bypasses = groupEvents.filter { isBypassActivity($0) }
+        let tlsMaintenance = groupEvents.filter { isTLSMaintenanceActivity($0) }
+        if app == "Guard TLS", !tlsMaintenance.isEmpty {
+            inspectorSummaryStack.addArrangedSubview(actorHeader(
+                title: "Guard TLS",
+                subtitle: "Local HTTPS inspection certificate service",
+                icon: iconForApp("Guard"),
+                sent: 0,
+                received: 0
+            ))
+            inspectorSummaryStack.addArrangedSubview(inspectorSection("What This Means"))
+            inspectorSummaryStack.addArrangedSubview(detailBlock([
+                "Guard prepared or reused local per-host certificates so explicitly enabled HTTPS inspection can work.",
+                "This is local Guard maintenance. It does not mean the remote website changed its certificate, and it is not attributed to Node, npm, Git, or Python."
+            ]))
+            inspectorSummaryStack.addArrangedSubview(inspectorSection("Status"))
+            inspectorSummaryStack.addArrangedSubview(detailKeyValueBlock([
+                ("Events", "\(tlsMaintenance.count)"),
+                ("Destinations", "\(Set(tlsMaintenance.compactMap { $0.host.isEmpty ? nil : $0.host }).count)"),
+                ("Trust", "Guard-local CA only"),
+                ("Network Traffic", "No connection implied by this event")
+            ]))
+            inspectorSummaryStack.addArrangedSubview(inspectorSection("Recent Destinations"))
+            for item in topCounts(tlsMaintenance.compactMap { $0.host.isEmpty ? nil : hostListLabel(for: $0) }, limit: 8) {
+                inspectorSummaryStack.addArrangedSubview(summaryListItem(symbol: "lock.shield", text: item))
+            }
+            return
+        }
         if network.isEmpty && !bypasses.isEmpty {
             renderBypassSummaryPanel(title: app, subtitle: "\(bypasses.count) unprotected execution review\(bypasses.count == 1 ? "" : "s")", events: bypasses, icon: iconForApp(app))
             return
@@ -11004,7 +11031,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             let allowed = decisions.filter { $0.result == "allow" }.count
             let domains = Set((decisions + flows).map { $0.host }).count
             let fileLike = groupEvents.filter { isFileActivity($0) }.count
+            let tlsMaintenance = groupEvents.filter { isTLSMaintenanceActivity($0) }
             let summaryParts = [
+                tlsMaintenance.isEmpty ? nil : "\(tlsMaintenance.count) local inspection certificate event\(tlsMaintenance.count == 1 ? "" : "s")",
                 domains == 0 ? nil : "\(domains) destination\(domains == 1 ? "" : "s")",
                 decisions.isEmpty ? nil : "\(allowed) allowed",
                 denied == 0 ? nil : "\(denied) denied",
@@ -11441,6 +11470,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     }
 
     func processLabel(for event: GuardMonitorEvent) -> String {
+        if isTLSMaintenanceActivity(event) {
+            return "Certificate service"
+        }
         if isBypassActivity(event) {
             return guardBypassTargetLabel(for: event)
         }
@@ -11667,6 +11699,12 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             event.type.hasPrefix("guard.alert.")
     }
 
+    func isTLSMaintenanceActivity(_ event: GuardMonitorEvent) -> Bool {
+        event.type == "tls.cert.changed" ||
+            event.type == "tls.ca.changed" ||
+            event.type == "tls.cert_cache_warmed"
+    }
+
     func isPolicyDecisionActivity(_ event: GuardMonitorEvent) -> Bool {
         guard !isBypassActivity(event) else { return false }
         return event.type == "network.decision" || event.type.hasPrefix("guard.alert.")
@@ -11752,7 +11790,13 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     }
 
     func hostListLabel(for event: GuardMonitorEvent) -> String {
-        event.host.isEmpty ? "-" : event.host
+        guard !event.host.isEmpty else { return "-" }
+        switch event.host.lowercased() {
+        case "169.254.169.254": return "Cloud metadata service (169.254.169.254)"
+        case "127.0.0.1": return "Localhost (127.0.0.1)"
+        case "::1": return "Localhost (::1)"
+        default: return event.host
+        }
     }
 
     func hostPortLabel(for event: GuardMonitorEvent) -> String {
@@ -12488,6 +12532,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     }
 
     func appLabel(for event: GuardMonitorEvent) -> String {
+        if isTLSMaintenanceActivity(event) {
+            return "Guard TLS"
+        }
         if isBypassActivity(event) {
             if !event.launcherApp.isEmpty {
                 return appLabel(event.launcherApp, decoratedWithLauncherFor: event)
@@ -12534,6 +12581,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     }
 
     func activityLabel(for event: GuardMonitorEvent) -> String {
+        if event.type == "tls.cert.changed" { return "Local inspection certificate ready" }
+        if event.type == "tls.ca.changed" { return "Local inspection authority updated" }
+        if event.type == "tls.cert_cache_warmed" { return "Inspection certificates prepared" }
         if isBypassActivity(event) {
             return bypassActivityLabel(for: event)
         }
