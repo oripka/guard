@@ -3407,6 +3407,7 @@ struct MonitorRuleRow {
     let approvalState: String
     let notes: String
     let expiresAt: String
+    let groupCount: Int
 
     init(
         id: String = "",
@@ -3422,7 +3423,8 @@ struct MonitorRuleRow {
         lifetime: String = "persistent",
         approvalState: String = "approved",
         notes: String = "",
-        expiresAt: String = ""
+        expiresAt: String = "",
+        groupCount: Int = 1
     ) {
         self.id = id
         self.kind = kind
@@ -3438,6 +3440,7 @@ struct MonitorRuleRow {
         self.approvalState = approvalState
         self.notes = notes
         self.expiresAt = expiresAt
+        self.groupCount = groupCount
     }
 }
 
@@ -4069,7 +4072,8 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         let search = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let filter = filterControl.selectedSegment
         let selectedSection = sidebar.selectedRow >= 0 ? sidebarSections[safe: sidebar.selectedRow] ?? "All Rules" : "All Rules"
-        let sourceRows = combinedRuleRows()
+        let rawRows = ungroupedRuleRows()
+        let sourceRows = groupedRuleRows(rawRows)
         renderedRows = sourceRows.filter { row in
             let text = [row.kind, row.action, row.scope, row.detail, row.source].joined(separator: " ").lowercased()
             let matchesSearch = search.isEmpty || text.contains(search)
@@ -4105,10 +4109,16 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         renderInspector()
         statusLabel.stringValue = sourceRows.isEmpty
             ? "No profile rules or recent decisions are available yet."
-            : "\(renderedRows.count) visible of \(sourceRows.count) rules and recent decisions."
+            : rawRows.count == sourceRows.count
+                ? "\(renderedRows.count) visible of \(sourceRows.count) rules and recent decisions."
+                : "\(renderedRows.count) visible groups · \(sourceRows.count) groups represent \(rawRows.count) rules and decisions."
     }
 
     func combinedRuleRows() -> [MonitorRuleRow] {
+        groupedRuleRows(ungroupedRuleRows())
+    }
+
+    func ungroupedRuleRows() -> [MonitorRuleRow] {
         var seen = Set<String>()
         var combined: [MonitorRuleRow] = []
         for row in rows + temporaryHttpDecisionRows() + recentDecisionRows() {
@@ -4118,6 +4128,76 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             combined.append(row)
         }
         return combined
+    }
+
+    func groupedRuleRows(_ sourceRows: [MonitorRuleRow]) -> [MonitorRuleRow] {
+        var groups: [String: [MonitorRuleRow]] = [:]
+        var order: [String] = []
+        for row in sourceRows {
+            let key = semanticRuleKey(row)
+            if groups[key] == nil { order.append(key) }
+            groups[key, default: []].append(row)
+        }
+        return order.compactMap { key in
+            guard let members = groups[key], let row = members.first else { return nil }
+            return MonitorRuleRow(
+                id: row.id,
+                kind: row.kind,
+                action: row.action,
+                scope: row.scope,
+                detail: row.detail,
+                enabled: row.enabled,
+                source: row.source,
+                field: row.field,
+                value: row.value,
+                layer: row.layer,
+                lifetime: row.lifetime,
+                approvalState: row.approvalState,
+                notes: row.notes,
+                expiresAt: row.expiresAt,
+                groupCount: members.count
+            )
+        }
+    }
+
+    func semanticRuleKey(_ row: MonitorRuleRow) -> String {
+        [
+            row.kind,
+            row.action,
+            row.field,
+            row.layer,
+            row.scope,
+            row.enabled ? "enabled" : "disabled",
+            row.lifetime,
+            row.approvalState,
+            row.source,
+            canonicalRuleValue(row.value)
+        ].joined(separator: "|")
+    }
+
+    func canonicalRuleValue(_ value: Any) -> String {
+        guard JSONSerialization.isValidJSONObject(["value": value]),
+              let data = try? JSONSerialization.data(withJSONObject: ["value": value], options: [.sortedKeys]),
+              let text = String(data: data, encoding: .utf8) else {
+            return String(describing: value)
+        }
+        return text
+    }
+
+    func expandedRuleRows(_ displayRows: [MonitorRuleRow]) -> [MonitorRuleRow] {
+        let grouped = Dictionary(grouping: ungroupedRuleRows(), by: semanticRuleKey)
+        var expanded: [MonitorRuleRow] = []
+        var seen = Set<String>()
+        for row in displayRows {
+            let members = grouped[semanticRuleKey(row)] ?? [row]
+            let actionableMembers = row.field == "process.bypass" ? members : Array(members.prefix(1))
+            for member in actionableMembers {
+                let key = member.id.isEmpty ? semanticRuleKey(member) : member.id
+                guard seen.insert(key).inserted else { continue }
+                expanded.append(member)
+            }
+        }
+        return expanded
     }
 
     func temporaryHttpDecisionRows() -> [MonitorRuleRow] {
@@ -4242,6 +4322,9 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         let rule = renderedRows[tableView.selectedRow]
         inspectorStack.addArrangedSubview(inspectorLabel(rule.scope, weight: .semibold))
         inspectorStack.addArrangedSubview(inspectorBadge(rule.enabled ? "Enabled" : "Disabled", color: rule.enabled ? .systemGreen : .secondaryLabelColor))
+        if rule.groupCount > 1 {
+            inspectorStack.addArrangedSubview(inspectorBadge("\(rule.groupCount) equivalent entries", color: .systemBlue))
+        }
         for (key, value) in [
             ("Action", rule.action.capitalized),
             ("Layer", rule.layer.isEmpty ? rule.kind : rule.layer),
@@ -4416,6 +4499,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             statusLabel.stringValue = "guardd must be connected before editing rules."
             return
         }
+        let targetRows = expandedRuleRows(targetRows)
         let cacheRows = targetRows.filter { $0.field == "process.bypass" }
         if !cacheRows.isEmpty && action != "remove" {
             statusLabel.stringValue = "Bypass decisions are cached decisions; delete them to ask again."
@@ -4520,7 +4604,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         switch id {
         case "state": text = rule.enabled ? "On" : "Off"
         case "action": text = rule.action
-        case "kind": text = rule.kind
+        case "kind": text = rule.groupCount > 1 ? "\(rule.kind) ×\(rule.groupCount)" : rule.kind
         case "scope": text = rule.scope
         case "detail": text = rule.detail
         case "lifetime": text = rule.lifetime
