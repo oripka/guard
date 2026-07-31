@@ -2164,6 +2164,76 @@ test('iron-proxy backend blocks non-matching HTTP methods', async () => {
   }
 })
 
+test('concurrent HTTP requests reuse a rule accepted by the first queued prompt', async () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'guard-concurrent-http-prompts-'))
+  const promptLog = join(tempRoot, 'prompts.log')
+  const helperPath = join(tempRoot, 'ask-helper.mjs')
+  const eventLog = join(tempRoot, 'events.jsonl')
+  const profilePath = writeGuardProfile(
+    'network-iron-concurrent-ask',
+    {
+      ...ironProxyNetworkProfileConfig({ ask: true }),
+      network: {
+        ...ironProxyNetworkProfileConfig({ ask: true }).network,
+        learnHttpRules: false,
+      },
+    },
+  )
+  writeFileSync(
+    helperPath,
+    [
+      '#!/usr/bin/env node',
+      "import { appendFileSync } from 'node:fs'",
+      "appendFileSync(process.env.GUARD_TEST_PROMPT_LOG, 'prompt\\n')",
+      'await new Promise((resolve) => setTimeout(resolve, 200))',
+      "process.stdout.write(JSON.stringify({ action: 'allow', rule: { host: 'localhost' }, duration: 'run' }))",
+    ].join('\n'),
+  )
+  chmodSync(helperPath, 0o755)
+  const server = createHttpServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end(`queued-ok ${req.url}\n`)
+  })
+  const port = await listenLoopback(server)
+
+  try {
+    const requests = Array.from({ length: 8 }, (_, index) =>
+      `http://localhost:${port}/queued-${index}`,
+    )
+    const result = await runGuardCommandAsync([
+      '--profile',
+      'network-iron-concurrent-ask',
+      'node',
+      '--input-type=module',
+      '-e',
+      `const responses = await Promise.all(${JSON.stringify(requests)}.map((url) => fetch(url))); if (responses.some((response) => !response.ok)) process.exitCode = 1`,
+    ], {
+      GUARD_ASK_NETWORK_UI: 'native',
+      GUARD_ASK_NETWORK_HELPER: helperPath,
+      GUARD_TEST_PROMPT_LOG: promptLog,
+      GUARD_EVENT_LOG: eventLog,
+      GUARD_STATE_DIR: tempRoot,
+    })
+    expectOk(result)
+    const prompts = readFileSync(promptLog, 'utf8').trim().split(/\r?\n/)
+    assert.equal(prompts.length, 1)
+    const decisions = readFileSync(eventLog, 'utf8')
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .filter((event) => event.type === 'network.decision' && event.host === 'localhost')
+    assert.equal(decisions.filter((event) => event.reason === 'interactive-policy').length, 1)
+    assert.equal(decisions.filter((event) => [
+      'matched-rule-after-prompt',
+      'matched-temporary-http-decision-after-prompt',
+    ].includes(event.reason)).length, 7)
+  } finally {
+    rmSync(profilePath, { force: true })
+    rmSync(tempRoot, { recursive: true, force: true })
+    await closeServer(server)
+  }
+})
+
 test('iron-proxy backend swaps proxy tokens for scoped secrets without exposing the real secret to the workload', async () => {
   const profilePath = writeGuardProfile(
     'network-iron-secret-injection',
@@ -2539,6 +2609,46 @@ test('network ask filter caches decisions by host and port for the run', async (
     { host: 'localhost', port: 8080 },
     { host: 'localhost', port: 9090 },
   ])
+})
+
+test('network ask filter honors wildcard and all-host prompt scopes', async () => {
+  let wildcardPrompts = 0
+  const wildcardFilter = createDomainFilter({}, {
+    ask: async () => {
+      wildcardPrompts += 1
+      return { action: 'allow', duration: 'run', hostPattern: '*.example.com' }
+    },
+  })
+
+  assert.equal(await wildcardFilter('api.example.com', 443), true)
+  assert.equal(await wildcardFilter('cdn.example.com', 8443), true)
+  assert.equal(wildcardPrompts, 1)
+
+  let allPrompts = 0
+  const allFilter = createDomainFilter({}, {
+    ask: async () => {
+      allPrompts += 1
+      return { action: 'allow', duration: 'run', hostPattern: '*' }
+    },
+  })
+
+  assert.equal(await allFilter('example.com', 443), true)
+  assert.equal(await allFilter('another.test', 80), true)
+  assert.equal(allPrompts, 1)
+})
+
+test('network ask once decisions are not cached', async () => {
+  let prompts = 0
+  const filter = createDomainFilter({}, {
+    ask: async () => {
+      prompts += 1
+      return { action: 'allow', duration: 'once', hostPattern: '*' }
+    },
+  })
+
+  assert.equal(await filter('localhost', 8080), true)
+  assert.equal(await filter('localhost', 8080), true)
+  assert.equal(prompts, 2)
 })
 
 test('network ask does not prompt for denied domains', async () => {
