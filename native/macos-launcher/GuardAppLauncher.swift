@@ -6028,6 +6028,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     var pendingAlertRetryAfter: [String: Date] = [:]
     var fullRefreshInFlight = false
     var policyRefreshGeneration = 0
+    var lastInspectorPolicyProfile = ""
     var selectedEventKey: String?
     var selectedActivityRowKey: String?
     var renderedInspectorRowKey: String?
@@ -6059,6 +6060,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     var projectSummaryMissCache = Set<String>()
     var projectSummaryLoadsInFlight = Set<String>()
     var codeSignatureCache: [String: (status: String, signer: String, teamId: String, bundleIdentifier: String)] = [:]
+    var codeSignatureLoadsInFlight = Set<String>()
     var activePendingAlertId: String?
     var recentAllowedCount = 0
     var recentDeniedCount = 0
@@ -6630,6 +6632,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         tableView.dataSource = self
         tableView.delegate = self
         tableView.target = self
+        tableView.action = #selector(activityRowClicked(_:))
         tableView.doubleAction = #selector(toggleSelectedActivityGroup(_:))
         let rowMenu = NSMenu(title: "Connection Actions")
         rowMenu.delegate = self
@@ -7825,27 +7828,42 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else {
             return ("Not collected", "Process path unavailable", "Unavailable", event.bundleIdentifier.isEmpty ? "Unavailable" : event.bundleIdentifier)
         }
+        loadCodeSignatureSummary(path: path, bundleIdentifier: event.bundleIdentifier, cacheKey: cacheKey)
+        return ("Checking…", "Resolving outside the UI thread", "Pending", event.bundleIdentifier.isEmpty ? "Pending" : event.bundleIdentifier)
+    }
 
-        let result = try? runProcess("/usr/bin/codesign", ["-dv", "--verbose=4", path])
-        guard let result else {
-            return ("Unavailable", "codesign failed", "Unavailable", event.bundleIdentifier.isEmpty ? "Unavailable" : event.bundleIdentifier)
-        }
-        let stderr = String(data: result.2, encoding: .utf8) ?? ""
-        let authority = stderr
-            .split(whereSeparator: \.isNewline)
-            .compactMap { line -> String? in
-                let text = String(line)
-                return text.hasPrefix("Authority=") ? String(text.dropFirst("Authority=".count)) : nil
+    func loadCodeSignatureSummary(path: String, bundleIdentifier: String, cacheKey: String) {
+        guard codeSignatureLoadsInFlight.insert(cacheKey).inserted else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let summary: (status: String, signer: String, teamId: String, bundleIdentifier: String)
+            if let result = try? runProcess("/usr/bin/codesign", ["-dv", "--verbose=4", path]) {
+                let stderr = String(data: result.2, encoding: .utf8) ?? ""
+                let authority = stderr
+                    .split(whereSeparator: \.isNewline)
+                    .compactMap { line -> String? in
+                        let text = String(line)
+                        return text.hasPrefix("Authority=") ? String(text.dropFirst("Authority=".count)) : nil
+                    }
+                    .first ?? "Unavailable"
+                let teamId = self?.fieldValue("TeamIdentifier", in: stderr) ?? "Unavailable"
+                let identifier = bundleIdentifier.isEmpty
+                    ? (self?.fieldValue("Identifier", in: stderr) ?? "Unavailable")
+                    : bundleIdentifier
+                summary = (result.0 == 0 ? "Signature valid" : "Signature invalid", authority, teamId, identifier)
+            } else {
+                summary = ("Unavailable", "codesign failed", "Unavailable", bundleIdentifier.isEmpty ? "Unavailable" : bundleIdentifier)
             }
-            .first ?? "Unavailable"
-        let teamId = fieldValue("TeamIdentifier", in: stderr) ?? "Unavailable"
-        let identifier = event.bundleIdentifier.isEmpty
-            ? (fieldValue("Identifier", in: stderr) ?? "Unavailable")
-            : event.bundleIdentifier
-        let status = result.0 == 0 ? "Signature valid" : "Signature invalid"
-        let summary: (status: String, signer: String, teamId: String, bundleIdentifier: String) = (status, authority, teamId, identifier)
-        codeSignatureCache[cacheKey] = summary
-        return summary
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.codeSignatureLoadsInFlight.remove(cacheKey)
+                self.codeSignatureCache[cacheKey] = summary
+                guard let selected = self.currentSelectedEvent() else { return }
+                let selectedPath = selected.processPath.isEmpty ? self.executablePath(from: selected.command) : selected.processPath
+                guard "\(selectedPath)|\(selected.bundleIdentifier)" == cacheKey else { return }
+                self.renderedInspectorRowKey = nil
+                self.renderSelectedInspectorIfNeeded(force: true)
+            }
+        }
     }
 
     func fieldValue(_ key: String, in text: String) -> String? {
@@ -8262,7 +8280,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     }
 
     @objc func switchInspectorTab(_ sender: NSSegmentedControl) {
-        updateInspector(currentSelectedEvent())
+        renderSelectedInspectorIfNeeded(force: true)
     }
 
     @objc func selectProfile(_ sender: NSPopUpButton) {
@@ -8270,12 +8288,12 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         if daemonConnected {
             loadDaemonPolicyState(profile: selectedProfileName)
         }
-        updateInspector(currentSelectedEvent())
+        renderSelectedInspectorIfNeeded(force: true)
     }
 
     @objc func selectTemplate(_ sender: NSPopUpButton) {
         selectedTemplateName = sender.titleOfSelectedItem ?? selectedTemplateName
-        updateInspector(currentSelectedEvent())
+        renderSelectedInspectorIfNeeded(force: true)
     }
 
     @objc func filterRules(_ sender: Any?) {
@@ -8767,7 +8785,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         daemonHealthText = "Stopped by monitor."
         daemonStateLabel.stringValue = daemonStatusText
         daemonStateLabel.textColor = .tertiaryLabelColor
-        updateInspector(currentSelectedEvent())
+        renderSelectedInspectorIfNeeded(force: true)
         statusLabel.stringValue = "Stopped managed guardd."
     }
 
@@ -8878,7 +8896,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             if (200..<300).contains(response.statusCode) {
                 self.statusLabel.stringValue = "Applied \(template) to \(profile)."
                 self.loadDaemonPolicyState(profile: profile)
-                self.updateInspector(self.currentSelectedEvent())
+                self.renderSelectedInspectorIfNeeded(force: true)
             } else {
                 self.statusLabel.stringValue = self.daemonErrorMessage(response) ?? "Template apply failed."
             }
@@ -9145,7 +9163,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 }
                 self.statusLabel.stringValue = "Deleted cached bypass decision for \(row.scope)."
                 self.loadDaemonPolicyState(profile: profile)
-                self.updateInspector(self.currentSelectedEvent())
+                self.renderSelectedInspectorIfNeeded(force: true)
             }
             return
         }
@@ -9167,7 +9185,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             if (200..<300).contains(response.statusCode) {
                 self.statusLabel.stringValue = "\(action.capitalized) \(row.scope)."
                 self.loadDaemonPolicyState(profile: profile)
-                self.updateInspector(self.currentSelectedEvent())
+                self.renderSelectedInspectorIfNeeded(force: true)
             } else {
                 self.statusLabel.stringValue = self.daemonErrorMessage(response) ?? "Rule update failed."
             }
@@ -9176,7 +9194,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
 
     func didMutateRules(profile: String) {
         loadDaemonPolicyState(profile: profile)
-        updateInspector(currentSelectedEvent())
+        renderSelectedInspectorIfNeeded(force: true)
     }
 
     func templateRowView(_ row: MonitorTemplateRow) -> NSView {
@@ -9207,7 +9225,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         selectedTemplateName = sender.title
         updateTemplateMenu()
         renderTemplateRows()
-        updateInspector(currentSelectedEvent())
+        renderSelectedInspectorIfNeeded(force: true)
     }
 
     func pill(_ text: String, color: NSColor) -> NSView {
@@ -9535,11 +9553,11 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 if let response, (200..<300).contains(response.statusCode) {
                     self.statusLabel.stringValue = "Added \(value) to \(field) via guardd."
                     self.loadDaemonPolicyState(profile: profile)
-                    self.updateInspector(event)
+                    self.renderSelectedInspectorIfNeeded(force: true)
                     self.reloadEvents(nil)
                 } else if response?.statusCode == 412 {
                     self.loadDaemonPolicyState(profile: profile)
-                    self.updateInspector(event)
+                    self.renderSelectedInspectorIfNeeded(force: true)
                     self.statusLabel.stringValue = "Profile changed on disk. Reloaded latest profile; retry the rule action."
                 } else {
                     self.runRuleCLIFallback(action: "add", value: value, event: event, field: field, quietIfMissing: false)
@@ -9793,10 +9811,10 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             if (200..<300).contains(response.statusCode) {
                 self.statusLabel.stringValue = enabled ? "Enabled TLS inspection for \(profile)." : "Disabled TLS inspection for \(profile)."
                 self.loadDaemonPolicyState(profile: profile)
-                self.updateInspector(self.currentSelectedEvent())
+                self.renderSelectedInspectorIfNeeded(force: true)
             } else if response.statusCode == 412 {
                 self.loadDaemonPolicyState(profile: profile)
-                self.updateInspector(self.currentSelectedEvent())
+                self.renderSelectedInspectorIfNeeded(force: true)
                 self.statusLabel.stringValue = "Profile changed on disk. Reloaded latest profile; retry TLS change."
             } else {
                 self.statusLabel.stringValue = self.daemonErrorMessage(response) ?? "TLS policy update failed."
@@ -9821,7 +9839,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             if (200..<300).contains(response.statusCode) {
                 self.statusLabel.stringValue = success
                 self.loadDaemonPolicyState(profile: self.selectedProfileName)
-                self.updateInspector(self.currentSelectedEvent())
+                self.renderSelectedInspectorIfNeeded(force: true)
             } else {
                 self.statusLabel.stringValue = self.daemonErrorMessage(response) ?? "TLS CA \(action) failed."
             }
@@ -9846,7 +9864,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             if (200..<300).contains(response.statusCode) {
                 self.statusLabel.stringValue = "Synced NetworkExtension policy for \(profile)."
                 self.loadDaemonPolicyState(profile: profile)
-                self.updateInspector(self.currentSelectedEvent())
+                self.renderSelectedInspectorIfNeeded(force: true)
             } else {
                 self.statusLabel.stringValue = self.daemonErrorMessage(response) ?? "NetworkExtension sync failed."
             }
@@ -9870,7 +9888,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             if (200..<300).contains(response.statusCode) {
                 self.statusLabel.stringValue = "Invalidated NetworkExtension sync manifest."
                 self.loadDaemonPolicyState(profile: self.selectedProfileName)
-                self.updateInspector(self.currentSelectedEvent())
+                self.renderSelectedInspectorIfNeeded(force: true)
             } else {
                 self.statusLabel.stringValue = self.daemonErrorMessage(response) ?? "NetworkExtension invalidation failed."
             }
@@ -10960,7 +10978,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         updateProfileMenu()
         updateTemplateMenu()
         updateHeaderStatus()
-        updateInspector(currentSelectedEvent())
+        renderSelectedInspectorIfNeeded(force: true)
         settingsWindowController?.render()
         if let rulesWindowController, rulesWindowController.selectedProfile == profile {
             rulesWindowController.rows = ruleRows
@@ -12977,6 +12995,24 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         toggleActivityGroup(row: activityRow)
     }
 
+    @objc func activityRowClicked(_ sender: NSOutlineView) {
+        let row = sender.clickedRow >= 0 ? sender.clickedRow : sender.selectedRow
+        guard row >= 0, let activityRow = activityRow(atVisibleRow: row) else { return }
+        if sender.selectedRow != row {
+            sender.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        }
+        guard renderedInspectorRowKey != activityRow.rowKey else { return }
+        // Outline reloads temporarily suppress delegate selection callbacks. A
+        // direct user click must always win and update the inspector now.
+        let wasSuppressing = suppressSelectionChange
+        suppressSelectionChange = false
+        renderedInspectorRowKey = nil
+        tableViewSelectionDidChange(
+            Notification(name: NSTableView.selectionDidChangeNotification, object: sender)
+        )
+        suppressSelectionChange = wasSuppressing
+    }
+
     func toggleActivityGroup(named app: String) {
         if let row = activityRows.first(where: { $0.rowKey == app || ($0.kind == "app" && $0.app == app) }) {
             toggleActivityGroup(row: row)
@@ -13513,8 +13549,10 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             return
         }
         selectedEventKey = eventKey(event)
-        if daemonConnected {
-            loadDaemonPolicyState(profile: event.profile.isEmpty ? "guard" : event.profile)
+        let eventProfile = event.profile.isEmpty ? "guard" : event.profile
+        if daemonConnected && lastInspectorPolicyProfile != eventProfile {
+            lastInspectorPolicyProfile = eventProfile
+            loadDaemonPolicyState(profile: eventProfile)
         }
         updateInspector(event)
     }
