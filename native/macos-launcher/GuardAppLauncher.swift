@@ -3462,6 +3462,148 @@ struct MonitorRuleRow {
     }
 }
 
+final class GuardRuleEditorView: NSView {
+    let typePopup = NSPopUpButton()
+    let actionPopup = NSPopUpButton()
+    let permissionPopup = NSPopUpButton()
+    let scopeField = NSTextField()
+    let methodsField = NSTextField()
+    let pathsField = NSTextField()
+    let enabledCheckbox = NSButton(checkboxWithTitle: "Enabled", target: nil, action: nil)
+    let helpLabel = NSTextField(wrappingLabelWithString: "")
+    var baseHTTPRule: [String: Any] = [:]
+    var httpUsesCIDR = false
+
+    init(rule: MonitorRuleRow) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 470, height: 245))
+        typePopup.addItems(withTitles: ["Domain", "HTTP Request", "Filesystem"])
+        actionPopup.addItems(withTitles: ["Allow", "Deny"])
+        permissionPopup.addItems(withTitles: ["Read", "Write"])
+        typePopup.target = self
+        typePopup.action = #selector(kindChanged(_:))
+
+        switch rule.field {
+        case "network.httpRules":
+            typePopup.selectItem(withTitle: "HTTP Request")
+            baseHTTPRule = rule.value as? [String: Any] ?? [:]
+            httpUsesCIDR = (baseHTTPRule["cidr"] as? String)?.isEmpty == false
+            scopeField.stringValue = baseHTTPRule[httpUsesCIDR ? "cidr" : "host"] as? String ?? rule.scope
+            let singularMethod = baseHTTPRule["method"] as? String ?? ""
+            let methods = (baseHTTPRule["methods"] as? [String] ?? []) + (singularMethod.isEmpty ? [] : [singularMethod])
+            methodsField.stringValue = methods.joined(separator: ", ")
+            let singularPath = baseHTTPRule["path"] as? String ?? ""
+            let paths = (baseHTTPRule["paths"] as? [String] ?? []) + (singularPath.isEmpty ? [] : [singularPath])
+            pathsField.stringValue = paths.joined(separator: ", ")
+            actionPopup.selectItem(withTitle: "Allow")
+        case "filesystem.allowRead", "filesystem.allowWrite", "filesystem.denyRead", "filesystem.denyWrite":
+            typePopup.selectItem(withTitle: "Filesystem")
+            scopeField.stringValue = rule.value as? String ?? rule.scope
+            actionPopup.selectItem(withTitle: rule.field.contains("deny") ? "Deny" : "Allow")
+            permissionPopup.selectItem(withTitle: rule.field.lowercased().contains("write") ? "Write" : "Read")
+        default:
+            typePopup.selectItem(withTitle: "Domain")
+            scopeField.stringValue = rule.value as? String ?? rule.scope
+            actionPopup.selectItem(withTitle: rule.action == "deny" ? "Deny" : "Allow")
+        }
+        enabledCheckbox.state = rule.enabled ? .on : .off
+
+        scopeField.placeholderString = "Domain, host, CIDR, or filesystem path"
+        methodsField.placeholderString = "GET, POST (empty means any method)"
+        pathsField.placeholderString = "/v1/*, /health (empty means all paths)"
+        helpLabel.font = NSFont.systemFont(ofSize: 11)
+        helpLabel.textColor = .secondaryLabelColor
+
+        let grid = NSGridView(views: [
+            [NSTextField(labelWithString: "Rule Type:"), typePopup],
+            [NSTextField(labelWithString: "Action:"), actionPopup],
+            [NSTextField(labelWithString: "Permission:"), permissionPopup],
+            [NSTextField(labelWithString: "Scope:"), scopeField],
+            [NSTextField(labelWithString: "HTTP Methods:"), methodsField],
+            [NSTextField(labelWithString: "HTTP Paths:"), pathsField]
+        ])
+        grid.rowSpacing = 8
+        grid.columnSpacing = 10
+        grid.column(at: 0).xPlacement = .trailing
+        grid.column(at: 1).xPlacement = .fill
+        grid.translatesAutoresizingMaskIntoConstraints = false
+
+        let stack = NSStackView(views: [grid, helpLabel, enabledCheckbox])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 470),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+            scopeField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300),
+            methodsField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300),
+            pathsField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300)
+        ])
+        refreshFields()
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    @objc func kindChanged(_ sender: Any?) {
+        refreshFields()
+    }
+
+    func refreshFields() {
+        let kind = typePopup.titleOfSelectedItem ?? "Domain"
+        let isHTTP = kind == "HTTP Request"
+        let isFilesystem = kind == "Filesystem"
+        actionPopup.isEnabled = !isHTTP
+        if isHTTP { actionPopup.selectItem(withTitle: "Allow") }
+        permissionPopup.isEnabled = isFilesystem
+        methodsField.isEnabled = isHTTP
+        pathsField.isEnabled = isHTTP
+        scopeField.placeholderString = isFilesystem ? "/path/to/protected/resource" : (isHTTP ? "api.example.com" : "example.com or *.example.com")
+        helpLabel.stringValue = isHTTP
+            ? "HTTP rules are enforced by iron-proxy. Empty method or path fields match any request on the host."
+            : isFilesystem
+                ? "Filesystem rules apply to the selected profile and use the path exactly as entered."
+                : "Domain rules apply to proxy-routed traffic for the selected profile."
+    }
+
+    func editedRule() -> (field: String, value: Any, enabled: Bool, error: String?) {
+        let scope = scopeField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !scope.isEmpty else { return ("", "", true, "Enter a rule scope.") }
+        let kind = typePopup.titleOfSelectedItem ?? "Domain"
+        let allow = actionPopup.titleOfSelectedItem != "Deny"
+        if kind == "HTTP Request" {
+            var rule = baseHTTPRule
+            rule.removeValue(forKey: "host")
+            rule.removeValue(forKey: "cidr")
+            rule[httpUsesCIDR ? "cidr" : "host"] = scope
+            rule.removeValue(forKey: "method")
+            rule.removeValue(forKey: "path")
+            let methods = listValues(methodsField.stringValue).map { $0.uppercased() }
+            let paths = listValues(pathsField.stringValue)
+            if methods.isEmpty { rule.removeValue(forKey: "methods") } else { rule["methods"] = methods }
+            if paths.isEmpty { rule.removeValue(forKey: "paths") } else { rule["paths"] = paths }
+            return ("network.httpRules", rule, enabledCheckbox.state == .on, nil)
+        }
+        if kind == "Filesystem" {
+            let permission = permissionPopup.titleOfSelectedItem == "Write" ? "Write" : "Read"
+            let prefix = allow ? "allow" : "deny"
+            return ("filesystem.\(prefix)\(permission)", scope, enabledCheckbox.state == .on, nil)
+        }
+        return (allow ? "network.allowedDomains" : "network.deniedDomains", scope, enabledCheckbox.state == .on, nil)
+    }
+
+    func listValues(_ text: String) -> [String] {
+        text.split(whereSeparator: { $0 == "," || $0 == "\n" })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+}
+
 struct MonitorTemplateRow {
     let name: String
     let description: String
@@ -5148,7 +5290,14 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
     }
 
     @objc func toggleSelectedRuleGroup(_ sender: Any?) {
-        toggleRuleGroup(at: tableView.clickedRow >= 0 ? tableView.clickedRow : tableView.selectedRow)
+        let index = tableView.clickedRow >= 0 ? tableView.clickedRow : tableView.selectedRow
+        guard index >= 0 && index < renderedRows.count else { return }
+        let row = renderedRows[index]
+        if row.isActorGroup || (row.groupCount > 1 && !row.isGroupChild) {
+            toggleRuleGroup(at: index)
+        } else if isMutableRule(row) {
+            editSelectedRule(sender)
+        }
     }
 
     func toggleRuleGroup(at index: Int) {
@@ -5214,6 +5363,9 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         }
         if menu.numberOfItems > 0 { menu.addItem(.separator()) }
 
+        let edit = addRuleMenuItem(menu, title: "Edit Rule…", symbol: "square.and.pencil", action: #selector(editSelectedRule(_:)))
+        edit.isEnabled = affected.count == 1 && mutable && !rule.isActorGroup && rule.groupCount == 1
+
         let allEnabled = !affected.isEmpty && affected.allSatisfy(\.enabled)
         let toggle = addRuleMenuItem(
             menu,
@@ -5261,6 +5413,110 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         }
         menu.addItem(item)
         return item
+    }
+
+    @objc func editSelectedRule(_ sender: Any?) {
+        guard let displayed = selectedRule() else { return }
+        let underlying = expandedRuleRows([displayed])
+        guard underlying.count == 1, let rule = underlying.first, isMutableRule(rule) else {
+            statusLabel.stringValue = "Expand the group and select one exact rule before editing."
+            return
+        }
+        let form = GuardRuleEditorView(rule: rule)
+        let alert = NSAlert()
+        alert.messageText = "Edit Rule"
+        let actor = rule.actor.isEmpty ? "Any Process" : rule.actor
+        alert.informativeText = "Profile: \(selectedProfile) · Context: \(actor)\nGuard stores this policy in the selected profile."
+        alert.accessoryView = form
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        guard let window else {
+            if alert.runModal() == .alertFirstButtonReturn { saveEditedRule(rule, from: form) }
+            return
+        }
+        alert.beginSheetModal(for: window) { [weak self, weak form] response in
+            guard response == .alertFirstButtonReturn, let self, let form else { return }
+            self.saveEditedRule(rule, from: form)
+        }
+    }
+
+    func saveEditedRule(_ oldRule: MonitorRuleRow, from form: GuardRuleEditorView) {
+        let edited = form.editedRule()
+        if let error = edited.error {
+            statusLabel.stringValue = error
+            NSSound.beep()
+            return
+        }
+        guard let client else {
+            statusLabel.stringValue = "guardd must be connected before editing rules."
+            return
+        }
+        let sameRule = oldRule.field == edited.field
+            && canonicalRuleValue(oldRule.value) == canonicalRuleValue(edited.value)
+        if sameRule && oldRule.enabled == edited.enabled {
+            statusLabel.stringValue = "No rule changes to save."
+            return
+        }
+        let profile = selectedProfile
+        let version = parent?.profileVersionText
+        statusLabel.stringValue = "Saving rule…"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            func nextVersion(_ response: GuardDaemonResponse) -> String? {
+                guard let object = try? JSONSerialization.jsonObject(with: response.data) as? [String: Any] else { return nil }
+                return object["version"] as? String
+            }
+            if sameRule {
+                let action = edited.enabled ? "enable" : "disable"
+                let response = client.mutateRule(
+                    profile: profile,
+                    action: action,
+                    field: oldRule.field,
+                    value: oldRule.value,
+                    disabled: !edited.enabled,
+                    ifMatch: version
+                )
+                DispatchQueue.main.async {
+                    guard let response, (200..<300).contains(response.statusCode) else {
+                        self.statusLabel.stringValue = response.flatMap { self.parent?.daemonErrorMessage($0) } ?? "Rule update failed."
+                        return
+                    }
+                    self.statusLabel.stringValue = "Saved \(oldRule.scope)."
+                    self.parent?.didMutateRules(profile: profile)
+                }
+                return
+            }
+
+            guard let addResponse = client.mutateRule(
+                profile: profile,
+                action: "add",
+                field: edited.field,
+                value: edited.value,
+                disabled: !edited.enabled,
+                ifMatch: version
+            ), (200..<300).contains(addResponse.statusCode) else {
+                DispatchQueue.main.async {
+                    self.statusLabel.stringValue = "Could not save the edited rule; the original rule was not changed."
+                }
+                return
+            }
+            let removeResponse = client.mutateRule(
+                profile: profile,
+                action: "remove",
+                field: oldRule.field,
+                value: oldRule.value,
+                ifMatch: nextVersion(addResponse)
+            )
+            DispatchQueue.main.async {
+                guard let removeResponse, (200..<300).contains(removeResponse.statusCode) else {
+                    self.statusLabel.stringValue = "The edited rule was added, but the original could not be removed. Reload and review both entries."
+                    self.parent?.didMutateRules(profile: profile)
+                    return
+                }
+                self.statusLabel.stringValue = "Saved edited rule."
+                self.parent?.didMutateRules(profile: profile)
+            }
+        }
     }
 
     @objc func copySelectedRuleScope(_ sender: Any?) {
