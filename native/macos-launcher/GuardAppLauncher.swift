@@ -633,6 +633,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
     let modeValueLabel = NSTextField(labelWithString: "0 allowed, 0 denied")
     let daemonBadgeLabel = NSTextField(labelWithString: "Daemon unknown")
     let extensionBadgeLabel = NSTextField(labelWithString: "Extension unknown")
+    let healthSummaryLabel = NSTextField(labelWithString: "Daemon unknown · Extension unknown")
     let allowedPillLabel = NSTextField(labelWithString: "0 allowed")
     let deniedPillLabel = NSTextField(labelWithString: "0 denied")
     let sparkline = TrafficSparklineView()
@@ -717,8 +718,15 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
             root.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -8),
         ])
 
-        root.addArrangedSubview(popoverHeader())
-        root.addArrangedSubview(trafficSummary())
+        let header = popoverHeader()
+        let traffic = trafficSummary()
+        root.addArrangedSubview(header)
+        root.setCustomSpacing(3, after: header)
+        root.addArrangedSubview(traffic)
+        root.setCustomSpacing(5, after: traffic)
+        let statusRule = separator()
+        root.addArrangedSubview(statusRule)
+        root.setCustomSpacing(7, after: statusRule)
 
         let recentTitle = NSTextField(labelWithString: "Recent Guard Activity")
         recentTitle.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
@@ -876,109 +884,58 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
     }
 
     func popoverHeader() -> NSView {
-        let card = NSStackView()
-        card.orientation = .vertical
-        card.alignment = .width
-        card.spacing = 5
-        card.edgeInsets = NSEdgeInsets(top: 7, left: 8, bottom: 6, right: 6)
-        card.wantsLayer = true
-        card.layer?.cornerRadius = 9
-        card.layer?.cornerCurve = .continuous
-        card.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.28).cgColor
-        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.32).cgColor
-        card.layer?.borderWidth = 0.5
-
         let row = NSStackView()
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 7
+        row.edgeInsets = NSEdgeInsets(top: 3, left: 2, bottom: 3, right: 2)
 
         row.addArrangedSubview(guardMarkCircle())
         let labelStack = NSStackView()
         labelStack.orientation = .vertical
-        labelStack.spacing = -1
-        let eyebrow = NSTextField(labelWithString: "OPERATION MODE")
-        eyebrow.font = NSFont.systemFont(ofSize: 9.5, weight: .semibold)
-        eyebrow.textColor = .secondaryLabelColor
-        eyebrow.maximumNumberOfLines = 1
+        labelStack.alignment = .leading
+        labelStack.spacing = 0
         modeLabel.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
         modeLabel.textColor = .labelColor
         modeLabel.maximumNumberOfLines = 1
+        healthSummaryLabel.font = NSFont.systemFont(ofSize: 10.5, weight: .regular)
+        healthSummaryLabel.textColor = .secondaryLabelColor
+        healthSummaryLabel.maximumNumberOfLines = 1
+        healthSummaryLabel.lineBreakMode = .byTruncatingTail
+        healthSummaryLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         labelStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        labelStack.addArrangedSubview(eyebrow)
         labelStack.addArrangedSubview(modeLabel)
+        labelStack.addArrangedSubview(healthSummaryLabel)
         row.addArrangedSubview(labelStack)
         row.addArrangedSubview(NSView())
 
         row.addArrangedSubview(iconButton("bell.badge", action: #selector(openSettings(_:)), tint: .secondaryLabelColor, tooltip: "Alert settings"))
         row.addArrangedSubview(iconButton("network", action: #selector(openMonitor(_:)), tint: .controlAccentColor, tooltip: "Open live monitor"))
-        card.addArrangedSubview(row)
-
-        let health = NSStackView()
-        health.orientation = .horizontal
-        health.alignment = .centerY
-        health.spacing = 8
-        health.addArrangedSubview(statusLine(daemonBadgeLabel, symbol: "bolt.horizontal.fill"))
-        health.addArrangedSubview(statusLine(extensionBadgeLabel, symbol: "network.badge.shield.half.filled"))
-        health.addArrangedSubview(NSView())
-        card.addArrangedSubview(health)
-        return card
-    }
-
-    func statusBadgeRow() -> NSView {
-        let stack = NSStackView()
-        stack.orientation = .horizontal
-        stack.alignment = .centerY
-        stack.spacing = 12
-        stack.addArrangedSubview(statusLine(daemonBadgeLabel, symbol: "bolt.horizontal.circle.fill"))
-        stack.addArrangedSubview(statusLine(extensionBadgeLabel, symbol: "shield.lefthalf.filled"))
-        stack.addArrangedSubview(NSView())
-        return stack
-    }
-
-    func statusLine(_ label: NSTextField, symbol: String) -> NSView {
-        let row = NSStackView()
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 6
-        row.addArrangedSubview(customRowSymbol(symbol, tint: .secondaryLabelColor))
-        label.font = NSFont.systemFont(ofSize: 11)
-        label.textColor = .secondaryLabelColor
-        label.lineBreakMode = .byTruncatingTail
-        label.maximumNumberOfLines = 1
-        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        row.addArrangedSubview(label)
         return row
     }
 
     func trafficSummary() -> NSView {
-        let card = NSStackView()
-        card.orientation = .vertical
-        card.alignment = .width
-        card.spacing = 5
-        card.edgeInsets = NSEdgeInsets(top: 5, left: 7, bottom: 5, right: 7)
-        card.wantsLayer = true
-        card.layer?.cornerRadius = 8
-        card.layer?.cornerCurve = .continuous
-        card.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.18).cgColor
-        card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.24).cgColor
-        card.layer?.borderWidth = 0.5
+        let summary = NSStackView()
+        summary.orientation = .vertical
+        summary.alignment = .width
+        summary.spacing = 4
+        summary.edgeInsets = NSEdgeInsets(top: 2, left: 3, bottom: 2, right: 3)
 
         let metrics = NSStackView()
         metrics.orientation = .horizontal
         metrics.alignment = .centerY
-        metrics.spacing = 14
+        metrics.spacing = 20
         metrics.addArrangedSubview(metricLabel(label: allowedPillLabel, symbol: "checkmark.circle", tint: .systemGreen))
         metrics.addArrangedSubview(metricLabel(label: deniedPillLabel, symbol: "xmark.circle", tint: .systemRed))
         metrics.addArrangedSubview(NSView())
-        card.addArrangedSubview(metrics)
+        summary.addArrangedSubview(metrics)
 
         trafficTimeline.arrangedSubviews.forEach { view in
             trafficTimeline.removeArrangedSubview(view)
             view.removeFromSuperview()
         }
         sparkline.heightAnchor.constraint(equalToConstant: 26).isActive = true
-        card.addArrangedSubview(sparkline)
+        summary.addArrangedSubview(sparkline)
 
         trafficTimeline.orientation = .horizontal
         trafficEmptyLabel.font = NSFont.systemFont(ofSize: 9.5)
@@ -988,8 +945,8 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         trafficTimeline.addArrangedSubview(trafficEmptyLabel)
         trafficTimeline.addArrangedSubview(NSView())
         trafficTimeline.addArrangedSubview(trafficNowLabel)
-        card.addArrangedSubview(trafficTimeline)
-        return card
+        summary.addArrangedSubview(trafficTimeline)
+        return summary
     }
 
     func trafficSummarySnapshot() -> NSView {
@@ -1233,6 +1190,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         modeValueLabel.stringValue = "\(allowed) allowed, \(denied) denied"
         daemonBadgeLabel.stringValue = compactDaemonStatus(monitor.daemonStateLabel.stringValue)
         extensionBadgeLabel.stringValue = compactExtensionStatus(monitor.extensionSyncText)
+        healthSummaryLabel.stringValue = "\(daemonBadgeLabel.stringValue) · \(extensionBadgeLabel.stringValue)"
         allowedPillLabel.stringValue = "\(allowed) allowed"
         deniedPillLabel.stringValue = "\(denied) denied"
         deniedBadgeLabel.stringValue = "\(denied)"
@@ -1305,7 +1263,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         let visibleRows = max(1, min(4, recentRowCount))
         let activityHeight = CGFloat(visibleRows - 1) * 32
         let chartHeight: CGFloat = hasTraffic ? 44 : 0
-        popover.contentSize = NSSize(width: 312, height: 292 + activityHeight + chartHeight)
+        popover.contentSize = NSSize(width: 312, height: 272 + activityHeight + chartHeight)
     }
 
     func statusItemTintColor(active: Bool) -> NSColor? {
