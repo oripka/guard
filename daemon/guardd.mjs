@@ -2628,6 +2628,7 @@ class PendingAlertQueue {
     this.pruneDecisions()
     const request = normalizeDecisionRequest(body)
     const requestKey = request.id || alertDecisionKey(request)
+    const operationKind = request.operation?.kind || ''
     const profile = String(body.profile || 'guard')
     const rawHost = body.host || ''
     const host = rawHost ? sanitizeTlsHost(rawHost) : ''
@@ -2638,6 +2639,7 @@ class PendingAlertQueue {
     const requestForRule = { host, method, path: requestPath }
     return this.decisions.find((decision) => {
       if (decision.decisionKey && decision.decisionKey === requestKey) return true
+      if (operationKind === 'process.bypass' || decision.operationKind === 'process.bypass') return false
       if (!host) return false
       if (decision.rule && typeof decision.rule === 'object') {
         if (decision.profile !== profile) return false
@@ -2672,6 +2674,7 @@ class PendingAlertQueue {
       operationKind: event.operationKind || event.decisionRequest?.operation?.kind || '',
       resourceKind: event.resourceKind || event.decisionRequest?.resource?.kind || '',
       profile: event.profile,
+      projectDir: event.projectDir || event.decisionRequest?.subject?.projectDir || '',
       host: event.host,
       port: event.port,
       method: event.method || '',
@@ -2680,6 +2683,9 @@ class PendingAlertQueue {
       launcherProcess: event.launcherProcess || '',
       launcherPid: event.launcherPid || 0,
       parentChain: event.parentChain || '',
+      childCommand: event.childCommand || event.target || '',
+      childExecutablePath: event.childExecutablePath || '',
+      bypassReason: event.bypassReason || '',
       action: event.action,
       duration: event.duration,
       expiresAt,
@@ -2692,38 +2698,74 @@ class PendingAlertQueue {
 
   temporaryRules() {
     this.pruneDecisions()
-    return this.decisions.map((decision) => ({
-      schemaVersion: 1,
-      id: decision.ruleId || alertRuleId(decision),
-      field: decision.method || decision.path ? 'network.httpRules' : (decision.action === 'deny' ? 'network.deniedDomains' : 'network.allowedDomains'),
-      layer: decision.method || decision.path ? 'http' : 'destination',
-      action: decision.action,
-      scope: decision.method || decision.path
-        ? `${decision.method || '*'} ${decision.host}${decision.path ? ` ${decision.path}` : ''}`
-        : `${decision.host}${decision.port ? `:${decision.port}` : ''}`,
-      value: {
-        profile: decision.profile,
-        host: decision.host,
-        port: decision.port || 0,
-        method: decision.method || '',
-        path: decision.path || '',
-      },
-      source: 'alert-decision',
-      enabled: true,
-      lifetime: decision.duration || 'session',
-      approvalState: 'approved',
-      notes: 'Temporary/session rule from a Guard alert decision.',
-      processIdentity: {
-        launcherApp: decision.launcherApp || '',
-        launcherProcess: decision.launcherProcess || '',
-        launcherPid: decision.launcherPid || 0,
-        parentChain: decision.parentChain || '',
-      },
-      createdAt: decision.createdAt || '',
-      updatedAt: decision.createdAt || '',
-      expiresAt: decision.expiresAt || '',
-      auditHistory: [],
-    }))
+    return this.decisions.map((decision) => {
+      const isProcessBypass = decision.operationKind === 'process.bypass' || decision.resourceKind === 'process'
+      return {
+        schemaVersion: 1,
+        id: decision.ruleId || alertRuleId(decision),
+        field: isProcessBypass
+          ? 'process.bypass'
+          : decision.method || decision.path ? 'network.httpRules' : (decision.action === 'deny' ? 'network.deniedDomains' : 'network.allowedDomains'),
+        layer: isProcessBypass ? 'process-bypass' : decision.method || decision.path ? 'http' : 'destination',
+        action: decision.action,
+        scope: isProcessBypass
+          ? (decision.childCommand || decision.childExecutablePath || 'unprotected process')
+          : decision.method || decision.path
+            ? `${decision.method || '*'} ${decision.host}${decision.path ? ` ${decision.path}` : ''}`
+            : `${decision.host}${decision.port ? `:${decision.port}` : ''}`,
+        value: isProcessBypass
+          ? {
+              decisionKey: decision.decisionKey || '',
+              profile: decision.profile,
+              command: decision.childCommand || '',
+              executablePath: decision.childExecutablePath || '',
+              bypassReason: decision.bypassReason || '',
+              launcherApp: decision.launcherApp || '',
+              launcherProcess: decision.launcherProcess || '',
+              projectDir: decision.projectDir || '',
+            }
+          : {
+              profile: decision.profile,
+              host: decision.host,
+              port: decision.port || 0,
+              method: decision.method || '',
+              path: decision.path || '',
+            },
+        source: 'alert-decision',
+        enabled: true,
+        lifetime: decision.duration || 'session',
+        approvalState: 'approved',
+        notes: isProcessBypass
+          ? 'Cached Guard bypass decision. Delete it to ask again.'
+          : 'Temporary/session rule from a Guard alert decision.',
+        processIdentity: {
+          launcherApp: decision.launcherApp || '',
+          launcherProcess: decision.launcherProcess || '',
+          launcherPid: decision.launcherPid || 0,
+          parentChain: decision.parentChain || '',
+        },
+        createdAt: decision.createdAt || '',
+        updatedAt: decision.createdAt || '',
+        expiresAt: decision.expiresAt || '',
+        auditHistory: [],
+      }
+    })
+  }
+
+  removeDecisionByRuleId(ruleId) {
+    const id = String(ruleId || '')
+    if (!id) return { changed: false, removed: null }
+    const before = this.decisions.length
+    let removed = null
+    this.decisions = this.decisions.filter((decision) => {
+      const candidate = decision.ruleId || alertRuleId(decision)
+      if (candidate !== id) return true
+      removed ||= decision
+      return false
+    })
+    const changed = this.decisions.length !== before
+    if (changed) this.persist()
+    return { changed, removed }
   }
 
   create(body = {}) {
@@ -2733,7 +2775,9 @@ class PendingAlertQueue {
     const operation = decisionRequest.operation || {}
     const rawHost = body.host || resource.host || ''
     const host = rawHost ? sanitizeTlsHost(rawHost) : ''
-    if (!host) throw new Error('pending alert requires host')
+    const operationKind = operation.kind || ''
+    const isProcessBypass = operationKind === 'process.bypass' || resource.kind === 'process'
+    if (!host && !isProcessBypass) throw new Error('pending alert requires host')
     const now = new Date().toISOString()
     const { timeoutMs, expiresAt } = this.normalizeTimeout(body)
     const alert = {
@@ -2748,7 +2792,7 @@ class PendingAlertQueue {
       expiresAt,
       timeoutMs,
       decisionRequest,
-      operationKind: operation.kind || '',
+      operationKind,
       resourceKind: resource.kind || '',
       profile,
       host,
@@ -2756,7 +2800,10 @@ class PendingAlertQueue {
       method: String(body.method || resource.method || ''),
       path: String(body.path || resource.path || ''),
       protocol: String(body.protocol || resource.protocol || ''),
-      command: String(body.command || decisionRequest.subject.commandLine || ''),
+      command: String(body.command || resource.command || decisionRequest.subject.commandLine || ''),
+      childCommand: String(body.childCommand || resource.command || decisionRequest.subject.commandLine || ''),
+      childExecutablePath: String(body.childExecutablePath || resource.executablePath || decisionRequest.subject.executablePath || ''),
+      bypassReason: String(body.bypassReason || resource.bypassReason || body.reason || ''),
       projectDir: String(body.projectDir || decisionRequest.subject.projectDir || ''),
       runDir: String(body.runDir || ''),
       launcherApp: String(body.launcherApp || decisionRequest.subject.launcherApp || ''),
@@ -2767,7 +2814,9 @@ class PendingAlertQueue {
       suggestedAction: body.suggestedAction || '',
       suggestedDuration: body.suggestedDuration || '',
       recommendedScopes: decisionRequest.recommendedScopes,
-      availableActions: ['deny', 'allowOnce', 'allowUntilQuit', 'allowSession', 'allowForever', 'editRule'],
+      availableActions: isProcessBypass
+        ? ['deny', 'allowOnce', 'allowSession', 'allowForever']
+        : ['deny', 'allowOnce', 'allowUntilQuit', 'allowSession', 'allowForever', 'editRule'],
     }
     this.alerts.set(alert.id, alert)
     this.persist()
@@ -2873,6 +2922,13 @@ class PendingAlertQueue {
   alertMatchesDecision(alert = {}, decision = {}) {
     if (!alert || alert.status !== 'pending' || !decision || !decision.action) return false
     if (alert.id === decision.alertId) return false
+    if (alert.operationKind === 'process.bypass' || decision.operationKind === 'process.bypass') {
+      return Boolean(
+        alert.decisionRequest?.id &&
+        decision.decisionRequest?.id &&
+        alert.decisionRequest.id === decision.decisionRequest.id,
+      )
+    }
     if (String(alert.profile || 'guard') !== String(decision.profile || 'guard')) return false
     if (decision.launcherApp && decision.launcherApp !== alert.launcherApp) return false
     if (decision.launcherProcess && decision.launcherProcess !== alert.launcherProcess) return false
@@ -3001,6 +3057,11 @@ const alertHttpRuleForScope = ({ host, method, requestPath, scope }) => {
   case 'host':
   case 'allow-domain':
     return { host }
+  case 'wildcard-domain':
+  case 'allow-wildcard-domain': {
+    const parts = String(host || '').split('.').filter(Boolean)
+    return { host: parts.length > 2 ? `*.${parts.slice(1).join('.')}` : host }
+  }
   case 'all':
   case 'all-network':
   case 'allow-all-network':
@@ -3017,6 +3078,8 @@ const alertDecision = ({ body, policyStore, eventLogPath, tail }) => {
   const profile = String(body.profile || decisionRequest.subject?.profile || 'guard')
   const rawHost = body.host || resource.host || ''
   const host = rawHost ? sanitizeTlsHost(rawHost) : ''
+  const operationKind = operation.kind || ''
+  const isProcessBypass = operationKind === 'process.bypass' || resource.kind === 'process'
   const action = String(body.action || 'deny').toLowerCase()
   const duration = String(body.duration || 'once').toLowerCase()
   const method = String(body.method || resource.method || '')
@@ -3024,7 +3087,7 @@ const alertDecision = ({ body, policyStore, eventLogPath, tail }) => {
   const scope = String(body.scope || body.ruleScope || '')
   if (!['allow', 'deny'].includes(action)) throw new Error(`unsupported alert action: ${action}`)
   if (!/^(once|session|forever|\d+[smhd])$/.test(duration)) throw new Error(`unsupported alert duration: ${duration}`)
-  if (!host) throw new Error('alert decision requires host')
+  if (!host && !isProcessBypass) throw new Error('alert decision requires host')
   const httpRule = host && action === 'allow' ? alertHttpRuleForScope({ host, method, requestPath, scope }) : null
   const networkField = httpRule && duration === 'forever' ? 'network.httpRules' : action === 'allow' ? 'network.allowedDomains' : 'network.deniedDomains'
   const field = host ? networkField : ''
@@ -3054,7 +3117,7 @@ const alertDecision = ({ body, policyStore, eventLogPath, tail }) => {
     type: 'guard.alert.decision',
     backend: 'guardd',
     decisionRequest,
-    operationKind: operation.kind || '',
+    operationKind,
     resourceKind: resource.kind || '',
     profile,
     host,
@@ -3064,13 +3127,18 @@ const alertDecision = ({ body, policyStore, eventLogPath, tail }) => {
     expiresAt: alertDecisionExpiresAt(duration),
     method,
     path: requestPath,
-    target: host ? `${host}${body.port || resource.port ? `:${body.port || resource.port}` : ''}` : '',
+    target: host
+      ? `${host}${body.port || resource.port ? `:${body.port || resource.port}` : ''}`
+      : String(resource.command || body.childCommand || body.command || decisionRequest.subject?.commandLine || ''),
     scope,
     suggestedRule: httpRule || null,
     launcherApp,
     launcherProcess,
     launcherPid: Number.isInteger(Number(body.launcherPid ?? decisionRequest.subject?.launcherPid)) ? Number(body.launcherPid ?? decisionRequest.subject?.launcherPid) : 0,
     parentChain: String(body.parentChain || decisionRequest.subject?.parentChain || ''),
+    childCommand: String(body.childCommand || resource.command || decisionRequest.subject?.commandLine || ''),
+    childExecutablePath: String(body.childExecutablePath || resource.executablePath || decisionRequest.subject?.executablePath || ''),
+    bypassReason: String(body.bypassReason || resource.bypassReason || body.reason || ''),
     action,
     duration,
     allowed: action === 'allow',
@@ -3085,7 +3153,7 @@ const alertDecision = ({ body, policyStore, eventLogPath, tail }) => {
   tail.push(event)
   return {
     action: 'alert-decision',
-    changed: duration === 'forever',
+    changed: Boolean(mutation),
     decision: event,
     mutation,
   }
@@ -3448,6 +3516,10 @@ const createServer = ({ tail, policyStore, projectRegistry, startedAt, apiToken,
             writeJson(response, 404, { error: 'alert_not_found', alertId: resolveAlertId })
             return
           }
+          if (pending.status !== 'pending') {
+            writeJson(response, 409, { error: 'alert_not_pending', message: `pending alert is ${pending.status}`, alert: pending })
+            return
+          }
           const result = alertDecision({
             body: {
               ...body,
@@ -3461,6 +3533,9 @@ const createServer = ({ tail, policyStore, projectRegistry, startedAt, apiToken,
               launcherProcess: body.launcherProcess || pending.launcherProcess,
               launcherPid: body.launcherPid ?? pending.launcherPid,
               parentChain: body.parentChain || pending.parentChain,
+              childCommand: body.childCommand || pending.childCommand,
+              childExecutablePath: body.childExecutablePath || pending.childExecutablePath,
+              bypassReason: body.bypassReason || pending.bypassReason,
               decisionRequest: body.decisionRequest || pending.decisionRequest,
               expiresAt: pending.expiresAt,
               reason: body.reason || 'pending-alert-resolved',
@@ -3517,6 +3592,9 @@ const createServer = ({ tail, policyStore, projectRegistry, startedAt, apiToken,
             body.launcherProcess ||= pending.launcherProcess
             body.launcherPid ??= pending.launcherPid
             body.parentChain ||= pending.parentChain
+            body.childCommand ||= pending.childCommand
+            body.childExecutablePath ||= pending.childExecutablePath
+            body.bypassReason ||= pending.bypassReason
             body.decisionRequest ||= pending.decisionRequest
             body.expiresAt ||= pending.expiresAt
           }
@@ -3541,6 +3619,42 @@ const createServer = ({ tail, policyStore, projectRegistry, startedAt, apiToken,
           }
           const status = error.code === 'alert_not_found' ? 404 : error.code === 'alert_not_pending' ? 409 : 400
           writeJson(response, status, { error: error.code || 'alert_decision_failed', message: error.message, alert: error.alert || null })
+        }
+        return
+      }
+
+      if (url.pathname === '/decisions/cache') {
+        try {
+          const body = await readRequestJson(request)
+          const action = String(body.action || '').toLowerCase()
+          if (action !== 'remove') {
+            writeJson(response, 400, { error: 'unsupported_action', message: 'decisions cache only supports remove' })
+            return
+          }
+          const result = pendingAlerts.removeDecisionByRuleId(body.ruleId || body.id)
+          const event = {
+            schemaVersion: 1,
+            at: new Date().toISOString(),
+            type: 'guard.alert.decision.cache.changed',
+            backend: 'guardd',
+            operation: 'remove-decision-cache',
+            changed: result.changed,
+            ruleId: String(body.ruleId || body.id || ''),
+            decisionKey: result.removed?.decisionKey || '',
+            operationKind: result.removed?.operationKind || '',
+            resourceKind: result.removed?.resourceKind || '',
+            action: result.removed?.action || '',
+          }
+          appendJsonLine(eventLogPath, event)
+          tail.push(event)
+          writeJson(response, 200, {
+            action: 'remove-decision-cache',
+            changed: result.changed,
+            ruleId: event.ruleId,
+            pending: pendingAlerts.list({ limit: 50 }),
+          })
+        } catch (error) {
+          writeJson(response, 400, { error: 'decision_cache_failed', message: error.message })
         }
         return
       }
