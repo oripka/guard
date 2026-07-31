@@ -25,6 +25,19 @@ func compactMiddle(_ value: String, limit: Int) -> String {
     return "\(trimmed[..<headEnd])...\(trimmed[tailStart...])"
 }
 
+func originatingApplicationIcon(named rawName: String) -> NSImage? {
+    let name = rawName
+        .components(separatedBy: " via ")
+        .first?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .replacingOccurrences(of: ".app", with: "", options: [.caseInsensitive, .anchored, .backwards])
+        ?? ""
+    guard !name.isEmpty else { return nil }
+    return NSWorkspace.shared.runningApplications.first(where: {
+        $0.localizedName?.caseInsensitiveCompare(name) == .orderedSame
+    })?.icon
+}
+
 struct GuardAppConfig: Decodable {
     let mode: String?
     let profile: String
@@ -1110,7 +1123,15 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         let bypass = isGuardBypassActivity(event)
         let symbol = bypass ? "figure.run" : (denied ? "xmark.shield.fill" : "checkmark.shield.fill")
         let tint: NSColor = denied ? .systemRed : (bypass ? .systemOrange : .systemBlue)
-        row.addArrangedSubview(customRowSymbol(symbol, tint: tint))
+        if bypass,
+           let applicationIcon = originatingApplicationIcon(named: guardBypassActorLabel(for: event)) {
+            row.addArrangedSubview(customRowApplicationIcon(
+                applicationIcon,
+                description: guardBypassActorLabel(for: event)
+            ))
+        } else {
+            row.addArrangedSubview(customRowSymbol(symbol, tint: tint))
+        }
 
         let text = NSStackView()
         text.orientation = .vertical
@@ -1310,6 +1331,26 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         return slot
     }
 
+    func customRowApplicationIcon(_ image: NSImage, description: String) -> NSView {
+        image.accessibilityDescription = description
+        let slot = NSView()
+        slot.translatesAutoresizingMaskIntoConstraints = false
+        slot.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        slot.heightAnchor.constraint(equalToConstant: 20).isActive = true
+
+        let imageView = NSImageView(image: image)
+        imageView.imageScaling = .scaleProportionallyDown
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        slot.addSubview(imageView)
+        NSLayoutConstraint.activate([
+            imageView.leadingAnchor.constraint(equalTo: slot.leadingAnchor),
+            imageView.centerYAnchor.constraint(equalTo: slot.centerYAnchor),
+            imageView.widthAnchor.constraint(equalToConstant: 18),
+            imageView.heightAnchor.constraint(equalToConstant: 18)
+        ])
+        return slot
+    }
+
     func compactActorLabel(for event: GuardMonitorEvent) -> String {
         let label: String
         if event.type == "sandbox.denial", !event.actor.isEmpty {
@@ -1337,8 +1378,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         let result = event.result.isEmpty ? "" : "\(event.result) "
         if isGuardBypassActivity(event) {
             let child = guardBypassTargetLabel(for: event)
-            let action = result.isEmpty ? "bypass" : result
-            return compactMiddle("\(action) \(child)", limit: 72)
+            return compactMiddle("\(child) · \(guardBypassStateLabel(for: event))", limit: 72)
         }
         return compactMiddle(destination.isEmpty ? event.type : "\(result)\(destination)", limit: 72)
     }
@@ -1702,6 +1742,8 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
     let editablePath: String?
     let defaultLifetimeValue: String
     let scopePathOverrides: [GuardPromptChoice: String]
+    let headerIcon: NSImage?
+    let headerTargetLabel: String
     var selectedChoice: GuardPromptChoice = .deny
     var selectedActionDuration: String?
     var selectedScopeChoice: GuardPromptChoice?
@@ -1724,7 +1766,9 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         methodOptions: [(String, [String]?)] = [],
         editablePath: String? = nil,
         defaultLifetimeValue: String = "forever",
-        scopePathOverrides: [GuardPromptChoice: String] = [:]
+        scopePathOverrides: [GuardPromptChoice: String] = [:],
+        headerIcon: NSImage? = nil,
+        headerTargetLabel: String = "Destination"
     ) {
         self.titleText = titleText
         self.actor = actor
@@ -1739,6 +1783,8 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         self.editablePath = editablePath
         self.defaultLifetimeValue = defaultLifetimeValue
         self.scopePathOverrides = scopePathOverrides
+        self.headerIcon = headerIcon
+        self.headerTargetLabel = headerTargetLabel
     }
 
     func run() -> GuardPromptChoice {
@@ -1876,7 +1922,9 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         iconWrap.wantsLayer = true
         iconWrap.layer?.cornerRadius = 9
         iconWrap.layer?.cornerCurve = .continuous
-        iconWrap.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.16).cgColor
+        iconWrap.layer?.backgroundColor = (headerIcon == nil
+            ? NSColor.controlAccentColor.withAlphaComponent(0.16)
+            : NSColor.clear).cgColor
         iconWrap.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             iconWrap.widthAnchor.constraint(equalToConstant: 38),
@@ -1884,7 +1932,9 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         ])
 
         let icon = NSImageView()
-        if #available(macOS 11.0, *) {
+        if let headerIcon {
+            icon.image = headerIcon
+        } else if #available(macOS 11.0, *) {
             icon.image = NSImage(systemSymbolName: "network.badge.shield.half.filled", accessibilityDescription: "Network request")
             icon.contentTintColor = .controlAccentColor
         } else {
@@ -1905,7 +1955,7 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         subtitle.maximumNumberOfLines = 2
 
         let actorLine = makeHeaderKeyValueLine("Actor", actor)
-        let targetLine = makeHeaderKeyValueLine("Destination", destination)
+        let targetLine = makeHeaderKeyValueLine(headerTargetLabel, destination)
 
         let text = NSStackView(views: [title, subtitle, actorLine, targetLine])
         text.orientation = .vertical
@@ -2000,7 +2050,7 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         stack.spacing = 7
         stack.addArrangedSubview(promptLabel("Connection Details", size: 12, weight: .semibold, color: .secondaryLabelColor))
         stack.addArrangedSubview(makeKeyValueLine("Actor", actor, strong: false, maxLines: 0))
-        stack.addArrangedSubview(makeKeyValueLine("Destination", destination, strong: false, maxLines: 0))
+        stack.addArrangedSubview(makeKeyValueLine(headerTargetLabel, destination, strong: false, maxLines: 0))
         for (label, value) in detailRows {
             stack.addArrangedSubview(makeKeyValueLine(label, value, strong: false, maxLines: 0))
         }
@@ -3016,6 +3066,28 @@ func guardBypassReasonLabel(for event: GuardMonitorEvent) -> String {
         return event.detail
     }
     return "Guard bypass request"
+}
+
+func guardBypassActorLabel(for event: GuardMonitorEvent) -> String {
+    if !event.launcherApp.isEmpty { return event.launcherApp }
+    if !event.launcherProcess.isEmpty { return event.launcherProcess }
+    if !event.actor.isEmpty { return event.actor }
+    return event.profile.isEmpty ? "Unknown app" : event.profile
+}
+
+func guardBypassTitle(for event: GuardMonitorEvent) -> String {
+    "\(guardBypassActorLabel(for: event)) launched \(guardBypassTargetLabel(for: event))"
+}
+
+func guardBypassStateLabel(for event: GuardMonitorEvent) -> String {
+    let decision = event.result.lowercased()
+    if decision == "deny" || decision == "denied" || decision == "blocked" {
+        return "Blocked by Guard"
+    }
+    if decision == "pending" || decision == "review" || event.status == "pending" {
+        return "Needs approval"
+    }
+    return "Guard bypassed"
 }
 
 struct MonitorActivityRow {
@@ -9609,13 +9681,20 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             let launcherApp = alert["launcherApp"] as? String ?? ""
             let launcherProcess = alert["launcherProcess"] as? String ?? ""
             let parentChain = alert["parentChain"] as? String ?? ""
+            let originatingApp = launcherApp.isEmpty
+                ? (launcherProcess.isEmpty ? commandDisplay(command) : launcherProcess)
+                : launcherApp
+            let launchedCommand = compactMiddle(
+                childCommand.isEmpty ? (childPath.isEmpty ? "this command" : URL(fileURLWithPath: childPath).lastPathComponent) : childCommand,
+                limit: 48
+            )
             controller = GuardConnectionPromptController(
-                titleText: "Bypass Guard?",
-                actor: launcherApp.isEmpty ? command : launcherApp,
+                titleText: "\(originatingApp) wants to launch \(launchedCommand)",
+                actor: originatingApp,
                 destination: childCommand,
-                context: "This process wants to run without Guard filesystem and network containment.",
+                context: "This command would run outside Guard filesystem and network protection.",
                 scopeRows: [
-                    ("Scope", "Unprotected process launch")
+                    ("Security State", "Guard protection bypassed")
                 ],
                 detailRows: [
                     ("Command", childCommand),
@@ -9632,7 +9711,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                     GuardPromptAction(title: "Allow Always", choice: .allowAllNetwork, duration: "forever", isDefault: false, tint: nil)
                 ],
                 scopeOptions: [],
-                lifetimeOptions: []
+                lifetimeOptions: [],
+                headerIcon: originatingApplicationIcon(named: originatingApp),
+                headerTargetLabel: "Command"
             )
         } else if isHTTP {
             let requestPath = path.isEmpty ? "/" : path
@@ -10710,9 +10791,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                                 kind: "bypass",
                                 level: 2,
                                 rowKey: "\(processKey)/bypass:\(eventKey(event))",
-                                app: "Bypass request",
-                                destination: guardBypassTargetLabel(for: event),
-                                activity: bypassActivityLabel(for: event),
+                                app: guardBypassTitle(for: event),
+                                destination: guardBypassStateLabel(for: event),
+                                activity: guardBypassReasonLabel(for: event),
                                 decision: bypassDecisionLabel(for: event),
                                 time: shortTime(event.at),
                                 event: event
@@ -11906,6 +11987,9 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     }
 
     func iconForApp(_ app: String) -> NSImage? {
+        if let applicationIcon = originatingApplicationIcon(named: app) {
+            return applicationIcon
+        }
         let lower = app.lowercased()
         if #available(macOS 11.0, *) {
             let symbol: String
@@ -11971,6 +12055,10 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             return NSImage(named: NSImage.infoName)
         }
         if row.kind == "bypass" || row.kind == "bypass-summary" {
+            if let event = row.event,
+               let applicationIcon = originatingApplicationIcon(named: guardBypassActorLabel(for: event)) {
+                return applicationIcon
+            }
             let symbol = row.decision == "deny" ? "xmark.circle.fill" : row.decision == "pending" || row.decision == "review" ? "exclamationmark.triangle.fill" : "figure.run"
             if let image = configuredSymbol(symbol, description: row.app, pointSize: 17, weight: .semibold) { return image }
             return NSImage(named: NSImage.infoName)
