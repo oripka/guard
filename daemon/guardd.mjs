@@ -42,6 +42,8 @@ const EVENT_LOG_SCHEMA_VERSION = 1
 const EVENT_STORAGE_SCHEMA_VERSION = 2
 const EVENT_INDEX_SCHEMA_VERSION = 2
 const DEFAULT_LOG_TRUNCATE_MAX_BYTES = 1024 * 1024
+const DEFAULT_EVENT_LOG_MAX_BYTES = 16 * 1024 * 1024
+const DEFAULT_EVENT_LOG_RETAIN_BYTES = 8 * 1024 * 1024
 const DEFAULT_TLS_CA_DAYS = 90
 const DEFAULT_TLS_LEAF_DAYS = 30
 const DEFAULT_RECOVERY_TAIL_BYTES = 1024 * 1024
@@ -94,6 +96,8 @@ const parseArgs = (argv, env = process.env) => {
     stateDir,
     eventLogPath: resolveGuardEventLogPath(env),
     maxEvents: parsePositiveInt(env.GUARDD_MAX_EVENTS, DEFAULT_MAX_EVENTS),
+    eventLogMaxBytes: parsePositiveInt(env.GUARDD_EVENT_LOG_MAX_BYTES, DEFAULT_EVENT_LOG_MAX_BYTES),
+    eventLogRetainBytes: parsePositiveInt(env.GUARDD_EVENT_LOG_RETAIN_BYTES, DEFAULT_EVENT_LOG_RETAIN_BYTES),
     pollMs: parsePositiveInt(env.GUARDD_POLL_MS, DEFAULT_POLL_MS),
     policyRoot: resolveGuardPolicyRoot(env, stateDir),
     repoRoot: path.resolve(expandHome(env.GUARDD_REPO_ROOT || DEFAULT_REPO_ROOT)),
@@ -112,6 +116,8 @@ const parseArgs = (argv, env = process.env) => {
     else if (arg === '--port') config.port = parsePort(readValue(), config.port)
     else if (arg === '--event-log') config.eventLogPath = path.resolve(expandHome(readValue()))
     else if (arg === '--max-events') config.maxEvents = parsePositiveInt(readValue(), config.maxEvents)
+    else if (arg === '--event-log-max-bytes') config.eventLogMaxBytes = parsePositiveInt(readValue(), config.eventLogMaxBytes)
+    else if (arg === '--event-log-retain-bytes') config.eventLogRetainBytes = parsePositiveInt(readValue(), config.eventLogRetainBytes)
     else if (arg === '--poll-ms') config.pollMs = parsePositiveInt(readValue(), config.pollMs)
     else if (arg === '--policy-root') config.policyRoot = path.resolve(expandHome(readValue()))
     else if (arg === '--repo-root') config.repoRoot = path.resolve(expandHome(readValue()))
@@ -130,6 +136,10 @@ Options:
   --port PORT          Listen port (default: ${DEFAULT_PORT})
   --event-log PATH     Guard JSONL event log (default: GUARD_EVENT_LOG or state dir)
   --max-events N       Number of parsed events retained in memory (default: ${DEFAULT_MAX_EVENTS})
+  --event-log-max-bytes N
+                       Compact the event log after it exceeds N bytes (default: ${DEFAULT_EVENT_LOG_MAX_BYTES})
+  --event-log-retain-bytes N
+                       Bytes of complete recent events retained during compaction (default: ${DEFAULT_EVENT_LOG_RETAIN_BYTES})
   --poll-ms N          Event log polling interval in milliseconds (default: ${DEFAULT_POLL_MS})
   --policy-root PATH   Profile root containing .guard/*.json (default: GUARDD_POLICY_ROOT, GUARD_PROJECT_DIR, or Guard state dir)
   --repo-root PATH     Guard repo root for built-in profiles/templates (default: ${DEFAULT_REPO_ROOT})
@@ -267,11 +277,26 @@ class EventIndex {
     }
   }
 
+  load() {
+    const saved = safeReadJsonFile(this.path, null)
+    if (saved?.schemaVersion !== EVENT_INDEX_SCHEMA_VERSION) return false
+    this.totalEvents = Number(saved.totalEvents) || 0
+    this.byType = isPlainObject(saved.byType) ? saved.byType : {}
+    this.byHost = isPlainObject(saved.byHost) ? saved.byHost : {}
+    this.byProfile = isPlainObject(saved.byProfile) ? saved.byProfile : {}
+    this.byResult = isPlainObject(saved.byResult) ? saved.byResult : {}
+    this.alertDecisions = Number(saved.alertDecisions) || 0
+    this.lastEventAt = saved.lastEventAt || null
+    this.updatedAt = saved.updatedAt || null
+    this.rebuild = isPlainObject(saved.rebuild) ? saved.rebuild : this.rebuild
+    return true
+  }
+
   increment(bucket, key) {
     incrementBucket(bucket, key)
   }
 
-  record(event = {}) {
+  record(event = {}, { persist = true } = {}) {
     this.totalEvents += 1
     this.increment(this.byType, event.type)
     this.increment(this.byHost, event.host)
@@ -281,7 +306,7 @@ class EventIndex {
     if (event.type === 'guard.alert.decision') this.alertDecisions += 1
     this.lastEventAt = event.at || this.lastEventAt
     this.updatedAt = new Date().toISOString()
-    this.persist()
+    if (persist) this.persist()
   }
 
   rebuildFromLog(eventLogPath, { reason = 'startup' } = {}) {
@@ -330,7 +355,7 @@ class EventIndex {
         this.rebuild.tamperLineCount += 1
         continue
       }
-      this.record(classified.event)
+      this.record(classified.event, { persist: false })
       this.rebuild.validLineCount += 1
     }
     const completed = Date.now()
@@ -379,11 +404,24 @@ class EventIndex {
 }
 
 class EventTail {
-  constructor({ eventLogPath, maxEvents, pollMs, stateDir }) {
+  constructor({
+    eventLogPath,
+    maxEvents,
+    pollMs,
+    stateDir,
+    eventLogMaxBytes = DEFAULT_EVENT_LOG_MAX_BYTES,
+    eventLogRetainBytes = DEFAULT_EVENT_LOG_RETAIN_BYTES,
+  }) {
     this.eventLogPath = eventLogPath
     this.maxEvents = maxEvents
     this.pollMs = pollMs
     this.stateDir = stateDir || resolveGuardStateDir()
+    this.eventLogMaxBytes = Math.max(1, eventLogMaxBytes)
+    this.eventLogRetainBytes = Math.min(
+      Math.max(0, eventLogRetainBytes),
+      Math.max(0, this.eventLogMaxBytes - 1),
+    )
+    this.compacting = false
     this.metadataPath = path.join(this.stateDir, 'daemon-state.json')
     this.index = new EventIndex({ stateDir: this.stateDir })
     this.events = []
@@ -411,6 +449,8 @@ class EventTail {
     }
     this.retention = {
       maxEvents,
+      maxLogBytes: this.eventLogMaxBytes,
+      retainedLogBytes: this.eventLogRetainBytes,
       recoveryTailBytes: DEFAULT_RECOVERY_TAIL_BYTES,
       truncated: false,
       lastTruncatedAt: null,
@@ -420,7 +460,11 @@ class EventTail {
 
   start() {
     this.recover()
-    this.index.rebuildFromLog(this.eventLogPath, { reason: 'startup' })
+    const compacted = this.compactIfNeeded()
+    const recoveredIndex = !compacted && this.recovery.mode === 'cursor' && this.index.load()
+    if (!compacted && !recoveredIndex) {
+      this.index.rebuildFromLog(this.eventLogPath, { reason: 'startup' })
+    }
     this.poll()
     this.timer = setInterval(() => this.poll(), this.pollMs)
     this.timer.unref?.()
@@ -446,6 +490,8 @@ class EventTail {
       this.persist({ stat })
       return
     }
+
+    if (this.compactIfNeeded(stat)) return
 
     if (stat.size < this.offset) {
       this.offset = 0
@@ -481,6 +527,32 @@ class EventTail {
     this.persist({ stat })
   }
 
+  compactIfNeeded(stat = null) {
+    if (this.compacting) return false
+    const currentStat = stat || (() => {
+      try {
+        return fs.statSync(this.eventLogPath)
+      } catch {
+        return null
+      }
+    })()
+    if (!currentStat?.isFile() || currentStat.size <= this.eventLogMaxBytes) return false
+
+    this.compacting = true
+    try {
+      truncateEventLog({
+        eventLogPath: this.eventLogPath,
+        tail: this,
+        keepBytes: this.eventLogRetainBytes,
+        maxKeepBytes: this.eventLogMaxBytes,
+        operation: 'automatic-retention',
+      })
+      return true
+    } finally {
+      this.compacting = false
+    }
+  }
+
   consume(chunk) {
     const lines = `${this.partial}${chunk}`.split(/\r?\n/)
     this.partial = lines.pop() || ''
@@ -509,9 +581,9 @@ class EventTail {
     }
   }
 
-  push(event) {
+  push(event, { index = true } = {}) {
     this.events.push(event)
-    this.index.record(event)
+    if (index) this.index.record(event)
     if (this.events.length > this.maxEvents) {
       this.events.splice(0, this.events.length - this.maxEvents)
     }
@@ -562,6 +634,8 @@ class EventTail {
         ...previous.retention,
         maxEvents: this.maxEvents,
         recoveryTailBytes: DEFAULT_RECOVERY_TAIL_BYTES,
+        maxLogBytes: this.eventLogMaxBytes,
+        retainedLogBytes: this.eventLogRetainBytes,
       }
     }
 
@@ -657,7 +731,10 @@ class EventTail {
           }
           continue
         }
-        this.push(classified.event)
+        this.push(classified.event, { index: false })
+        if (classified.event.type === 'daemon.log.truncated') {
+          this.applyTruncationMetadata(classified.event)
+        }
       }
       this.lastReadAt = new Date().toISOString()
       this.recovery.recoveredEventCount = this.events.length - beforeCount
@@ -667,12 +744,18 @@ class EventTail {
   }
 
   recordTruncation(event) {
+    this.applyTruncationMetadata(event)
+    this.persist()
+  }
+
+  applyTruncationMetadata(event) {
     this.retention = {
       ...this.retention,
       truncated: true,
       lastTruncatedAt: event.at,
       lastTruncation: {
         at: event.at,
+        operation: event.operation,
         beforeBytes: event.beforeBytes,
         afterBytes: event.afterBytes,
         keepBytes: event.keepBytes,
@@ -680,7 +763,6 @@ class EventTail {
         eventLogPath: event.path,
       },
     }
-    this.persist()
   }
 
   metadata({ stat = null } = {}) {
@@ -2193,13 +2275,19 @@ const auditMutation = ({ tail, eventLogPath, operation, result }) => {
   }
 }
 
-const truncateEventLog = ({ eventLogPath, tail, keepBytes = 0 }) => {
+const truncateEventLog = ({
+  eventLogPath,
+  tail,
+  keepBytes = 0,
+  maxKeepBytes = DEFAULT_LOG_TRUNCATE_MAX_BYTES,
+  operation = 'truncate-event-log',
+}) => {
   const parsedKeepBytes = Number.parseInt(String(keepBytes || 0), 10)
   if (!Number.isFinite(parsedKeepBytes) || parsedKeepBytes < 0) {
     throw new Error('keepBytes must be a non-negative integer')
   }
-  if (parsedKeepBytes > DEFAULT_LOG_TRUNCATE_MAX_BYTES) {
-    throw new Error(`keepBytes must be <= ${DEFAULT_LOG_TRUNCATE_MAX_BYTES}`)
+  if (parsedKeepBytes > maxKeepBytes) {
+    throw new Error(`keepBytes must be <= ${maxKeepBytes}`)
   }
 
   fs.mkdirSync(path.dirname(eventLogPath), { recursive: true })
@@ -2222,24 +2310,33 @@ const truncateEventLog = ({ eventLogPath, tail, keepBytes = 0 }) => {
       fs.closeSync(fd)
     }
   }
-  fs.writeFileSync(eventLogPath, retained)
+  const temporaryPath = `${eventLogPath}.compact-${process.pid}-${crypto.randomUUID()}`
+  try {
+    fs.writeFileSync(temporaryPath, retained, { mode: 0o600 })
+    fs.renameSync(temporaryPath, eventLogPath)
+  } finally {
+    try {
+      fs.unlinkSync(temporaryPath)
+    } catch {}
+  }
   tail.resetAfterLogRewrite()
+  tail.index.rebuildFromLog(eventLogPath, { reason: operation })
 
   const event = {
     schemaVersion: 1,
     at: new Date().toISOString(),
     type: 'daemon.log.truncated',
     backend: 'guardd',
-    operation: 'truncate-event-log',
+    operation,
     changed: beforeBytes !== retained.length,
     path: eventLogPath,
     beforeBytes,
     afterBytes: retained.length,
     keepBytes: parsedKeepBytes,
-    maxKeepBytes: DEFAULT_LOG_TRUNCATE_MAX_BYTES,
+    maxKeepBytes,
   }
   appendJsonLine(eventLogPath, event)
-  tail.push(event)
+  tail.poll()
   tail.recordTruncation(event)
   return event
 }
@@ -4098,4 +4195,4 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   main()
 }
 
-export { EventTail, createServer, parseArgs, resolveGuardEventLogPath, resolveGuardStateDir }
+export { EventIndex, EventTail, createServer, parseArgs, resolveGuardEventLogPath, resolveGuardStateDir }
