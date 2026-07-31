@@ -3410,6 +3410,7 @@ struct MonitorRuleRow {
     let groupCount: Int
     let groupKey: String
     let memberSearchText: String
+    let isGroupChild: Bool
 
     init(
         id: String = "",
@@ -3428,7 +3429,8 @@ struct MonitorRuleRow {
         expiresAt: String = "",
         groupCount: Int = 1,
         groupKey: String = "",
-        memberSearchText: String = ""
+        memberSearchText: String = "",
+        isGroupChild: Bool = false
     ) {
         self.id = id
         self.kind = kind
@@ -3447,6 +3449,7 @@ struct MonitorRuleRow {
         self.groupCount = groupCount
         self.groupKey = groupKey
         self.memberSearchText = memberSearchText
+        self.isGroupChild = isGroupChild
     }
 }
 
@@ -3718,6 +3721,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
     var selectedProfile: String
     var rows: [MonitorRuleRow]
     var renderedRows: [MonitorRuleRow] = []
+    var expandedGroupKeys = Set<String>()
     let sidebarSections = ["All Rules", "Active", "Deny", "Recent Changes", "Temporary", "Bypass Decisions", "Unapproved", "Rule Groups", "Blocklists"]
 
     init(client: GuardDaemonClient?, profileNames: [String], selectedProfile: String, rows: [MonitorRuleRow], parent: MonitorWindowController) {
@@ -4079,7 +4083,8 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         let filter = filterControl.selectedSegment
         let selectedSection = sidebar.selectedRow >= 0 ? sidebarSections[safe: sidebar.selectedRow] ?? "All Rules" : "All Rules"
         let rawRows = ungroupedRuleRows()
-        let sourceRows = groupedRuleRows(rawRows)
+        let collapsedRows = groupedRuleRows(rawRows, includeExpanded: false)
+        let sourceRows = groupedRuleRows(rawRows, includeExpanded: true)
         renderedRows = sourceRows.filter { row in
             let text = [row.kind, row.action, row.scope, row.detail, row.source, row.memberSearchText].joined(separator: " ").lowercased()
             let matchesSearch = search.isEmpty || text.contains(search)
@@ -4115,13 +4120,13 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         renderInspector()
         statusLabel.stringValue = sourceRows.isEmpty
             ? "No profile rules or recent decisions are available yet."
-            : rawRows.count == sourceRows.count
+            : rawRows.count == collapsedRows.count
                 ? "\(renderedRows.count) visible of \(sourceRows.count) rules and recent decisions."
-                : "\(renderedRows.count) visible groups · \(sourceRows.count) groups represent \(rawRows.count) rules and decisions."
+                : "\(renderedRows.count) visible rows · \(collapsedRows.count) groups represent \(rawRows.count) rules and decisions."
     }
 
     func combinedRuleRows() -> [MonitorRuleRow] {
-        groupedRuleRows(ungroupedRuleRows())
+        groupedRuleRows(ungroupedRuleRows(), includeExpanded: false)
     }
 
     func ungroupedRuleRows() -> [MonitorRuleRow] {
@@ -4136,7 +4141,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         return combined
     }
 
-    func groupedRuleRows(_ sourceRows: [MonitorRuleRow]) -> [MonitorRuleRow] {
+    func groupedRuleRows(_ sourceRows: [MonitorRuleRow], includeExpanded: Bool) -> [MonitorRuleRow] {
         var groups: [String: [MonitorRuleRow]] = [:]
         var order: [String] = []
         for row in sourceRows {
@@ -4144,8 +4149,9 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             if groups[key] == nil { order.append(key) }
             groups[key, default: []].append(row)
         }
-        return order.compactMap { key in
-            guard let members = groups[key], let row = members.first else { return nil }
+        var output: [MonitorRuleRow] = []
+        for key in order {
+            guard let members = groups[key], let row = members.first else { continue }
             let httpDescriptor = members.count > 1 ? httpGroupDescriptor(row) : nil
             let paths = httpPaths(in: members)
             let groupedDetail: String
@@ -4156,7 +4162,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             } else {
                 groupedDetail = row.detail
             }
-            return MonitorRuleRow(
+            output.append(MonitorRuleRow(
                 id: row.id,
                 kind: row.kind,
                 action: row.action,
@@ -4174,8 +4180,32 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
                 groupCount: members.count,
                 groupKey: key,
                 memberSearchText: members.map { "\($0.scope) \($0.detail)" }.joined(separator: " ")
-            )
+            ))
+            if includeExpanded && members.count > 1 && expandedGroupKeys.contains(key) {
+                output.append(contentsOf: members.map { member in
+                    MonitorRuleRow(
+                        id: member.id,
+                        kind: member.kind,
+                        action: member.action,
+                        scope: member.scope,
+                        detail: member.detail,
+                        enabled: member.enabled,
+                        source: member.source,
+                        field: member.field,
+                        value: member.value,
+                        layer: member.layer,
+                        lifetime: member.lifetime,
+                        approvalState: member.approvalState,
+                        notes: member.notes,
+                        expiresAt: member.expiresAt,
+                        groupCount: 1,
+                        groupKey: key,
+                        isGroupChild: true
+                    )
+                })
+            }
         }
+        return output
     }
 
     func ruleGroupingKey(_ row: MonitorRuleRow) -> String {
@@ -4246,6 +4276,13 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         var expanded: [MonitorRuleRow] = []
         var seen = Set<String>()
         for row in displayRows {
+            if row.isGroupChild {
+                let memberKey = row.field == "process.bypass" && !row.id.isEmpty
+                    ? row.id
+                    : "\(row.field)|\(canonicalRuleValue(row.value))"
+                if seen.insert(memberKey).inserted { expanded.append(row) }
+                continue
+            }
             let key = row.groupKey.isEmpty ? ruleGroupingKey(row) : row.groupKey
             let members = grouped[key] ?? [row]
             for member in members {
@@ -4699,6 +4736,24 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             rowView.alignment = .centerY
             rowView.spacing = 5
             rowView.translatesAutoresizingMaskIntoConstraints = false
+            if id == "kind" {
+                if rule.groupCount > 1 && !rule.isGroupChild {
+                    let disclosure = NSButton()
+                    disclosure.setButtonType(.onOff)
+                    disclosure.bezelStyle = .disclosure
+                    disclosure.state = expandedGroupKeys.contains(rule.groupKey) ? .on : .off
+                    disclosure.target = self
+                    disclosure.action = #selector(toggleRuleGroup(_:))
+                    disclosure.tag = row
+                    disclosure.toolTip = disclosure.state == .on ? "Hide exact rules" : "Show exact rules"
+                    rowView.addArrangedSubview(disclosure)
+                } else if rule.isGroupChild {
+                    let indent = NSView()
+                    indent.translatesAutoresizingMaskIntoConstraints = false
+                    indent.widthAnchor.constraint(equalToConstant: 18).isActive = true
+                    rowView.addArrangedSubview(indent)
+                }
+            }
             let icon = NSImageView()
             if #available(macOS 11.0, *) {
                 icon.image = NSImage(systemSymbolName: ruleSymbol(rule, column: id), accessibilityDescription: text)
@@ -4759,6 +4814,22 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
     @objc func toggleRuleCheckbox(_ sender: NSButton) {
         guard sender.tag >= 0 && sender.tag < renderedRows.count else { return }
         mutateRules([renderedRows[sender.tag]], action: sender.state == .on ? "enable" : "disable")
+    }
+
+    @objc func toggleRuleGroup(_ sender: NSButton) {
+        guard sender.tag >= 0 && sender.tag < renderedRows.count else { return }
+        let row = renderedRows[sender.tag]
+        guard row.groupCount > 1, !row.groupKey.isEmpty else { return }
+        if expandedGroupKeys.contains(row.groupKey) {
+            expandedGroupKeys.remove(row.groupKey)
+        } else {
+            expandedGroupKeys.insert(row.groupKey)
+        }
+        renderRows()
+        if let index = renderedRows.firstIndex(where: { $0.groupKey == row.groupKey && !$0.isGroupChild }) {
+            tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+            tableView.scrollRowToVisible(index)
+        }
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
