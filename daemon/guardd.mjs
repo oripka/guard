@@ -25,6 +25,12 @@ import {
   stableJson,
   writeJsonFile,
 } from '../lib/guard-policy.mjs'
+import {
+  buildEvidenceWindows,
+  projectSecurityEvent,
+  validatePolicyProposal,
+  validateSecurityFinding,
+} from '../lib/guard-security-telemetry.mjs'
 
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 8765
@@ -145,6 +151,7 @@ Endpoints:
   GET /alerts/pending?limit=N
   GET /auth/token
   GET /security/status
+  GET /security/evidence-windows?windowMs=N&limit=N&privacy=redacted
   GET /policy?profile=guard
   GET /profiles
   GET /profiles/:name
@@ -152,6 +159,8 @@ Endpoints:
   GET /templates/:name
   GET /templates/:name/preview?profile=guard
   POST /policy/evaluate
+  POST /security/findings/validate
+  POST /security/proposals/validate
   POST /extension/sync
   POST /tls/ca
   POST /tls/cert
@@ -3107,6 +3116,40 @@ const createServer = ({ tail, policyStore, projectRegistry, startedAt, apiToken,
     }
 
     if (request.method === 'POST') {
+      if (url.pathname === '/security/findings/validate') {
+        try {
+          const body = await readRequestJson(request)
+          const knownEventIds = tail.events
+            .map((event) => event?.eventId)
+            .filter(Boolean)
+          const validation = validateSecurityFinding(body, knownEventIds)
+          writeJson(response, validation.ok ? 200 : 400, validation)
+        } catch (error) {
+          writeJson(response, 400, {
+            error: 'security_finding_validation_failed',
+            message: error.message,
+          })
+        }
+        return
+      }
+
+      if (url.pathname === '/security/proposals/validate') {
+        try {
+          const body = await readRequestJson(request)
+          const knownEventIds = tail.events
+            .map((event) => event?.eventId)
+            .filter(Boolean)
+          const validation = validatePolicyProposal(body, knownEventIds)
+          writeJson(response, validation.ok ? 200 : 400, validation)
+        } catch (error) {
+          writeJson(response, 400, {
+            error: 'security_proposal_validation_failed',
+            message: error.message,
+          })
+        }
+        return
+      }
+
       if (url.pathname === '/policy/evaluate') {
         try {
           const body = await readRequestJson(request)
@@ -3653,6 +3696,42 @@ const createServer = ({ tail, policyStore, projectRegistry, startedAt, apiToken,
 
     if (url.pathname === '/security/status') {
       writeJson(response, 200, securityStatus({ stateDir, eventLogPath, policyStore, authState }))
+      return
+    }
+
+    if (url.pathname === '/security/evidence-windows') {
+      const limit = Math.min(parsePositiveInt(url.searchParams.get('limit'), 250), DEFAULT_MAX_EVENTS)
+      const windowMs = Math.min(
+        parsePositiveInt(url.searchParams.get('windowMs'), 5 * 60 * 1000),
+        60 * 60 * 1000,
+      )
+      const requestedPrivacy = url.searchParams.get('privacy') || 'redacted'
+      const privacy = ['local', 'redacted', 'pseudonymous'].includes(requestedPrivacy)
+        ? requestedPrivacy
+        : 'redacted'
+      const retained = tail.events.slice(-limit)
+      const eligible = retained.filter((event) => event?.eventId && event?.runId && event?.at)
+      const projectionSalt = crypto
+        .createHash('sha256')
+        .update(`${authState.currentToken || 'local'}:${stateDir}:security-projection`)
+        .digest('hex')
+      const projected = eligible.map((event) =>
+        projectSecurityEvent(event, {
+          privacy,
+          pseudonymSalt: projectionSalt,
+        }))
+      writeJson(response, 200, {
+        schemaVersion: 1,
+        generatedAt: new Date().toISOString(),
+        privacy,
+        windowMs,
+        sourceEventCount: eligible.length,
+        skippedLegacyEventCount: retained.length - eligible.length,
+        windows: buildEvidenceWindows(projected, {
+          windowMs,
+          maxEvents: limit,
+        }),
+      })
       return
     }
 

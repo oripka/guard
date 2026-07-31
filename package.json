@@ -19,6 +19,7 @@
     "native/macos-launcher/README.md",
     "native/network-extension",
     "profiles",
+    "schemas",
     "scripts",
     "templates",
     "install.sh",
