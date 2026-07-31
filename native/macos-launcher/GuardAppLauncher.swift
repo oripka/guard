@@ -3725,6 +3725,9 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
     var rows: [MonitorRuleRow]
     var renderedRows: [MonitorRuleRow] = []
     var expandedGroupKeys = Set<String>()
+    var cachedUngroupedRows: [MonitorRuleRow] = []
+    var cachedCollapsedRows: [MonitorRuleRow] = []
+    var hasRuleRenderCache = false
     let sidebarSections = ["All Rules", "Active", "Deny", "Recent Changes", "Temporary", "Bypass Decisions", "Unapproved", "Rule Groups", "Blocklists"]
 
     init(client: GuardDaemonClient?, profileNames: [String], selectedProfile: String, rows: [MonitorRuleRow], parent: MonitorWindowController) {
@@ -3942,7 +3945,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         tableView.usesAlternatingRowBackgroundColors = true
         tableView.backgroundColor = .controlBackgroundColor
         tableView.allowsMultipleSelection = true
-        tableView.rowHeight = 30
+        tableView.rowHeight = 25
         tableView.dataSource = self
         tableView.delegate = self
         tableView.target = self
@@ -3950,16 +3953,18 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         let menu = NSMenu(title: "Rule Actions")
         menu.delegate = self
         tableView.menu = menu
-        tableView.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
+        tableView.columnAutoresizingStyle = .noColumnAutoresizing
         tableView.addTableColumn(column("state", "State", 54))
         tableView.addTableColumn(column("action", "Action", 82))
-        tableView.addTableColumn(column("kind", "Kind", 108))
-        tableView.addTableColumn(column("app", "App", 130))
+        tableView.addTableColumn(column("kind", "Kind", 88))
+        let appColumn = column("app", "App", 150)
+        appColumn.isHidden = false
+        tableView.addTableColumn(appColumn)
         tableView.addTableColumn(column("scope", "Scope", 320))
         tableView.addTableColumn(column("detail", "Detail", 210))
         tableView.addTableColumn(column("lifetime", "Lifetime", 86))
         tableView.addTableColumn(column("approval", "Review", 76))
-        tableView.autosaveName = "dev.guard.rules.columns"
+        tableView.autosaveName = "dev.guard.rules.columns.v2"
         tableView.autosaveTableColumns = true
         tableView.sortDescriptors = [
             NSSortDescriptor(key: "kind", ascending: true),
@@ -4037,15 +4042,15 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         guard tableView.numberOfColumns >= 6 else { return }
         let available = tableView.enclosingScrollView?.contentView.bounds.width ?? tableView.bounds.width
         guard available > 0 else { return }
-        let fixed: CGFloat = 54 + 82 + 108 + 130 + 86 + 76
+        let fixed: CGFloat = 54 + 82 + 88 + 150 + 86 + 76
         let remaining = max(320, available - fixed - 12)
         let scopeWidth = floor(remaining * 0.58)
         let detailWidth = floor(remaining - scopeWidth)
         let widths: [String: CGFloat] = [
             "state": 54,
             "action": 82,
-            "kind": 108,
-            "app": 130,
+            "kind": 88,
+            "app": 150,
             "scope": max(260, scopeWidth),
             "detail": max(160, detailWidth),
             "lifetime": 86,
@@ -4091,6 +4096,9 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         let selectedSection = sidebar.selectedRow >= 0 ? sidebarSections[safe: sidebar.selectedRow] ?? "All Rules" : "All Rules"
         let rawRows = ungroupedRuleRows()
         let collapsedRows = groupedRuleRows(rawRows, includeExpanded: false)
+        cachedUngroupedRows = rawRows
+        cachedCollapsedRows = collapsedRows
+        hasRuleRenderCache = true
         let sourceRows = groupedRuleRows(rawRows, includeExpanded: true)
         renderedRows = sourceRows.filter { row in
             let text = [row.kind, row.action, row.actor, row.scope, row.detail, row.source, row.memberSearchText].joined(separator: " ").lowercased()
@@ -4133,7 +4141,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
     }
 
     func combinedRuleRows() -> [MonitorRuleRow] {
-        groupedRuleRows(ungroupedRuleRows(), includeExpanded: false)
+        hasRuleRenderCache ? cachedCollapsedRows : groupedRuleRows(ungroupedRuleRows(), includeExpanded: false)
     }
 
     func ungroupedRuleRows() -> [MonitorRuleRow] {
@@ -4283,7 +4291,8 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
     }
 
     func expandedRuleRows(_ displayRows: [MonitorRuleRow]) -> [MonitorRuleRow] {
-        let grouped = Dictionary(grouping: ungroupedRuleRows(), by: ruleGroupingKey)
+        let sourceRows = hasRuleRenderCache ? cachedUngroupedRows : ungroupedRuleRows()
+        let grouped = Dictionary(grouping: sourceRows, by: ruleGroupingKey)
         var expanded: [MonitorRuleRow] = []
         var seen = Set<String>()
         for row in displayRows {
@@ -4718,6 +4727,22 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         renderedRows.count
     }
 
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        guard row >= 0, row < renderedRows.count else { return nil }
+        let rule = renderedRows[row]
+        let view = MonitorRowView()
+        view.group = rule.groupCount > 1 && !rule.isGroupChild
+        view.odd = row % 2 == 1
+        return view
+    }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        guard row >= 0, row < renderedRows.count else { return 25 }
+        let rule = renderedRows[row]
+        if rule.groupCount > 1 && !rule.isGroupChild { return 28 }
+        return rule.isGroupChild ? 23 : 25
+    }
+
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard row < renderedRows.count else { return nil }
         let rule = renderedRows[row]
@@ -4726,7 +4751,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         switch id {
         case "state": text = rule.enabled ? "On" : "Off"
         case "action": text = rule.action
-        case "kind": text = rule.groupCount > 1 ? "\(rule.kind) ×\(rule.groupCount)" : rule.kind
+        case "kind": text = rule.kind
         case "app": text = rule.actor.isEmpty ? "Profile-wide" : rule.actor
         case "scope": text = rule.scope
         case "detail": text = rule.detail
@@ -4754,33 +4779,6 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             rowView.alignment = .centerY
             rowView.spacing = 5
             rowView.translatesAutoresizingMaskIntoConstraints = false
-            if id == "kind" {
-                if rule.groupCount > 1 && !rule.isGroupChild {
-                    let expanded = expandedGroupKeys.contains(rule.groupKey)
-                    let disclosure = NSButton(
-                        image: NSImage(
-                            systemSymbolName: expanded ? "chevron.down" : "chevron.right",
-                            accessibilityDescription: expanded ? "Hide exact rules" : "Show exact rules"
-                        ) ?? NSImage(),
-                        target: self,
-                        action: #selector(toggleRuleGroup(_:))
-                    )
-                    disclosure.isBordered = false
-                    disclosure.imageScaling = .scaleProportionallyDown
-                    disclosure.contentTintColor = .secondaryLabelColor
-                    disclosure.tag = row
-                    disclosure.toolTip = expanded ? "Hide exact rules" : "Show exact rules"
-                    disclosure.translatesAutoresizingMaskIntoConstraints = false
-                    disclosure.widthAnchor.constraint(equalToConstant: 16).isActive = true
-                    disclosure.heightAnchor.constraint(equalToConstant: 18).isActive = true
-                    rowView.addArrangedSubview(disclosure)
-                } else if rule.isGroupChild {
-                    let indent = NSView()
-                    indent.translatesAutoresizingMaskIntoConstraints = false
-                    indent.widthAnchor.constraint(equalToConstant: 18).isActive = true
-                    rowView.addArrangedSubview(indent)
-                }
-            }
             let icon = NSImageView()
             if #available(macOS 11.0, *) {
                 icon.image = NSImage(systemSymbolName: ruleSymbol(rule, column: id), accessibilityDescription: text)
@@ -4800,6 +4798,98 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             NSLayoutConstraint.activate([
                 rowView.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 6),
                 rowView.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
+                rowView.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
+            ])
+            return cell
+        }
+        if id == "app" {
+            let rowView = NSStackView()
+            rowView.orientation = .horizontal
+            rowView.alignment = .centerY
+            rowView.spacing = 5
+            rowView.translatesAutoresizingMaskIntoConstraints = false
+            let icon = NSImageView()
+            if #available(macOS 11.0, *) {
+                icon.image = NSImage(
+                    systemSymbolName: rule.actor.isEmpty ? "person.2" : "app",
+                    accessibilityDescription: text
+                )
+                icon.contentTintColor = .secondaryLabelColor
+            }
+            icon.translatesAutoresizingMaskIntoConstraints = false
+            icon.widthAnchor.constraint(equalToConstant: 15).isActive = true
+            let label = NSTextField(labelWithString: text)
+            label.font = NSFont.systemFont(
+                ofSize: 12,
+                weight: rule.groupCount > 1 && !rule.isGroupChild ? .semibold : .regular
+            )
+            label.lineBreakMode = .byTruncatingTail
+            rowView.addArrangedSubview(icon)
+            rowView.addArrangedSubview(label)
+            cell.addSubview(rowView)
+            NSLayoutConstraint.activate([
+                rowView.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 6),
+                rowView.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
+                rowView.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
+            ])
+            return cell
+        }
+        if id == "scope" {
+            let rowView = NSStackView()
+            rowView.orientation = .horizontal
+            rowView.alignment = .centerY
+            rowView.spacing = 5
+            rowView.translatesAutoresizingMaskIntoConstraints = false
+            if rule.groupCount > 1 && !rule.isGroupChild {
+                let expanded = expandedGroupKeys.contains(rule.groupKey)
+                let disclosure = NSButton(
+                    image: NSImage(
+                        systemSymbolName: expanded ? "chevron.down" : "chevron.right",
+                        accessibilityDescription: expanded ? "Hide exact rules" : "Show exact rules"
+                    ) ?? NSImage(),
+                    target: self,
+                    action: #selector(toggleRuleGroup(_:))
+                )
+                disclosure.isBordered = false
+                disclosure.imageScaling = .scaleProportionallyDown
+                disclosure.contentTintColor = .secondaryLabelColor
+                disclosure.tag = row
+                disclosure.toolTip = expanded ? "Hide exact rules" : "Show exact rules"
+                disclosure.translatesAutoresizingMaskIntoConstraints = false
+                disclosure.widthAnchor.constraint(equalToConstant: 16).isActive = true
+                disclosure.heightAnchor.constraint(equalToConstant: 18).isActive = true
+                rowView.addArrangedSubview(disclosure)
+            } else if rule.isGroupChild {
+                let indent = NSView()
+                indent.translatesAutoresizingMaskIntoConstraints = false
+                indent.widthAnchor.constraint(equalToConstant: 18).isActive = true
+                rowView.addArrangedSubview(indent)
+            }
+            let label = NSTextField(labelWithString: text)
+            label.font = NSFont.systemFont(
+                ofSize: 12,
+                weight: rule.groupCount > 1 && !rule.isGroupChild ? .semibold : .regular
+            )
+            label.lineBreakMode = .byTruncatingMiddle
+            if rule.isGroupChild { label.textColor = .secondaryLabelColor }
+            rowView.addArrangedSubview(label)
+            if rule.groupCount > 1 && !rule.isGroupChild {
+                let badge = NSTextField(labelWithString: "\(rule.groupCount)")
+                badge.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
+                badge.textColor = .secondaryLabelColor
+                badge.alignment = .center
+                badge.wantsLayer = true
+                badge.layer?.backgroundColor = NSColor.quaternaryLabelColor.withAlphaComponent(0.16).cgColor
+                badge.layer?.cornerRadius = 7
+                badge.translatesAutoresizingMaskIntoConstraints = false
+                badge.widthAnchor.constraint(greaterThanOrEqualToConstant: 22).isActive = true
+                badge.heightAnchor.constraint(equalToConstant: 16).isActive = true
+                rowView.addArrangedSubview(badge)
+            }
+            cell.addSubview(rowView)
+            NSLayoutConstraint.activate([
+                rowView.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 6),
+                rowView.trailingAnchor.constraint(lessThanOrEqualTo: cell.trailingAnchor, constant: -6),
                 rowView.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
             ])
             return cell
