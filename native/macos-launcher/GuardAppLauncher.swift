@@ -3412,6 +3412,8 @@ struct MonitorRuleRow {
     let memberSearchText: String
     let isGroupChild: Bool
     let actor: String
+    let isActorGroup: Bool
+    let hierarchyDepth: Int
 
     init(
         id: String = "",
@@ -3432,7 +3434,9 @@ struct MonitorRuleRow {
         groupKey: String = "",
         memberSearchText: String = "",
         isGroupChild: Bool = false,
-        actor: String = ""
+        actor: String = "",
+        isActorGroup: Bool = false,
+        hierarchyDepth: Int = 0
     ) {
         self.id = id
         self.kind = kind
@@ -3453,6 +3457,8 @@ struct MonitorRuleRow {
         self.memberSearchText = memberSearchText
         self.isGroupChild = isGroupChild
         self.actor = actor
+        self.isActorGroup = isActorGroup
+        self.hierarchyDepth = hierarchyDepth
     }
 }
 
@@ -3716,7 +3722,6 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
     let profilePopup = NSPopUpButton()
     let sidebar = NSOutlineView()
     let inspectorStack = NSStackView()
-    let filterControl = NSSegmentedControl(labels: ["All", "Allow", "Deny", "HTTP", "Off"], trackingMode: .selectOne, target: nil, action: nil)
     let statusLabel = NSTextField(labelWithString: "")
     weak var rulesToolbarSearchField: NSSearchField?
     var window: NSWindow?
@@ -3725,6 +3730,11 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
     var rows: [MonitorRuleRow]
     var renderedRows: [MonitorRuleRow] = []
     var expandedGroupKeys = Set<String>()
+    var expandedActorKeys = Set<String>()
+    var initializedActorExpansion = false
+    var ruleActionFilter = "all"
+    var ruleKindFilter = "all"
+    var ruleActorFilter = "all"
     var cachedUngroupedRows: [MonitorRuleRow] = []
     var cachedCollapsedRows: [MonitorRuleRow] = []
     var hasRuleRenderCache = false
@@ -3742,6 +3752,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
     func show() {
         if let window = window {
             syncProfilePopup()
+            hasRuleRenderCache = false
             renderRows()
             window.makeKeyAndOrderFront(nil)
             return
@@ -3840,13 +3851,16 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         case "rulesFilter":
             item.label = "Filter"
             item.paletteLabel = "Filter"
-            filterControl.selectedSegment = 0
-            filterControl.target = self
-            filterControl.action = #selector(filterChanged(_:))
-            filterControl.segmentStyle = .texturedRounded
-            filterControl.controlSize = .regular
-            filterControl.widthAnchor.constraint(equalToConstant: 300).isActive = true
-            item.view = filterControl
+            if #available(macOS 11.0, *) {
+                let button = NSButton(
+                    image: NSImage(systemSymbolName: "line.3.horizontal.decrease.circle", accessibilityDescription: "Filter rules") ?? NSImage(),
+                    target: self,
+                    action: #selector(showRulesFilterMenu(_:))
+                )
+                button.bezelStyle = .texturedRounded
+                button.toolTip = "Filter rules by action, type, and app scope"
+                item.view = button
+            }
         case "rulesSearch":
             if #available(macOS 11.0, *) {
                 let search = NSSearchToolbarItem(itemIdentifier: itemIdentifier)
@@ -3954,17 +3968,17 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         menu.delegate = self
         tableView.menu = menu
         tableView.columnAutoresizingStyle = .noColumnAutoresizing
-        tableView.addTableColumn(column("state", "State", 54))
-        tableView.addTableColumn(column("action", "Action", 82))
-        tableView.addTableColumn(column("kind", "Kind", 88))
-        let appColumn = column("app", "App", 150)
+        let appColumn = column("app", "App / Process", 180)
         appColumn.isHidden = false
         tableView.addTableColumn(appColumn)
+        tableView.addTableColumn(column("state", "State", 48))
+        tableView.addTableColumn(column("action", "Action", 78))
+        tableView.addTableColumn(column("kind", "Kind", 82))
         tableView.addTableColumn(column("scope", "Scope", 320))
         tableView.addTableColumn(column("detail", "Detail", 210))
         tableView.addTableColumn(column("lifetime", "Lifetime", 86))
         tableView.addTableColumn(column("approval", "Review", 76))
-        tableView.autosaveName = "dev.guard.rules.columns.v2"
+        tableView.autosaveName = "dev.guard.rules.columns.v3"
         tableView.autosaveTableColumns = true
         tableView.sortDescriptors = [
             NSSortDescriptor(key: "kind", ascending: true),
@@ -4042,15 +4056,15 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         guard tableView.numberOfColumns >= 6 else { return }
         let available = tableView.enclosingScrollView?.contentView.bounds.width ?? tableView.bounds.width
         guard available > 0 else { return }
-        let fixed: CGFloat = 54 + 82 + 88 + 150 + 86 + 76
+        let fixed: CGFloat = 180 + 48 + 78 + 82 + 86 + 76
         let remaining = max(320, available - fixed - 12)
         let scopeWidth = floor(remaining * 0.58)
         let detailWidth = floor(remaining - scopeWidth)
         let widths: [String: CGFloat] = [
-            "state": 54,
-            "action": 82,
-            "kind": 88,
-            "app": 150,
+            "app": 180,
+            "state": 48,
+            "action": 78,
+            "kind": 82,
             "scope": max(260, scopeWidth),
             "detail": max(160, detailWidth),
             "lifetime": 86,
@@ -4074,16 +4088,100 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         renderRows()
     }
 
+    @objc func showRulesFilterMenu(_ sender: NSButton) {
+        let menu = NSMenu(title: "Rule Filters")
+        addRuleFilterSection(
+            to: menu,
+            title: "Decision",
+            values: [
+                ("all", "All Decisions", "line.3.horizontal.decrease.circle"),
+                ("allow", "Allow", "checkmark.circle"),
+                ("deny", "Deny", "xmark.octagon"),
+                ("off", "Disabled", "pause.circle")
+            ],
+            selected: ruleActionFilter,
+            prefix: "action"
+        )
+        menu.addItem(.separator())
+        addRuleFilterSection(
+            to: menu,
+            title: "Rule Type",
+            values: [
+                ("all", "All Types", "square.stack.3d.up"),
+                ("network", "Network", "network"),
+                ("http", "HTTP Inspection", "arrow.left.arrow.right"),
+                ("domain", "Domain", "globe"),
+                ("filesystem", "Filesystem", "folder"),
+                ("raw-tcp", "Raw TCP", "point.3.connected.trianglepath.dotted"),
+                ("bypass", "Bypass Decisions", "figure.run")
+            ],
+            selected: ruleKindFilter,
+            prefix: "kind"
+        )
+        menu.addItem(.separator())
+        addRuleFilterSection(
+            to: menu,
+            title: "App Scope",
+            values: [
+                ("all", "All Apps and Processes", "person.2"),
+                ("app", "App or Process", "app"),
+                ("profile", "Profile-wide", "shield")
+            ],
+            selected: ruleActorFilter,
+            prefix: "actor"
+        )
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
+    }
+
+    func addRuleFilterSection(
+        to menu: NSMenu,
+        title: String,
+        values: [(String, String, String)],
+        selected: String,
+        prefix: String
+    ) {
+        let heading = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        heading.isEnabled = false
+        menu.addItem(heading)
+        for (value, label, symbol) in values {
+            let item = NSMenuItem(title: label, action: #selector(selectRuleFilter(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = "\(prefix):\(value)"
+            item.state = value == selected ? .on : .off
+            if #available(macOS 11.0, *) {
+                item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
+            }
+            menu.addItem(item)
+        }
+    }
+
+    @objc func selectRuleFilter(_ sender: NSMenuItem) {
+        guard let selection = sender.representedObject as? String,
+              let separator = selection.firstIndex(of: ":") else { return }
+        let category = String(selection[..<separator])
+        let value = String(selection[selection.index(after: separator)...])
+        switch category {
+        case "action": ruleActionFilter = value
+        case "kind": ruleKindFilter = value
+        case "actor": ruleActorFilter = value
+        default: return
+        }
+        renderRows()
+    }
+
     @objc func ruleSidebarChanged(_ sender: Any?) {
         renderRows()
     }
 
     @objc func profileChanged(_ sender: NSPopUpButton) {
         selectedProfile = sender.titleOfSelectedItem ?? selectedProfile
+        expandedActorKeys.removeAll()
+        initializedActorExpansion = false
         refresh(nil)
     }
 
     @objc func refresh(_ sender: Any?) {
+        hasRuleRenderCache = false
         parent?.loadDaemonPolicyState(profile: selectedProfile)
         rows = parent?.ruleRows ?? rows
         renderRows()
@@ -4092,25 +4190,28 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
 
     func renderRows() {
         let search = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let filter = filterControl.selectedSegment
         let selectedSection = sidebar.selectedRow >= 0 ? sidebarSections[safe: sidebar.selectedRow] ?? "All Rules" : "All Rules"
-        let rawRows = ungroupedRuleRows()
+        let rawRows = hasRuleRenderCache ? cachedUngroupedRows : ungroupedRuleRows()
         let collapsedRows = groupedRuleRows(rawRows, includeExpanded: false)
         cachedUngroupedRows = rawRows
         cachedCollapsedRows = collapsedRows
         hasRuleRenderCache = true
         let sourceRows = groupedRuleRows(rawRows, includeExpanded: true)
-        renderedRows = sourceRows.filter { row in
+        let visibleRules = sourceRows.filter { row in
             let text = [row.kind, row.action, row.actor, row.scope, row.detail, row.source, row.memberSearchText].joined(separator: " ").lowercased()
             let matchesSearch = search.isEmpty || text.contains(search)
-            let matchesFilter: Bool
-            switch filter {
-            case 1: matchesFilter = row.action == "allow"
-            case 2: matchesFilter = row.action == "deny"
-            case 3: matchesFilter = row.kind == "HTTP"
-            case 4: matchesFilter = !row.enabled
-            default: matchesFilter = true
+            let matchesAction = ruleActionFilter == "all"
+                || (ruleActionFilter == "off" ? !row.enabled : row.action == ruleActionFilter)
+            let matchesKind: Bool
+            switch ruleKindFilter {
+            case "network": matchesKind = ["HTTP", "Domain", "Raw TCP"].contains(row.kind)
+            case "bypass": matchesKind = row.field == "process.bypass"
+            case "all": matchesKind = true
+            default: matchesKind = row.kind.lowercased().replacingOccurrences(of: " ", with: "-") == ruleKindFilter
             }
+            let matchesActor = ruleActorFilter == "all"
+                || (ruleActorFilter == "app" ? !row.actor.isEmpty : row.actor.isEmpty)
+            let matchesFilter = matchesAction && matchesKind && matchesActor
             let matchesSection: Bool
             switch selectedSection {
             case "Active": matchesSection = row.enabled
@@ -4125,6 +4226,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             }
             return matchesSearch && matchesFilter && matchesSection
         }
+        renderedRows = actorGroupedRuleRows(visibleRules)
         tableView.reloadData()
         resizeRulesColumns()
         resetRulesTableScrollOrigin()
@@ -4136,8 +4238,86 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         statusLabel.stringValue = sourceRows.isEmpty
             ? "No profile rules or recent decisions are available yet."
             : rawRows.count == collapsedRows.count
-                ? "\(renderedRows.count) visible of \(sourceRows.count) rules and recent decisions."
-                : "\(renderedRows.count) visible rows · \(collapsedRows.count) groups represent \(rawRows.count) rules and decisions."
+                ? "\(visibleRules.count) visible of \(sourceRows.count) rules and recent decisions."
+                : "\(visibleRules.count) visible rules · \(collapsedRows.count) groups represent \(rawRows.count) rules and decisions."
+    }
+
+    func actorGroupedRuleRows(_ ruleRows: [MonitorRuleRow]) -> [MonitorRuleRow] {
+        var groups: [String: [MonitorRuleRow]] = [:]
+        for row in ruleRows {
+            groups[actorGroupKey(row.actor), default: []].append(row)
+        }
+        let keys = groups.keys.sorted { left, right in
+            if left == "actor:profile-wide" { return true }
+            if right == "actor:profile-wide" { return false }
+            return left.localizedCaseInsensitiveCompare(right) == .orderedAscending
+        }
+        if !initializedActorExpansion {
+            expandedActorKeys.formUnion(keys)
+            initializedActorExpansion = true
+        }
+        var output: [MonitorRuleRow] = []
+        for key in keys {
+            guard let members = groups[key], !members.isEmpty else { continue }
+            let actor = members.first?.actor ?? ""
+            let rawCount = members.reduce(0) { partial, row in
+                partial + (row.isGroupChild ? 0 : max(1, row.groupCount))
+            }
+            let actions = Set(members.map(\.action))
+            let kinds = Set(members.map(\.kind))
+            output.append(MonitorRuleRow(
+                id: key,
+                kind: kinds.count == 1 ? (kinds.first ?? "Rules") : "Rules",
+                action: actions.count == 1 ? (actions.first ?? "mixed") : "mixed",
+                scope: "\(rawCount) rule\(rawCount == 1 ? "" : "s")",
+                detail: kinds.sorted().joined(separator: " · "),
+                enabled: members.contains(where: \.enabled),
+                source: "app-group",
+                field: "",
+                value: [:] as [String: Any],
+                layer: "",
+                lifetime: "",
+                approvalState: "",
+                notes: "Rules associated with this app or process.",
+                groupCount: max(1, rawCount),
+                groupKey: key,
+                memberSearchText: members.map { "\($0.actor) \($0.scope) \($0.detail)" }.joined(separator: " "),
+                actor: actor,
+                isActorGroup: true,
+                hierarchyDepth: 0
+            ))
+            guard expandedActorKeys.contains(key) else { continue }
+            output.append(contentsOf: members.map { row in
+                MonitorRuleRow(
+                    id: row.id,
+                    kind: row.kind,
+                    action: row.action,
+                    scope: row.scope,
+                    detail: row.detail,
+                    enabled: row.enabled,
+                    source: row.source,
+                    field: row.field,
+                    value: row.value,
+                    layer: row.layer,
+                    lifetime: row.lifetime,
+                    approvalState: row.approvalState,
+                    notes: row.notes,
+                    expiresAt: row.expiresAt,
+                    groupCount: row.groupCount,
+                    groupKey: row.groupKey,
+                    memberSearchText: row.memberSearchText,
+                    isGroupChild: row.isGroupChild,
+                    actor: row.actor,
+                    hierarchyDepth: row.isGroupChild ? 2 : 1
+                )
+            })
+        }
+        return output
+    }
+
+    func actorGroupKey(_ actor: String) -> String {
+        let normalized = actor.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized.isEmpty ? "actor:profile-wide" : "actor:\(normalized)"
     }
 
     func combinedRuleRows() -> [MonitorRuleRow] {
@@ -4296,6 +4476,15 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         var expanded: [MonitorRuleRow] = []
         var seen = Set<String>()
         for row in displayRows {
+            if row.isActorGroup {
+                for member in sourceRows where actorGroupKey(member.actor) == row.groupKey {
+                    let memberKey = (member.field == "process.bypass" || member.source == "alert-decision") && !member.id.isEmpty
+                        ? member.id
+                        : "\(member.field)|\(canonicalRuleValue(member.value))"
+                    if seen.insert(memberKey).inserted { expanded.append(member) }
+                }
+                continue
+            }
             if row.isGroupChild {
                 let memberKey = (row.field == "process.bypass" || row.source == "alert-decision") && !row.id.isEmpty
                     ? row.id
@@ -4731,7 +4920,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         guard row >= 0, row < renderedRows.count else { return nil }
         let rule = renderedRows[row]
         let view = MonitorRowView()
-        view.group = rule.groupCount > 1 && !rule.isGroupChild
+        view.group = rule.isActorGroup || (rule.groupCount > 1 && !rule.isGroupChild)
         view.odd = row % 2 == 1
         return view
     }
@@ -4739,7 +4928,8 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
         guard row >= 0, row < renderedRows.count else { return 25 }
         let rule = renderedRows[row]
-        if rule.groupCount > 1 && !rule.isGroupChild { return 28 }
+        if rule.isActorGroup { return 30 }
+        if rule.groupCount > 1 && !rule.isGroupChild { return 27 }
         return rule.isGroupChild ? 23 : 25
     }
 
@@ -4750,13 +4940,13 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         let text: String
         switch id {
         case "state": text = rule.enabled ? "On" : "Off"
-        case "action": text = rule.action
-        case "kind": text = rule.kind
-        case "app": text = rule.actor.isEmpty ? "Profile-wide" : rule.actor
+        case "action": text = rule.isActorGroup ? "" : rule.action
+        case "kind": text = rule.isActorGroup ? "" : rule.kind
+        case "app": text = rule.isActorGroup ? (rule.actor.isEmpty ? "Any Process" : rule.actor) : ""
         case "scope": text = rule.scope
         case "detail": text = rule.detail
-        case "lifetime": text = rule.lifetime
-        case "approval": text = rule.approvalState
+        case "lifetime": text = rule.isActorGroup ? "" : rule.lifetime
+        case "approval": text = rule.isActorGroup ? "" : rule.approvalState
         case "source": text = rule.source
         default: text = ""
         }
@@ -4774,6 +4964,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             return cell
         }
         if id == "action" || id == "kind" || id == "lifetime" {
+            if rule.isActorGroup { return cell }
             let rowView = NSStackView()
             rowView.orientation = .horizontal
             rowView.alignment = .centerY
@@ -4803,11 +4994,29 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             return cell
         }
         if id == "app" {
+            guard rule.isActorGroup else { return cell }
             let rowView = NSStackView()
             rowView.orientation = .horizontal
             rowView.alignment = .centerY
             rowView.spacing = 5
             rowView.translatesAutoresizingMaskIntoConstraints = false
+            let expanded = expandedActorKeys.contains(rule.groupKey)
+            let disclosure = NSButton(
+                image: NSImage(
+                    systemSymbolName: expanded ? "chevron.down" : "chevron.right",
+                    accessibilityDescription: expanded ? "Hide app rules" : "Show app rules"
+                ) ?? NSImage(),
+                target: self,
+                action: #selector(toggleActorRuleGroup(_:))
+            )
+            disclosure.isBordered = false
+            disclosure.imageScaling = .scaleProportionallyDown
+            disclosure.contentTintColor = .secondaryLabelColor
+            disclosure.tag = row
+            disclosure.translatesAutoresizingMaskIntoConstraints = false
+            disclosure.widthAnchor.constraint(equalToConstant: 16).isActive = true
+            disclosure.heightAnchor.constraint(equalToConstant: 18).isActive = true
+            rowView.addArrangedSubview(disclosure)
             let icon = NSImageView()
             if #available(macOS 11.0, *) {
                 icon.image = NSImage(
@@ -4819,10 +5028,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             icon.translatesAutoresizingMaskIntoConstraints = false
             icon.widthAnchor.constraint(equalToConstant: 15).isActive = true
             let label = NSTextField(labelWithString: text)
-            label.font = NSFont.systemFont(
-                ofSize: 12,
-                weight: rule.groupCount > 1 && !rule.isGroupChild ? .semibold : .regular
-            )
+            label.font = NSFont.systemFont(ofSize: 12, weight: rule.isActorGroup ? .semibold : .regular)
             label.lineBreakMode = .byTruncatingTail
             rowView.addArrangedSubview(icon)
             rowView.addArrangedSubview(label)
@@ -4840,7 +5046,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             rowView.alignment = .centerY
             rowView.spacing = 5
             rowView.translatesAutoresizingMaskIntoConstraints = false
-            if rule.groupCount > 1 && !rule.isGroupChild {
+            if rule.groupCount > 1 && !rule.isGroupChild && !rule.isActorGroup {
                 let expanded = expandedGroupKeys.contains(rule.groupKey)
                 let disclosure = NSButton(
                     image: NSImage(
@@ -4859,7 +5065,7 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
                 disclosure.widthAnchor.constraint(equalToConstant: 16).isActive = true
                 disclosure.heightAnchor.constraint(equalToConstant: 18).isActive = true
                 rowView.addArrangedSubview(disclosure)
-            } else if rule.isGroupChild {
+            } else if rule.hierarchyDepth > 1 {
                 let indent = NSView()
                 indent.translatesAutoresizingMaskIntoConstraints = false
                 indent.widthAnchor.constraint(equalToConstant: 18).isActive = true
@@ -4868,12 +5074,12 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
             let label = NSTextField(labelWithString: text)
             label.font = NSFont.systemFont(
                 ofSize: 12,
-                weight: rule.groupCount > 1 && !rule.isGroupChild ? .semibold : .regular
+                weight: rule.groupCount > 1 && !rule.isGroupChild && !rule.isActorGroup ? .semibold : .regular
             )
             label.lineBreakMode = .byTruncatingMiddle
             if rule.isGroupChild { label.textColor = .secondaryLabelColor }
             rowView.addArrangedSubview(label)
-            if rule.groupCount > 1 && !rule.isGroupChild {
+            if rule.groupCount > 1 && !rule.isGroupChild && !rule.isActorGroup {
                 let badge = NSTextField(labelWithString: "\(rule.groupCount)")
                 badge.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
                 badge.textColor = .secondaryLabelColor
@@ -4937,6 +5143,10 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         toggleRuleGroup(at: sender.tag)
     }
 
+    @objc func toggleActorRuleGroup(_ sender: NSButton) {
+        toggleActorRuleGroup(at: sender.tag)
+    }
+
     @objc func toggleSelectedRuleGroup(_ sender: Any?) {
         toggleRuleGroup(at: tableView.clickedRow >= 0 ? tableView.clickedRow : tableView.selectedRow)
     }
@@ -4944,6 +5154,10 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
     func toggleRuleGroup(at index: Int) {
         guard index >= 0 && index < renderedRows.count else { return }
         let row = renderedRows[index]
+        if row.isActorGroup {
+            toggleActorRuleGroup(at: index)
+            return
+        }
         guard row.groupCount > 1, !row.groupKey.isEmpty else { return }
         if expandedGroupKeys.contains(row.groupKey) {
             expandedGroupKeys.remove(row.groupKey)
@@ -4952,6 +5166,22 @@ final class RulesWindowController: NSObject, NSWindowDelegate, NSTableViewDataSo
         }
         renderRows()
         if let index = renderedRows.firstIndex(where: { $0.groupKey == row.groupKey && !$0.isGroupChild }) {
+            tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+            tableView.scrollRowToVisible(index)
+        }
+    }
+
+    func toggleActorRuleGroup(at index: Int) {
+        guard index >= 0 && index < renderedRows.count else { return }
+        let row = renderedRows[index]
+        guard row.isActorGroup, !row.groupKey.isEmpty else { return }
+        if expandedActorKeys.contains(row.groupKey) {
+            expandedActorKeys.remove(row.groupKey)
+        } else {
+            expandedActorKeys.insert(row.groupKey)
+        }
+        renderRows()
+        if let index = renderedRows.firstIndex(where: { $0.isActorGroup && $0.groupKey == row.groupKey }) {
             tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
             tableView.scrollRowToVisible(index)
         }
@@ -10361,6 +10591,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         settingsWindowController?.render()
         if let rulesWindowController, rulesWindowController.selectedProfile == profile {
             rulesWindowController.rows = ruleRows
+            rulesWindowController.hasRuleRenderCache = false
             rulesWindowController.renderRows()
         }
     }
