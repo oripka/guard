@@ -25,7 +25,15 @@ func compactMiddle(_ value: String, limit: Int) -> String {
     return "\(trimmed[..<headEnd])...\(trimmed[tailStart...])"
 }
 
-func originatingApplicationIcon(named rawName: String) -> NSImage? {
+func originatingApplicationIcon(named rawName: String, processIdentifier: Int? = nil) -> NSImage? {
+    if let processIdentifier,
+       processIdentifier > 0,
+       let application = NSRunningApplication(processIdentifier: pid_t(processIdentifier)),
+       (application.bundleIdentifier != nil || application.bundleURL?.pathExtension.lowercased() == "app"),
+       let icon = application.icon {
+        return icon
+    }
+
     let name = rawName
         .components(separatedBy: " via ")
         .first?
@@ -33,9 +41,86 @@ func originatingApplicationIcon(named rawName: String) -> NSImage? {
         .replacingOccurrences(of: ".app", with: "", options: [.caseInsensitive, .anchored, .backwards])
         ?? ""
     guard !name.isEmpty else { return nil }
-    return NSWorkspace.shared.runningApplications.first(where: {
-        $0.localizedName?.caseInsensitiveCompare(name) == .orderedSame
-    })?.icon
+
+    let normalized = name.lowercased()
+    let bundleIdentifiers: [String]
+    switch normalized {
+    case "codex", "chatgpt":
+        bundleIdentifiers = ["com.openai.codex", "com.openai.chat"]
+    default:
+        bundleIdentifiers = []
+    }
+    let applicationNames = normalized == "codex" ? [name, "ChatGPT"] : [name]
+    let runningApplication = NSWorkspace.shared.runningApplications.first { application in
+        if let identifier = application.bundleIdentifier,
+           bundleIdentifiers.contains(where: { $0.caseInsensitiveCompare(identifier) == .orderedSame }) {
+            return true
+        }
+        if let localizedName = application.localizedName,
+           applicationNames.contains(where: { $0.caseInsensitiveCompare(localizedName) == .orderedSame }) {
+            return true
+        }
+        if let bundleName = application.bundleURL?.deletingPathExtension().lastPathComponent,
+           applicationNames.contains(where: { $0.caseInsensitiveCompare(bundleName) == .orderedSame }) {
+            return true
+        }
+        return false
+    }
+    if let icon = runningApplication?.icon {
+        return icon
+    }
+
+    for identifier in bundleIdentifiers {
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier) {
+            return NSWorkspace.shared.icon(forFile: url.path)
+        }
+    }
+    for applicationName in applicationNames {
+        for directory in ["/Applications", NSHomeDirectory() + "/Applications"] {
+            let path = (directory as NSString).appendingPathComponent("\(applicationName).app")
+            if FileManager.default.fileExists(atPath: path) {
+                return NSWorkspace.shared.icon(forFile: path)
+            }
+        }
+    }
+    return nil
+}
+
+func compactPromptCommand(_ command: String, limit: Int = 118) -> String {
+    let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return "Unknown command" }
+    let firstBoundary = trimmed.firstIndex(where: { $0.isWhitespace }) ?? trimmed.endIndex
+    let executable = String(trimmed[..<firstBoundary])
+    let executableName = URL(fileURLWithPath: executable).lastPathComponent
+    let arguments = String(trimmed[firstBoundary...])
+    return compactMiddle("\(executableName.isEmpty ? executable : executableName)\(arguments)", limit: limit)
+}
+
+func promptCommandSummary(_ command: String, executablePath: String) -> String {
+    let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+    let executable = executablePath.isEmpty
+        ? trimmed.components(separatedBy: .whitespacesAndNewlines).first ?? "command"
+        : executablePath
+    let runtimeName = URL(fileURLWithPath: executable).lastPathComponent
+    let lowerRuntime = runtimeName.lowercased()
+    let fileSuffixes = [".py", ".pyw", ".js", ".mjs", ".cjs", ".ts", ".tsx"]
+    let script = trimmed
+        .components(separatedBy: .whitespacesAndNewlines)
+        .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "'\"")) }
+        .last(where: { token in fileSuffixes.contains(where: { token.lowercased().hasSuffix($0) }) })
+        .map { URL(fileURLWithPath: $0).lastPathComponent }
+
+    if lowerRuntime.hasPrefix("node") {
+        if trimmed.contains("--test") {
+            return script.map { "Node test · \($0)" } ?? "Node test"
+        }
+        return script.map { "Node · \($0)" } ?? "Node"
+    }
+    if lowerRuntime.hasPrefix("python") {
+        return script.map { "Python · \($0)" } ?? "Python"
+    }
+    if let script { return script }
+    return runtimeName.isEmpty ? "command" : runtimeName
 }
 
 struct GuardAppConfig: Decodable {
@@ -1887,6 +1972,8 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
     var pathField: NSTextField?
     var detailsView: NSView?
     var detailsButton: NSButton?
+    var collapsedPanelHeight: CGFloat = 390
+    var expandedPanelHeight: CGFloat = 530
 
     init(
         titleText: String,
@@ -1923,14 +2010,18 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
     }
 
     func run() -> GuardPromptChoice {
+        let compactPrompt = scopeOptions.isEmpty && lifetimeOptions.isEmpty && methodOptions.isEmpty && editablePath == nil
+        collapsedPanelHeight = compactPrompt ? 292 : 390
+        let detailHeight = min(250, 52 + CGFloat(detailRows.count + 2) * 22)
+        expandedPanelHeight = min(620, collapsedPanelHeight + detailHeight)
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 700, height: 390),
+            contentRect: NSRect(x: 0, y: 0, width: 700, height: collapsedPanelHeight),
             styleMask: [.titled, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
-        panel.minSize = NSSize(width: 700, height: 390)
-        panel.maxSize = NSSize(width: 700, height: 530)
+        panel.minSize = NSSize(width: 700, height: collapsedPanelHeight)
+        panel.maxSize = NSSize(width: 700, height: expandedPanelHeight)
         panel.title = "Guard Connection"
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
@@ -1950,8 +2041,8 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .width
-        root.spacing = 12
-        root.edgeInsets = NSEdgeInsets(top: 34, left: 28, bottom: 18, right: 28)
+        root.spacing = 10
+        root.edgeInsets = NSEdgeInsets(top: 26, left: 28, bottom: 16, right: 28)
         root.translatesAutoresizingMaskIntoConstraints = false
         background.addSubview(root)
         NSLayoutConstraint.activate([
@@ -2026,7 +2117,10 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         detailsView.isHidden.toggle()
         sender.title = detailsView.isHidden ? "Details" : "Hide Details"
         if let panel = sender.window {
-            panel.setContentSize(NSSize(width: 700, height: detailsView.isHidden ? 390 : 530))
+            panel.setContentSize(NSSize(
+                width: 700,
+                height: detailsView.isHidden ? collapsedPanelHeight : expandedPanelHeight
+            ))
         }
     }
 
@@ -2062,8 +2156,8 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
             : NSColor.clear).cgColor
         iconWrap.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            iconWrap.widthAnchor.constraint(equalToConstant: 38),
-            iconWrap.heightAnchor.constraint(equalToConstant: 38)
+            iconWrap.widthAnchor.constraint(equalToConstant: 44),
+            iconWrap.heightAnchor.constraint(equalToConstant: 44)
         ])
 
         let icon = NSImageView()
@@ -2081,11 +2175,11 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         NSLayoutConstraint.activate([
             icon.centerXAnchor.constraint(equalTo: iconWrap.centerXAnchor),
             icon.centerYAnchor.constraint(equalTo: iconWrap.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 21),
-            icon.heightAnchor.constraint(equalToConstant: 21)
+            icon.widthAnchor.constraint(equalToConstant: headerIcon == nil ? 23 : 40),
+            icon.heightAnchor.constraint(equalToConstant: headerIcon == nil ? 23 : 40)
         ])
 
-        let title = promptLabel(titleText, size: 18, weight: .bold)
+        let title = promptLabel(titleText, size: 17, weight: .semibold)
         let subtitle = promptLabel(context, size: 11.5, weight: .regular, color: .secondaryLabelColor)
         subtitle.maximumNumberOfLines = 2
 
@@ -2112,12 +2206,15 @@ final class GuardConnectionPromptController: NSObject, NSWindowDelegate {
         row.spacing = 7
 
         let keyLabel = promptLabel(key, size: 11, weight: .medium, color: .tertiaryLabelColor)
-        keyLabel.alignment = .left
+        keyLabel.alignment = .right
+        keyLabel.translatesAutoresizingMaskIntoConstraints = false
+        keyLabel.widthAnchor.constraint(equalToConstant: 58).isActive = true
         keyLabel.setContentHuggingPriority(.required, for: .horizontal)
 
-        let valueLabel = promptLabel(value.isEmpty ? "Unknown" : value, size: 13, weight: .semibold)
+        let valueWeight: NSFont.Weight = key == "Actor" ? .semibold : .medium
+        let valueLabel = promptLabel(value.isEmpty ? "Unknown" : value, size: 12.5, weight: valueWeight)
         valueLabel.lineBreakMode = .byWordWrapping
-        valueLabel.maximumNumberOfLines = 3
+        valueLabel.maximumNumberOfLines = key == headerTargetLabel ? 2 : 1
         valueLabel.translatesAutoresizingMaskIntoConstraints = false
         valueLabel.widthAnchor.constraint(lessThanOrEqualToConstant: promptHeaderValueWidth).isActive = true
         valueLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -10813,6 +10910,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         let port = Int("\(alert["port"] ?? 0)") ?? 0
         let profile = alert["profile"] as? String ?? selectedProfileName
         let command = alert["command"] as? String ?? "Guard run"
+        let launcherPid = Int("\(alert["launcherPid"] ?? 0)") ?? 0
         let projectDir = alert["projectDir"] as? String ?? ""
         let runDir = alert["runDir"] as? String ?? ""
         let operationKind = alert["operationKind"] as? String ?? ""
@@ -10833,14 +10931,11 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             let originatingApp = launcherApp.isEmpty
                 ? (launcherProcess.isEmpty ? commandDisplay(command) : launcherProcess)
                 : launcherApp
-            let launchedCommand = compactMiddle(
-                childCommand.isEmpty ? (childPath.isEmpty ? "this command" : URL(fileURLWithPath: childPath).lastPathComponent) : childCommand,
-                limit: 48
-            )
+            let launchedCommand = promptCommandSummary(childCommand, executablePath: childPath)
             controller = GuardConnectionPromptController(
                 titleText: "\(originatingApp) wants to launch \(launchedCommand)",
                 actor: originatingApp,
-                destination: childCommand,
+                destination: compactPromptCommand(childCommand),
                 context: "This command would run outside Guard filesystem and network protection.",
                 scopeRows: [
                     ("Security State", "Guard protection bypassed")
@@ -10861,7 +10956,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 ],
                 scopeOptions: [],
                 lifetimeOptions: [],
-                headerIcon: originatingApplicationIcon(named: originatingApp),
+                headerIcon: originatingApplicationIcon(named: originatingApp, processIdentifier: launcherPid),
                 headerTargetLabel: "Command"
             )
         } else if isHTTP {
