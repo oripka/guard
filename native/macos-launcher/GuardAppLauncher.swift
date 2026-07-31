@@ -411,6 +411,128 @@ protocol GuardMenuHighlighting: AnyObject {
     func setHighlighted(_ highlighted: Bool)
 }
 
+private enum GuardMarkState {
+    case monitoring
+    case starting
+    case review
+    case degraded
+}
+
+private func guardMarkImage(
+    size: NSSize,
+    state: GuardMarkState,
+    isTemplate: Bool,
+    foregroundColor: NSColor = .black
+) -> NSImage {
+    let image = NSImage(size: size, flipped: false) { rect in
+        let scale = min(rect.width / 20, rect.height / 20)
+        let centerX = rect.midX
+        let top = rect.maxY - (1.4 * scale)
+        let bottom = rect.minY + (1.2 * scale)
+        let left = centerX - (7.1 * scale)
+        let right = centerX + (7.1 * scale)
+
+        let shield = NSBezierPath()
+        shield.move(to: NSPoint(x: centerX, y: top))
+        shield.line(to: NSPoint(x: right, y: top - (3.0 * scale)))
+        shield.line(to: NSPoint(x: right, y: rect.midY + (0.8 * scale)))
+        shield.curve(
+            to: NSPoint(x: centerX, y: bottom),
+            controlPoint1: NSPoint(x: right, y: bottom + (5.0 * scale)),
+            controlPoint2: NSPoint(x: centerX + (3.0 * scale), y: bottom + (1.1 * scale))
+        )
+        shield.curve(
+            to: NSPoint(x: left, y: rect.midY + (0.8 * scale)),
+            controlPoint1: NSPoint(x: centerX - (3.0 * scale), y: bottom + (1.1 * scale)),
+            controlPoint2: NSPoint(x: left, y: bottom + (5.0 * scale))
+        )
+        shield.line(to: NSPoint(x: left, y: top - (3.0 * scale)))
+        shield.close()
+        shield.lineJoinStyle = .round
+        shield.lineCapStyle = .round
+        shield.lineWidth = 1.75 * scale
+
+        foregroundColor.setStroke()
+        shield.stroke()
+
+        let signal = NSBezierPath()
+        signal.move(to: NSPoint(x: left + (2.4 * scale), y: rect.midY + (0.1 * scale)))
+        signal.line(to: NSPoint(x: centerX - (3.1 * scale), y: rect.midY + (0.1 * scale)))
+        signal.line(to: NSPoint(x: centerX - (1.6 * scale), y: rect.midY + (2.6 * scale)))
+        signal.line(to: NSPoint(x: centerX + (0.4 * scale), y: rect.midY - (2.7 * scale)))
+        signal.line(to: NSPoint(x: centerX + (2.0 * scale), y: rect.midY + (0.1 * scale)))
+        signal.line(to: NSPoint(x: right - (2.4 * scale), y: rect.midY + (0.1 * scale)))
+        signal.lineCapStyle = .round
+        signal.lineJoinStyle = .round
+        signal.lineWidth = 1.45 * scale
+        signal.stroke()
+
+        switch state {
+        case .monitoring:
+            break
+        case .starting:
+            for offset in [-2.2, 0, 2.2] {
+                let dot = NSBezierPath(ovalIn: NSRect(
+                    x: centerX + (CGFloat(offset) * scale) - (0.55 * scale),
+                    y: bottom + (0.2 * scale),
+                    width: 1.1 * scale,
+                    height: 1.1 * scale
+                ))
+                foregroundColor.setFill()
+                dot.fill()
+            }
+        case .review:
+            let badge = NSBezierPath(ovalIn: NSRect(
+                x: right - (2.0 * scale),
+                y: top - (1.6 * scale),
+                width: 3.1 * scale,
+                height: 3.1 * scale
+            ))
+            foregroundColor.setFill()
+            badge.fill()
+        case .degraded:
+            let slash = NSBezierPath()
+            slash.move(to: NSPoint(x: left + (2.4 * scale), y: bottom + (2.9 * scale)))
+            slash.line(to: NSPoint(x: right - (2.0 * scale), y: top - (2.3 * scale)))
+            slash.lineWidth = 1.7 * scale
+            slash.lineCapStyle = .round
+            slash.stroke()
+        }
+        return true
+    }
+    image.isTemplate = isTemplate
+    image.accessibilityDescription = "Guard security monitor"
+    return image
+}
+
+private func guardApplicationIconImage() -> NSImage {
+    let size = NSSize(width: 512, height: 512)
+    let image = NSImage(size: size, flipped: false) { rect in
+        let tile = rect.insetBy(dx: 28, dy: 28)
+        let background = NSBezierPath(roundedRect: tile, xRadius: 108, yRadius: 108)
+        let gradient = NSGradient(colors: [
+            NSColor(calibratedRed: 0.05, green: 0.55, blue: 1.0, alpha: 1),
+            NSColor(calibratedRed: 0.16, green: 0.20, blue: 0.78, alpha: 1)
+        ])
+        gradient?.draw(in: background, angle: -62)
+
+        NSColor.white.withAlphaComponent(0.16).setStroke()
+        background.lineWidth = 3
+        background.stroke()
+
+        let mark = guardMarkImage(
+            size: NSSize(width: 270, height: 270),
+            state: .monitoring,
+            isTemplate: false,
+            foregroundColor: .white
+        )
+        mark.draw(in: NSRect(x: 121, y: 121, width: 270, height: 270))
+        return true
+    }
+    image.accessibilityDescription = "Guard"
+    return image
+}
+
 final class GuardStatusItemController: NSObject, NSMenuDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     let popover = NSPopover()
@@ -429,6 +551,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
     let recentStack = NSStackView()
     let deniedBadgeLabel = NSTextField(labelWithString: "0")
     let deniedRow = NSButton()
+    let popoverMarkImageView = NSImageView()
     let popoverContentWidth: CGFloat = 288
     let menuContentInset: CGFloat = 16
     var lastNotifiedPendingCount = 0
@@ -442,14 +565,14 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         super.init()
         if let button = statusItem.button {
             if #available(macOS 11.0, *) {
-                button.image = statusImage(named: "shield", description: "Guard Monitor")
+                button.image = guardMarkImage(size: NSSize(width: 19, height: 19), state: .starting, isTemplate: true)
                 button.title = ""
             } else {
                 button.title = "G"
             }
             button.imagePosition = .imageOnly
             button.imageScaling = .scaleProportionallyDown
-            button.contentTintColor = .white
+            button.contentTintColor = nil
             button.toolTip = "Guard Monitor"
             button.target = self
             button.action = #selector(togglePopover(_:))
@@ -480,35 +603,6 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         for menuItem in menu.items {
             (menuItem.view as? GuardMenuHighlighting)?.setHighlighted(menuItem == item && menuItem.isEnabled)
         }
-    }
-
-    @available(macOS 11.0, *)
-    func statusImage(named symbolName: String, description: String) -> NSImage? {
-        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { rect in
-            let path = NSBezierPath()
-            path.move(to: NSPoint(x: rect.midX, y: rect.maxY - 1.2))
-            path.line(to: NSPoint(x: rect.maxX - 3.2, y: rect.maxY - 3.7))
-            path.line(to: NSPoint(x: rect.maxX - 3.2, y: rect.midY + 0.7))
-            path.curve(
-                to: NSPoint(x: rect.midX, y: rect.minY + 1.1),
-                controlPoint1: NSPoint(x: rect.maxX - 3.2, y: rect.minY + 4.7),
-                controlPoint2: NSPoint(x: rect.midX + 2.2, y: rect.minY + 1.7)
-            )
-            path.curve(
-                to: NSPoint(x: rect.minX + 3.2, y: rect.midY + 0.7),
-                controlPoint1: NSPoint(x: rect.midX - 2.2, y: rect.minY + 1.7),
-                controlPoint2: NSPoint(x: rect.minX + 3.2, y: rect.minY + 4.7)
-            )
-            path.line(to: NSPoint(x: rect.minX + 3.2, y: rect.maxY - 3.7))
-            path.close()
-            path.lineWidth = 1.8
-            path.lineJoinStyle = .round
-            NSColor.white.setStroke()
-            path.stroke()
-            return true
-        }
-        image.isTemplate = false
-        return image
     }
 
     func makePopoverView() -> NSView {
@@ -561,9 +655,9 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         root.setCustomSpacing(6, after: deniedRow)
         root.addArrangedSubview(bottomRule)
         root.setCustomSpacing(7, after: bottomRule)
-        root.addArrangedSubview(menuAction("Open Monitor", symbol: "rectangle.3.group", action: #selector(openMonitor(_:))))
-        root.addArrangedSubview(menuAction("Manage Rules...", symbol: "list.bullet.rectangle", action: #selector(openRules(_:))))
-        root.addArrangedSubview(menuAction("Guard Settings...", symbol: "gearshape", action: #selector(openSettings(_:))))
+        root.addArrangedSubview(menuAction("Open Monitor", symbol: "waveform.path.ecg.rectangle", action: #selector(openMonitor(_:))))
+        root.addArrangedSubview(menuAction("Manage Rules...", symbol: "checklist", action: #selector(openRules(_:))))
+        root.addArrangedSubview(menuAction("Guard Settings...", symbol: "gearshape.2", action: #selector(openSettings(_:))))
         return background
     }
 
@@ -708,7 +802,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         row.alignment = .centerY
         row.spacing = 7
 
-        row.addArrangedSubview(symbolCircle("shield.lefthalf.filled", tint: .controlAccentColor, fallback: "G"))
+        row.addArrangedSubview(guardMarkCircle())
         let labelStack = NSStackView()
         labelStack.orientation = .vertical
         labelStack.spacing = -1
@@ -733,8 +827,8 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         health.orientation = .horizontal
         health.alignment = .centerY
         health.spacing = 8
-        health.addArrangedSubview(statusLine(daemonBadgeLabel, symbol: "bolt.horizontal.circle.fill"))
-        health.addArrangedSubview(statusLine(extensionBadgeLabel, symbol: "shield.lefthalf.filled"))
+        health.addArrangedSubview(statusLine(daemonBadgeLabel, symbol: "bolt.horizontal.fill"))
+        health.addArrangedSubview(statusLine(extensionBadgeLabel, symbol: "network.badge.shield.half.filled"))
         health.addArrangedSubview(NSView())
         card.addArrangedSubview(health)
         return card
@@ -989,21 +1083,30 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         return button
     }
 
-    func symbolCircle(_ symbol: String, tint: NSColor, fallback: String) -> NSView {
+    func guardMarkCircle() -> NSView {
         let holder = NSView()
         holder.wantsLayer = true
         holder.layer?.cornerRadius = 15
         holder.layer?.cornerCurve = .continuous
-        holder.layer?.backgroundColor = tint.cgColor
+        holder.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
         holder.translatesAutoresizingMaskIntoConstraints = false
         holder.widthAnchor.constraint(equalToConstant: 30).isActive = true
         holder.heightAnchor.constraint(equalToConstant: 30).isActive = true
-        let image = symbolImage(symbol, tint: .white, size: 15, weight: .regular)
-        image.translatesAutoresizingMaskIntoConstraints = false
-        holder.addSubview(image)
+
+        popoverMarkImageView.image = guardMarkImage(
+            size: NSSize(width: 18, height: 18),
+            state: .starting,
+            isTemplate: true
+        )
+        popoverMarkImageView.contentTintColor = .white
+        popoverMarkImageView.imageScaling = .scaleProportionallyDown
+        popoverMarkImageView.translatesAutoresizingMaskIntoConstraints = false
+        holder.addSubview(popoverMarkImageView)
         NSLayoutConstraint.activate([
-            image.centerXAnchor.constraint(equalTo: holder.centerXAnchor),
-            image.centerYAnchor.constraint(equalTo: holder.centerYAnchor)
+            popoverMarkImageView.centerXAnchor.constraint(equalTo: holder.centerXAnchor),
+            popoverMarkImageView.centerYAnchor.constraint(equalTo: holder.centerYAnchor),
+            popoverMarkImageView.widthAnchor.constraint(equalToConstant: 18),
+            popoverMarkImageView.heightAnchor.constraint(equalToConstant: 18)
         ])
         return holder
     }
@@ -1065,13 +1168,45 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
             }
             resizePopover(recentRowCount: recentViews.count, hasTraffic: hasTraffic)
         }
-        statusItem.button?.contentTintColor = .white
+        let markState = guardMarkState(
+            pending: pending,
+            denied: denied,
+            daemonStatus: daemonBadgeLabel.stringValue
+        )
+        let markImage = guardMarkImage(size: NSSize(width: 19, height: 19), state: markState, isTemplate: true)
+        statusItem.button?.image = markImage
+        statusItem.button?.contentTintColor = nil
+        statusItem.button?.toolTip = guardMarkTooltip(for: markState)
+        popoverMarkImageView.image = guardMarkImage(
+            size: NSSize(width: 18, height: 18),
+            state: markState,
+            isTemplate: true
+        )
         if notify {
             if pending > 0 && pending != lastNotifiedPendingCount {
                 notifyPendingAlerts(count: pending)
             }
             lastNotifiedPendingCount = pending
             notifyNewSandboxDenials(from: monitor.events)
+        }
+    }
+
+    fileprivate func guardMarkState(pending: Int, denied: Int, daemonStatus: String) -> GuardMarkState {
+        if pending > 0 || denied > 0 { return .review }
+        let normalized = daemonStatus.lowercased()
+        if normalized.contains("starting") || normalized.contains("connecting") { return .starting }
+        if normalized.contains("offline") || normalized.contains("stopped") || normalized.contains("unavailable") {
+            return .degraded
+        }
+        return .monitoring
+    }
+
+    fileprivate func guardMarkTooltip(for state: GuardMarkState) -> String {
+        switch state {
+        case .monitoring: return "Guard is monitoring"
+        case .starting: return "Guard is starting"
+        case .review: return "Guard has activity to review"
+        case .degraded: return "Guard monitoring is degraded"
         }
     }
 
@@ -13595,7 +13730,7 @@ if let iconURL = Bundle.main.url(forResource: "GuardAppIcon", withExtension: "ic
    let bundledIcon = NSImage(contentsOf: iconURL) {
     app.applicationIconImage = bundledIcon
 } else if #available(macOS 11.0, *) {
-    app.applicationIconImage = NSImage(systemSymbolName: "network.badge.shield.half.filled", accessibilityDescription: "Guard")
+    app.applicationIconImage = guardApplicationIconImage()
 }
 
 do {
