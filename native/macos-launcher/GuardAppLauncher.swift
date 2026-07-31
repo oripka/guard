@@ -10487,6 +10487,10 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         let executable = URL(fileURLWithPath: process.executable).lastPathComponent
         let lower = executable.lowercased()
         let tokens = process.command.split(whereSeparator: \.isWhitespace).map(String.init)
+        if ["bash", "sh", "zsh"].contains(lower),
+           tokens.contains(where: { URL(fileURLWithPath: $0).lastPathComponent == "celery" }) {
+            return "worker supervisor"
+        }
         if lower == "celery",
            let queues = tokens.first(where: { $0.hasPrefix("--queues=") })?.components(separatedBy: "=").last,
            !queues.isEmpty {
@@ -10530,6 +10534,17 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         return context.isEmpty ? process.user : compactMiddle(context, limit: 68)
     }
 
+    func dockerProcessRelationship(_ process: GuardDockerProcess, in container: GuardDockerContainer) -> String {
+        guard let parent = container.processes.first(where: { $0.pid == process.parentPid }) else {
+            return "Container entry command"
+        }
+        let parentName = meaningfulDockerProcessLabel(parent)
+        if parent.executable == process.executable {
+            return "Worker of \(parentName)"
+        }
+        return "Started by \(parentName)"
+    }
+
     func dockerActivityRows() -> [MonitorActivityRow] {
         guard monitorFilterControl.selectedSegment == 0 else { return [] }
         let query = monitorSearchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -10565,8 +10580,8 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                     rowKey: "\(key)/process:\(process.pid):\(index)",
                     app: meaningfulDockerProcessLabel(process),
                     destination: dockerProcessContext(process),
-                    activity: "PID \(process.pid) · parent \(process.parentPid) · \(process.user)",
-                    decision: "container",
+                    activity: dockerProcessRelationship(process, in: container),
+                    decision: "running",
                     time: "",
                     performance: showsPerformanceMetrics
                         ? String(format: "CPU %.1f%% · %@", process.cpuPercent, formattedByteCount(process.residentBytes))
@@ -12241,6 +12256,14 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 .replacingOccurrences(of: "docker:", with: "")
                 .components(separatedBy: "/").first ?? ""
             let container = dockerContainers.first { $0.id == containerId }
+            let processPid = activityRow.rowKey
+                .components(separatedBy: "/process:")
+                .dropFirst()
+                .first?
+                .components(separatedBy: ":")
+                .first
+                .flatMap(Int.init)
+            let dockerProcess = container?.processes.first { $0.pid == processPid }
             inspectorHelpLabel.stringValue = activityRow.kind == "docker-container" ? "Docker Container" : "Container Process"
             inspectorTitleLabel.stringValue = activityRow.app
             inspectorSummaryStack.isHidden = true
@@ -12249,10 +12272,16 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 container.map { "Container: \($0.name)" },
                 container.map { "Image: \($0.image)" },
                 container.map { "State: \($0.status)" },
-                activityRow.kind == "docker-process" ? "Identity: \(activityRow.activity)" : nil,
+                dockerProcess.map { "Relationship: \(dockerProcessRelationship($0, in: container!))" },
+                dockerProcess.map { "Command: \($0.command)" },
+                dockerProcess.map { "PID: \($0.pid)" },
+                dockerProcess.map { "Parent PID: \($0.parentPid)" },
+                dockerProcess.map { "User: \($0.user)" },
+                dockerProcess.map { String(format: "Process CPU: %.1f%%", $0.cpuPercent) },
+                dockerProcess.map { "Process Memory: \(formattedByteCount($0.residentBytes))" },
                 container?.ports.isEmpty == false ? "Ports: \(container?.ports ?? "")" : nil,
-                container?.cpuPercent.isEmpty == false ? "CPU: \(container?.cpuPercent ?? "")" : nil,
-                container?.memoryUsage.isEmpty == false ? "Memory: \(container?.memoryUsage ?? "")" : nil,
+                container?.cpuPercent.isEmpty == false ? "Container CPU: \(container?.cpuPercent ?? "")" : nil,
+                container?.memoryUsage.isEmpty == false ? "Container Memory: \(container?.memoryUsage ?? "")" : nil,
                 container?.blockIO.isEmpty == false ? "Disk I/O: \(container?.blockIO ?? "")" : nil,
                 container?.networkIO.isEmpty == false ? "Network I/O: \(container?.networkIO ?? "")" : nil
             ].compactMap { $0 }.joined(separator: "\n")
