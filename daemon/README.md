@@ -50,6 +50,9 @@ Read-only HTTP API:
 - `GET /auth/token` returns runtime token status: whether authentication is
   configured, a short SHA-256 fingerprint, length, rotation metadata, and a
   macOS Keychain descriptor. It never returns the token secret.
+- `GET /accounts` and `GET /accounts/:id` return normalized configured account
+  snapshots. `GET /accounts/:id/login-preview` returns redacted argv and
+  environment key names, never values.
 - `GET /tls/ca` returns TLS CA lifecycle metadata: intended local state paths,
   whether files already exist, current lifecycle state, and explicit
   `installedGlobally: false` / `globalTrustManaged: false` status. It also
@@ -117,6 +120,9 @@ Read-only HTTP API:
 
 Authenticated write API:
 
+- `POST /accounts/refresh` and `POST /accounts/:id/refresh` run configured
+  manual account checks. Passive background checks never run monitors marked
+  with `status.cadence: "manual"`.
 - `POST /policy/evaluate` evaluates the effective profile through the shared
   Guard policy evaluator. Body:
   `{"profile":"guard","host":"api.example.com","method":"POST","path":"/v1"}`.

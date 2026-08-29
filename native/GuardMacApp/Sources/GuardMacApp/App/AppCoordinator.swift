@@ -2,6 +2,7 @@ import AppKit
 
 final class AppCoordinator {
     private let monitorWindowController = MonitorWindowController()
+    private lazy var accountsWindowController = AccountsWindowController()
     private lazy var statusItemController = StatusItemController(coordinator: self)
 
     func startMenuBarOnly() {
@@ -20,5 +21,11 @@ final class AppCoordinator {
 
     func showSettings() {
         monitorWindowController.showSettings()
+    }
+
+    func showAccounts() {
+        accountsWindowController.showWindow(nil)
+        accountsWindowController.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 }

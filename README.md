@@ -40,6 +40,23 @@ guard run webex
 `guard --deep-egress --ask-network` are daemon-free per-run flows. They do not
 require `guardd`, Guard.app, a launch agent, or a Network Extension.
 
+## Account Sessions
+
+Daemon/UI mode can monitor machine-local developer account sessions from
+`~/.config/guard/config.json` without adding provider behavior to Guard core:
+
+```sh
+guard account setup
+guard account list
+guard account refresh
+guard account login codex-mac
+```
+
+The native Accounts window shows sign-in state, locally observed last use,
+expiry when exposed, and a supervised Login Again action. Provider-contacting
+checks are manual by default. Ordinary guarded runs remain independent of this
+feature. See [Account session monitoring](docs/account-monitoring.md).
+
 ## Project Config
 
 Guard reads `.guard/guard.json` from the current project. Profile files are
@@ -100,6 +117,7 @@ guard profile doctor
 - [Experimental native macOS app profiles](docs/native-apps.md)
 - [guardd daemon](docs/guardd.md)
 - [Guard UI](docs/ui.md)
+- [Account session monitoring](docs/account-monitoring.md)
 - [TLS inspection scaffold](docs/tls-inspection-policy-scaffold.md)
 - [Network Extension roadmap](docs/network-extension-roadmap.md)
 
@@ -123,7 +141,7 @@ The installer places Guard under `~/.local/guard`, links `guard` and bundled
 specific release or replace an existing release:
 
 ```sh
-GUARD_VERSION=v0.1.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/oripka/guard/main/install.sh)"
+GUARD_VERSION=v0.2.0 sh -c "$(curl -fsSL https://raw.githubusercontent.com/oripka/guard/main/install.sh)"
 GUARD_FORCE=1 sh -c "$(curl -fsSL https://raw.githubusercontent.com/oripka/guard/main/install.sh)"
 ```
 

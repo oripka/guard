@@ -1,6 +1,6 @@
 {
   "name": "guard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Early-alpha local macOS developer sandbox launcher with fail-closed shims for risky toolchains.",
   "license": "Apache-2.0",
   "type": "module",
@@ -15,6 +15,9 @@
     "daemon",
     "docs",
     "lib",
+    "native/GuardMacApp/Sources/GuardMacApp/Controllers/AccountsWindowController.swift",
+    "native/GuardMacApp/Sources/GuardMacApp/ViewModels/AccountMonitorViewModel.swift",
+    "native/GuardMacApp/Sources/GuardMacApp/Views/AccountsView.swift",
     "native/macos-launcher/GuardAppLauncher.swift",
     "native/macos-launcher/README.md",
     "native/network-extension",

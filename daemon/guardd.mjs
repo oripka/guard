@@ -31,6 +31,7 @@ import {
   validatePolicyProposal,
   validateSecurityFinding,
 } from '../lib/guard-security-telemetry.mjs'
+import { AccountMonitorStore } from '../lib/guard-account-monitor.mjs'
 
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 8765
@@ -157,6 +158,9 @@ Endpoints:
   GET /events/index
   GET /events/integrity
   GET /projects
+  GET /accounts
+  GET /accounts/:id
+  GET /accounts/:id/login-preview
   GET /alerts?limit=N
   GET /alerts/pending?limit=N
   GET /auth/token
@@ -180,6 +184,8 @@ Endpoints:
   POST /auth/token/rotate
   POST /auth/token/persist
   POST /projects
+  POST /accounts/refresh
+  POST /accounts/:id/refresh
   POST /profiles/:name/rules
   POST /profiles/:name/tls
   POST /events/truncate
@@ -3260,7 +3266,30 @@ const createServer = ({ tail, policyStore, projectRegistry, startedAt, apiToken,
   const authState = createAuthState(apiToken)
   const pendingAlerts = new PendingAlertQueue({ eventLogPath, tail, stateDir })
   const projects = projectRegistry || new ProjectRegistry({ stateDir, policyRoot: policyStore.policyRoot })
-  return http.createServer(async (request, response) => {
+  const accounts = new AccountMonitorStore({
+    stateDir,
+    eventLogPath,
+    getEvents: () => tail.events,
+    onEvent: (event) => tail.push(event),
+  })
+  const schedulePassiveAccounts = () => {
+    let running = false
+    let lastRefreshMs = 0
+    const tick = async () => {
+      const loaded = accounts.config()
+      if (!loaded.config?.enabled || loaded.config.monitors.length === 0 || running) return
+      const now = Date.now()
+      if (lastRefreshMs && now - lastRefreshMs < loaded.config.passiveIntervalSeconds * 1000) return
+      running = true
+      lastRefreshMs = now
+      try { await accounts.refresh({ mode: 'passive' }) } catch {}
+      finally { running = false }
+    }
+    tick()
+    return setInterval(tick, 10_000)
+  }
+  const accountTimer = schedulePassiveAccounts()
+  const server = http.createServer(async (request, response) => {
     const url = new URL(request.url || '/', 'http://guardd.local')
 
     if (!isAuthorized(request, authState)) {
@@ -3281,6 +3310,28 @@ const createServer = ({ tail, policyStore, projectRegistry, startedAt, apiToken,
     }
 
     if (request.method === 'POST') {
+      if (url.pathname === '/accounts/refresh') {
+        try {
+          const body = await readRequestJson(request)
+          const refreshed = await accounts.refresh({ id: body.id || '', mode: 'manual' })
+          writeJson(response, 200, { schemaVersion: 1, accounts: refreshed })
+        } catch (error) {
+          writeJson(response, /not found/.test(error.message) ? 404 : 400, { error: 'account_refresh_failed', message: error.message })
+        }
+        return
+      }
+
+      const accountRefreshMatch = url.pathname.match(/^\/accounts\/([^/]+)\/refresh$/)
+      if (accountRefreshMatch) {
+        try {
+          const refreshed = await accounts.refresh({ id: decodeURIComponent(accountRefreshMatch[1]), mode: 'manual' })
+          writeJson(response, 200, { schemaVersion: 1, account: refreshed[0] })
+        } catch (error) {
+          writeJson(response, /not found/.test(error.message) ? 404 : 400, { error: 'account_refresh_failed', message: error.message })
+        }
+        return
+      }
+
       if (url.pathname === '/security/findings/validate') {
         try {
           const body = await readRequestJson(request)
@@ -3878,6 +3929,30 @@ const createServer = ({ tail, policyStore, projectRegistry, startedAt, apiToken,
       return
     }
 
+    if (url.pathname === '/accounts') {
+      writeJson(response, 200, { schemaVersion: 1, ...accounts.list() })
+      return
+    }
+
+    const accountLoginPreviewMatch = url.pathname.match(/^\/accounts\/([^/]+)\/login-preview$/)
+    if (accountLoginPreviewMatch) {
+      try {
+        writeJson(response, 200, { schemaVersion: 1, preview: accounts.preview(decodeURIComponent(accountLoginPreviewMatch[1])) })
+      } catch (error) {
+        writeJson(response, /not found/.test(error.message) ? 404 : 400, { error: 'account_login_preview_failed', message: error.message })
+      }
+      return
+    }
+
+    const accountMatch = url.pathname.match(/^\/accounts\/([^/]+)$/)
+    if (accountMatch) {
+      const id = decodeURIComponent(accountMatch[1])
+      const account = accounts.list().accounts.find((entry) => entry.id === id)
+      if (!account) writeJson(response, 404, { error: 'account_not_found', id })
+      else writeJson(response, 200, { schemaVersion: 1, account })
+      return
+    }
+
     if (url.pathname === '/auth/token') {
       writeJson(response, 200, authTokenMetadata(authState))
       return
@@ -4136,6 +4211,10 @@ const createServer = ({ tail, policyStore, projectRegistry, startedAt, apiToken,
 
     writeJson(response, 404, { error: 'not_found' })
   })
+  server.on('close', () => {
+    if (accountTimer) clearInterval(accountTimer)
+  })
+  return server
 }
 
 const main = () => {

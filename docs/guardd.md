@@ -123,6 +123,9 @@ Read-only endpoints include:
 - `GET /templates`
 - `GET /tls/status`
 - `GET /security/status`
+- `GET /accounts`
+- `GET /accounts/:id`
+- `GET /accounts/:id/login-preview`
 
 Authenticated write endpoints include:
 
@@ -137,6 +140,8 @@ Authenticated write endpoints include:
 - `POST /events/truncate`
 - `POST /auth/token/rotate`
 - `POST /auth/token/persist`
+- `POST /accounts/refresh`
+- `POST /accounts/:id/refresh`
 
 See [daemon/README.md](../daemon/README.md) for the detailed endpoint list.
 

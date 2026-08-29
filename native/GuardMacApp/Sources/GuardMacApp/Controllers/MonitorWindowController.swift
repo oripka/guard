@@ -15,6 +15,7 @@ final class MonitorWindowController: NSWindowController, NSTableViewDataSource, 
     private var refreshTimer: Timer?
     private lazy var rulesWindowController = RulesWindowController()
     private lazy var settingsWindowController = GuardSettingsWindowController()
+    private lazy var accountsWindowController = AccountsWindowController()
 
     init() {
         let window = NSWindow(
@@ -56,6 +57,12 @@ final class MonitorWindowController: NSWindowController, NSTableViewDataSource, 
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    func showAccounts() {
+        accountsWindowController.showWindow(nil)
+        accountsWindowController.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     private func buildContent() {
         guard let window else { return }
         let root = NSVisualEffectView()
@@ -79,7 +86,11 @@ final class MonitorWindowController: NSWindowController, NSTableViewDataSource, 
         settingsButton.bezelStyle = .rounded
         settingsButton.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
 
-        let buttonStack = NSStackView(views: [refreshButton, rulesButton, settingsButton])
+        let accountsButton = NSButton(title: "Accounts", target: self, action: #selector(openAccounts))
+        accountsButton.bezelStyle = .rounded
+        accountsButton.image = NSImage(systemSymbolName: "person.crop.circle.badge.checkmark", accessibilityDescription: nil)
+
+        let buttonStack = NSStackView(views: [refreshButton, accountsButton, rulesButton, settingsButton])
         buttonStack.orientation = .horizontal
         buttonStack.spacing = 8
         let spacer = NSView()
@@ -141,6 +152,10 @@ final class MonitorWindowController: NSWindowController, NSTableViewDataSource, 
 
     @objc private func openSettings() {
         showSettings()
+    }
+
+    @objc private func openAccounts() {
+        showAccounts()
     }
 
     @objc private func copySelectedDetail() {

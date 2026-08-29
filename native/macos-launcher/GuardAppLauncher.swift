@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Darwin
 import Foundation
 import UserNotifications
@@ -641,9 +642,13 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
     let trafficNowLabel = NSTextField(labelWithString: "now")
     let trafficTimeline = NSStackView()
     let recentStack = NSStackView()
+    let accountsStack = NSStackView()
+    let accountsSummaryLabel = NSTextField(labelWithString: "Loading accounts…")
+    let accountsChevron = NSImageView()
     let deniedBadgeLabel = NSTextField(labelWithString: "0")
     let deniedRow = NSButton()
     let popoverMarkImageView = NSImageView()
+    var popoverRootStack: NSStackView?
     let popoverContentWidth: CGFloat = 288
     let menuContentInset: CGFloat = 16
     var lastNotifiedPendingCount = 0
@@ -651,10 +656,34 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
     var didPrimeSandboxDenials = false
     var cachedRecentRowCount = 0
     var cachedHasTraffic = false
+    var accountsExpanded = false
+    var cachedAccountRowCount = 0
+    var accountModel: AccountMonitorViewModel?
+    var accountObservation: AnyCancellable?
+    var accountRefreshObservation: AnyCancellable?
+    var lastAccountCacheLoadAt = Date.distantPast
 
     init(monitor: MonitorWindowController) {
         self.monitor = monitor
         super.init()
+        let model = AccountMonitorViewModel(guardPath: monitor.config.guardPath)
+        accountModel = model
+        accountObservation = model.$accounts
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] accounts in
+                self?.renderAccountRows(accounts)
+            }
+        accountRefreshObservation = model.$isRefreshing
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] refreshing in
+                guard let self else { return }
+                if refreshing {
+                    self.accountsSummaryLabel.stringValue = "Refreshing…"
+                } else {
+                    self.renderAccountRows(model.accounts)
+                }
+            }
+        loadAccountsIfNeeded(force: true)
         if let button = statusItem.button {
             if #available(macOS 11.0, *) {
                 button.image = guardMarkImage(size: NSSize(width: 19, height: 19), state: .starting, isTemplate: true)
@@ -710,6 +739,8 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         root.spacing = 4
         root.edgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
         root.translatesAutoresizingMaskIntoConstraints = false
+        root.setContentCompressionResistancePriority(.required, for: .vertical)
+        popoverRootStack = root
         background.addSubview(root)
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 12),
@@ -747,11 +778,26 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         root.addArrangedSubview(recentStack)
 
         let topRule = separator()
+        let accountRule = separator()
         let bottomRule = separator()
         root.addArrangedSubview(topRule)
         root.setCustomSpacing(6, after: topRule)
         root.addArrangedSubview(recentDeniedRow())
         root.setCustomSpacing(6, after: deniedRow)
+        root.addArrangedSubview(accountRule)
+        root.setCustomSpacing(5, after: accountRule)
+        let accountDisclosure = accountDisclosureRow()
+        root.addArrangedSubview(accountDisclosure)
+        root.setCustomSpacing(2, after: accountDisclosure)
+        accountsStack.orientation = .vertical
+        accountsStack.alignment = .width
+        accountsStack.spacing = 1
+        accountsStack.translatesAutoresizingMaskIntoConstraints = false
+        accountsStack.setContentCompressionResistancePriority(.required, for: .vertical)
+        accountsStack.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
+        accountsStack.isHidden = true
+        root.addArrangedSubview(accountsStack)
+        root.setCustomSpacing(5, after: accountsStack)
         root.addArrangedSubview(bottomRule)
         root.setCustomSpacing(7, after: bottomRule)
         root.addArrangedSubview(menuAction("Open Monitor", symbol: "waveform.path.ecg.rectangle", action: #selector(openMonitor(_:))))
@@ -791,6 +837,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         statusMenu.addItem(menuItem(deniedTitle, symbol: "xmark.octagon", action: #selector(openDenied(_:))))
         statusMenu.addItem(.separator())
         statusMenu.addItem(menuItem("Open Monitor", symbol: "rectangle.3.group", action: #selector(openMonitor(_:)), keyEquivalent: "0"))
+        statusMenu.addItem(menuItem("Accounts…", symbol: "person.crop.circle.badge.checkmark", action: #selector(openAccounts(_:))))
         statusMenu.addItem(menuItem("Manage Rules...", symbol: "list.bullet.rectangle", action: #selector(openRules(_:)), keyEquivalent: "1"))
         statusMenu.addItem(menuItem("Guard Settings...", symbol: "gearshape", action: #selector(openSettings(_:)), keyEquivalent: ","))
     }
@@ -1022,7 +1069,8 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         deniedRow.layer?.backgroundColor = NSColor.clear.cgColor
         deniedRow.contentTintColor = .labelColor
         deniedRow.translatesAutoresizingMaskIntoConstraints = false
-        deniedRow.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        deniedRow.setContentCompressionResistancePriority(.required, for: .vertical)
+        deniedRow.heightAnchor.constraint(equalToConstant: 30).isActive = true
         deniedRow.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
 
         let row = NSStackView()
@@ -1059,6 +1107,178 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         return deniedRow
     }
 
+    func accountDisclosureRow() -> NSView {
+        let button = GuardPopoverButton()
+        button.title = ""
+        button.isBordered = false
+        button.target = self
+        button.action = #selector(toggleAccounts(_:))
+        button.setAccessibilityLabel("Expand account session status")
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.setContentCompressionResistancePriority(.required, for: .vertical)
+        button.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        button.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
+
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 9
+        row.translatesAutoresizingMaskIntoConstraints = false
+        button.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: button.leadingAnchor),
+            row.trailingAnchor.constraint(equalTo: button.trailingAnchor),
+            row.topAnchor.constraint(equalTo: button.topAnchor),
+            row.bottomAnchor.constraint(equalTo: button.bottomAnchor),
+        ])
+
+        row.addArrangedSubview(symbolImage("person.crop.circle", tint: .secondaryLabelColor, size: 13, weight: .regular))
+        let title = NSTextField(labelWithString: "Accounts")
+        title.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        title.textColor = .labelColor
+        row.addArrangedSubview(title)
+        accountsSummaryLabel.font = NSFont.systemFont(ofSize: 10.5)
+        accountsSummaryLabel.textColor = .secondaryLabelColor
+        accountsSummaryLabel.alignment = .right
+        accountsSummaryLabel.lineBreakMode = .byTruncatingTail
+        accountsSummaryLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(accountsSummaryLabel)
+        accountsChevron.image = menuSymbol("chevron.right")
+        accountsChevron.contentTintColor = .tertiaryLabelColor
+        accountsChevron.imageScaling = .scaleProportionallyDown
+        accountsChevron.translatesAutoresizingMaskIntoConstraints = false
+        accountsChevron.widthAnchor.constraint(equalToConstant: 11).isActive = true
+        accountsChevron.heightAnchor.constraint(equalToConstant: 11).isActive = true
+        row.addArrangedSubview(accountsChevron)
+        return button
+    }
+
+    func renderAccountRows(_ accounts: [GuardAccountSnapshot]) {
+        accountsStack.arrangedSubviews.forEach { view in
+            accountsStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        let attention = accounts.filter {
+            $0.state == "expired" || $0.state == "signedOut" || $0.state == "unavailable" || $0.state == "error" || $0.isExpiring
+        }.count
+        let signedIn = accounts.filter { $0.state == "signedIn" && !$0.isExpiring }.count
+        if accounts.isEmpty {
+            accountsSummaryLabel.stringValue = "None configured"
+        } else if attention > 0 {
+            accountsSummaryLabel.stringValue = "\(attention) attention · \(signedIn) in"
+        } else {
+            accountsSummaryLabel.stringValue = "\(signedIn) signed in"
+        }
+
+        let visible = Array(accounts.prefix(5))
+        cachedAccountRowCount = visible.count
+        for account in visible {
+            accountsStack.addArrangedSubview(accountStatusRow(account))
+        }
+        accountsStack.addArrangedSubview(menuAction(
+            accounts.count > visible.count ? "Open All \(accounts.count) Accounts…" : "Open Accounts…",
+            symbol: "person.2",
+            action: #selector(openAccounts(_:))
+        ))
+        accountsStack.isHidden = !accountsExpanded
+        accountsChevron.image = menuSymbol(accountsExpanded ? "chevron.down" : "chevron.right")
+        resizePopover(recentRowCount: cachedRecentRowCount, hasTraffic: cachedHasTraffic)
+    }
+
+    func accountStatusRow(_ account: GuardAccountSnapshot) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 7
+        row.edgeInsets = NSEdgeInsets(top: 1, left: 2, bottom: 1, right: 1)
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.setContentCompressionResistancePriority(.required, for: .vertical)
+        row.heightAnchor.constraint(equalToConstant: 36).isActive = true
+        row.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
+
+        row.addArrangedSubview(symbolImage("circle.fill", tint: accountTint(account), size: 7, weight: .regular))
+        let labels = NSStackView()
+        labels.orientation = .vertical
+        labels.alignment = .leading
+        labels.spacing = 0
+        labels.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let title = NSTextField(labelWithString: account.label)
+        title.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+        title.lineBreakMode = .byTruncatingTail
+        title.maximumNumberOfLines = 1
+        title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let detail = NSTextField(labelWithString: compactAccountDetail(account))
+        detail.font = NSFont.systemFont(ofSize: 9.5)
+        detail.textColor = accountTint(account)
+        detail.lineBreakMode = .byTruncatingMiddle
+        detail.maximumNumberOfLines = 1
+        detail.toolTip = [account.statusLabel, account.identity, account.target.label, account.expiresAt].filter { !$0.isEmpty }.joined(separator: " · ")
+        detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        labels.addArrangedSubview(title)
+        labels.addArrangedSubview(detail)
+        row.addArrangedSubview(labels)
+        row.addArrangedSubview(NSView())
+        row.addArrangedSubview(accountMiniAction(
+            "arrow.clockwise",
+            accountId: account.id,
+            action: #selector(refreshAccount(_:)),
+            tooltip: "Refresh \(account.label)"
+        ))
+        if account.loginAvailable {
+            row.addArrangedSubview(accountMiniAction(
+                "key",
+                accountId: account.id,
+                action: #selector(loginAccount(_:)),
+                tooltip: "Login again to \(account.label)"
+            ))
+        }
+        return row
+    }
+
+    func accountMiniAction(_ symbol: String, accountId: String, action: Selector, tooltip: String) -> NSButton {
+        let button = GuardAccountActionButton()
+        button.accountId = accountId
+        button.title = ""
+        button.controlSize = .mini
+        button.bezelStyle = .accessoryBarAction
+        button.isBordered = true
+        button.target = self
+        button.action = action
+        button.toolTip = tooltip
+        button.setAccessibilityLabel(tooltip)
+        button.image = menuSymbol(symbol)
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleProportionallyDown
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.setContentCompressionResistancePriority(.required, for: .vertical)
+        button.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        return button
+    }
+
+    func compactAccountDetail(_ account: GuardAccountSnapshot) -> String {
+        var parts = [account.stale ? "\(account.statusLabel) (stale)" : account.statusLabel]
+        if !account.identity.isEmpty {
+            parts.append(account.identity)
+        } else if !account.target.label.isEmpty {
+            parts.append(account.target.label)
+        }
+        if let expiry = GuardAccountSnapshot.parseDate(account.expiresAt) {
+            let formatter = RelativeDateTimeFormatter()
+            formatter.unitsStyle = .abbreviated
+            parts.append("expires \(formatter.localizedString(for: expiry, relativeTo: Date()))")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    func accountTint(_ account: GuardAccountSnapshot) -> NSColor {
+        if account.state == "signedIn" && !account.isExpiring { return .systemGreen }
+        if account.state == "expired" || account.state == "signedOut" || account.state == "error" { return .systemRed }
+        if account.state == "unavailable" || account.isExpiring { return .systemOrange }
+        return .secondaryLabelColor
+    }
+
     func menuAction(_ title: String, symbol: String, action: Selector) -> NSButton {
         let button = GuardPopoverButton()
         button.title = ""
@@ -1069,6 +1289,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         button.layer?.cornerRadius = 6
         button.layer?.cornerCurve = .continuous
         button.translatesAutoresizingMaskIntoConstraints = false
+        button.setContentCompressionResistancePriority(.required, for: .vertical)
         button.heightAnchor.constraint(equalToConstant: 24).isActive = true
         button.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
 
@@ -1181,8 +1402,16 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         return line
     }
 
+    func loadAccountsIfNeeded(force: Bool = false) {
+        let now = Date()
+        guard force || now.timeIntervalSince(lastAccountCacheLoadAt) >= 30 else { return }
+        lastAccountCacheLoadAt = now
+        accountModel?.loadCached()
+    }
+
     func refresh(rebuildRecent: Bool = true, notify: Bool = true) {
         guard let monitor else { return }
+        loadAccountsIfNeeded()
         let denied = monitor.recentDeniedCount
         let pending = monitor.pendingAlertCount
         let allowed = monitor.recentAllowedCount
@@ -1263,7 +1492,11 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         let visibleRows = max(1, min(4, recentRowCount))
         let activityHeight = CGFloat(visibleRows - 1) * 32
         let chartHeight: CGFloat = hasTraffic ? 44 : 0
-        popover.contentSize = NSSize(width: 312, height: 272 + activityHeight + chartHeight)
+        let accountHeight: CGFloat = 36 + (accountsExpanded ? CGFloat(cachedAccountRowCount * 37 + 26) : 0)
+        let estimatedHeight = 288 + activityHeight + chartHeight + accountHeight
+        popoverRootStack?.layoutSubtreeIfNeeded()
+        let fittedHeight = ceil(popoverRootStack?.fittingSize.height ?? 0) + 16
+        popover.contentSize = NSSize(width: 312, height: max(estimatedHeight, fittedHeight))
     }
 
     func statusItemTintColor(active: Bool) -> NSColor? {
@@ -1397,6 +1630,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
             : "Open \(events.count) recent Guard activities")
         button.translatesAutoresizingMaskIntoConstraints = false
         button.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        button.widthAnchor.constraint(equalToConstant: popoverContentWidth).isActive = true
 
         content.translatesAutoresizingMaskIntoConstraints = false
         button.addSubview(content)
@@ -1736,6 +1970,7 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
         if popover.isShown {
             popover.performClose(sender)
         } else {
+            loadAccountsIfNeeded(force: true)
             resizePopover(recentRowCount: cachedRecentRowCount, hasTraffic: cachedHasTraffic)
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
@@ -1763,6 +1998,39 @@ final class GuardStatusItemController: NSObject, NSMenuDelegate {
     @objc func openSettings(_ sender: Any?) {
         monitor?.openSettingsWindow(sender)
         popover.performClose(sender)
+    }
+
+    @objc func toggleAccounts(_ sender: Any?) {
+        accountsExpanded.toggle()
+        if accountsExpanded { loadAccountsIfNeeded(force: true) }
+        accountsStack.isHidden = !accountsExpanded
+        accountsChevron.image = menuSymbol(accountsExpanded ? "chevron.down" : "chevron.right")
+        resizePopover(recentRowCount: cachedRecentRowCount, hasTraffic: cachedHasTraffic)
+    }
+
+    @objc func openAccounts(_ sender: Any?) {
+        monitor?.openAccountsWindow(sender)
+        popover.performClose(sender)
+    }
+
+    @objc func refreshAccount(_ sender: Any?) {
+        guard let button = sender as? GuardAccountActionButton else { return }
+        accountModel?.refresh(id: button.accountId)
+    }
+
+    @objc func loginAccount(_ sender: Any?) {
+        guard let button = sender as? GuardAccountActionButton,
+              let account = accountModel?.accounts.first(where: { $0.id == button.accountId }),
+              let monitor else { return }
+        if popover.isShown { popover.performClose(sender) }
+        DispatchQueue.main.async {
+            let controller = monitor.accountsWindowController ?? AccountsWindowController()
+            monitor.accountsWindowController = controller
+            controller.showWindow(nil)
+            controller.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            controller.confirmLogin(account)
+        }
     }
 
     @objc func openDenied(_ sender: Any?) {
@@ -1850,6 +2118,10 @@ class GuardPopoverButton: NSButton {
             ? NSColor.controlAccentColor.withAlphaComponent(0.08)
             : NSColor.clear).cgColor
     }
+}
+
+final class GuardAccountActionButton: NSButton {
+    var accountId = ""
 }
 
 func installMainMenu(appName: String, delegate: GuardApplicationDelegate) {
@@ -6373,6 +6645,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     let invalidateExtensionButton = NSButton()
     let openRulesWindowButton = NSButton()
     let openTemplatesWindowButton = NSButton()
+    let openAccountsWindowButton = NSButton()
     let openSettingsWindowButton = NSButton()
     let addProjectFolderButton = NSButton()
     let previewTemplateButton = NSButton()
@@ -6391,6 +6664,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
     var inspectorWidthConstraint: NSLayoutConstraint?
     var settingsWindow: NSWindow?
     var settingsWindowController: SettingsWindowController?
+    var accountsWindowController: AccountsWindowController?
     var templatesWindow: NSWindow?
     var logWindow: NSWindow?
     var logTextView: NSTextView?
@@ -6635,9 +6909,11 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
         tools.spacing = 5
         configureToolButton(openRulesWindowButton, title: "Rules", symbol: "slider.horizontal.3", action: #selector(openRulesWindow(_:)), tooltip: "Open profile and network rules.")
         configureToolButton(openTemplatesWindowButton, title: "Templates", symbol: "square.grid.2x2", action: #selector(openTemplatesWindow(_:)), tooltip: "Open reusable policy templates.")
+        configureToolButton(openAccountsWindowButton, title: "Accounts", symbol: "person.crop.circle.badge.checkmark", action: #selector(openAccountsWindow(_:)), tooltip: "Review configured developer account sessions.")
         configureToolButton(openSettingsWindowButton, title: "Settings", symbol: "gearshape", action: #selector(openSettingsWindow(_:)), tooltip: "Open monitor, daemon, TLS, and extension settings.")
         tools.addArrangedSubview(openRulesWindowButton)
         tools.addArrangedSubview(openTemplatesWindowButton)
+        tools.addArrangedSubview(openAccountsWindowButton)
         tools.addArrangedSubview(openSettingsWindowButton)
         row.addArrangedSubview(tools)
         return row
@@ -6664,6 +6940,7 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             .space,
             NSToolbarItem.Identifier("rules"),
             NSToolbarItem.Identifier("templates"),
+            NSToolbarItem.Identifier("accounts"),
             NSToolbarItem.Identifier("settings"),
             .flexibleSpace,
             NSToolbarItem.Identifier("search"),
@@ -6701,6 +6978,12 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
             item.target = self
             item.action = #selector(openTemplatesWindow(_:))
             if #available(macOS 11.0, *) { item.image = NSImage(systemSymbolName: "square.grid.2x2", accessibilityDescription: "Templates") }
+        case "accounts":
+            item.label = "Accounts"
+            item.paletteLabel = "Accounts"
+            item.target = self
+            item.action = #selector(openAccountsWindow(_:))
+            if #available(macOS 11.0, *) { item.image = NSImage(systemSymbolName: "person.crop.circle.badge.checkmark", accessibilityDescription: "Accounts") }
         case "settings":
             item.label = "Settings"
             item.paletteLabel = "Settings"
@@ -8981,6 +9264,14 @@ final class MonitorWindowController: NSObject, NSWindowDelegate, NSTableViewData
                 self.openSettingsWindow(nil)
             }
         }
+    }
+
+    @objc func openAccountsWindow(_ sender: Any?) {
+        let controller = accountsWindowController ?? AccountsWindowController()
+        accountsWindowController = controller
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     @objc func openSettingsWindow(_ sender: Any?) {

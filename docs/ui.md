@@ -45,6 +45,7 @@ The monitor uses native AppKit/SwiftUI-style macOS surfaces, including:
 - rules window.
 - settings window.
 - daemon health and TLS status views.
+- account-session status with last-used/expiry metadata and supervised login.
 - event-log and daemon-backed refresh paths.
 
 The monitor can start or connect to a local `guardd` for richer state and
