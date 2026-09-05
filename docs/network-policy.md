@@ -101,3 +101,79 @@ GUARD_IRON_PROXY_BIN=/path/to/iron-proxy
 
 Project profiles should hold durable allow/deny rules. Use global environment
 settings only for local UI/runtime preferences.
+
+## Backend compatibility requirements
+
+## Network Policy Requirements
+
+Guard has three intentionally different egress mechanisms. Keep their contracts
+separate in code, docs, UI, and tests:
+
+- `network.allowedDomains`: domain allowlist for traffic that cooperates with
+  Guard's per-run proxy environment. The sandbox should still block direct raw
+  egress so clients cannot bypass domain policy by opening sockets themselves.
+- `network.httpRules`: deep HTTP policy for the `iron-proxy` backend. This is
+  the place for host/domain, method, path, header, and TLS inspection behavior
+  when traffic can be routed through the proxy.
+- `network.allowedRawTcp`: exact IP:port sandbox egress exceptions for tools
+  that cannot reasonably use the proxy path. In the current `sandbox-exec`
+  backend this is limited to loopback destinations because macOS rejects exact
+  external `remote ip "x.x.x.x:port"` filters; use the SOCKS/SSH proxy path for
+  external SSH until a Network Extension backend owns exact destination rules.
+
+`allowedRawTcp` rules must be narrow and reviewable:
+
+- Accept `{ "ip": "127.0.0.1", "port": 8976 }` or equivalent loopback
+  addresses for explicit addresses in the per-run sandbox backend.
+- Accept `{ "host": "localhost", "resolveAtLaunch": true, "port": 8976 }`
+  when a profile author deliberately chooses DNS resolution at run startup.
+- Reject host rules that omit `resolveAtLaunch: true`; a hostname in a sandbox
+  `remote ip` rule would otherwise be misleading and fail open or fail closed in
+  ways users cannot reason about.
+- Resolve host rules once per guarded run, emit an event containing the rule ID,
+  host, port, resolved addresses, and reason, then render exact `ip:port`
+  sandbox rules where the active backend supports that destination class.
+- Reject exact external raw TCP in the current `sandbox-exec` backend with a
+  clear error that points users to `GUARD_SSH_PROXY_COMMAND`, `GIT_SSH_COMMAND`,
+  or the future Network Extension backend.
+- Do not support wildcard ports, raw DNS egress, raw ICMP, or CIDR-wide direct
+  TCP in the per-run sandbox path until there is a stronger product reason and
+  matching UI/audit language.
+
+The normal Guard backend and `iron-proxy` backend must expose the same
+client-facing proxy contract:
+
+- `HTTP_PROXY`, `HTTPS_PROXY`, lowercase variants, npm/yarn/pnpm proxy env, and
+  other HTTP-aware variables point at the per-run HTTP proxy.
+- `ALL_PROXY`, lowercase variant, FTP/Git/Rust/Go/rsync SOCKS-style variables,
+  and `GUARD_SOCKS_PROXY` point at the per-run SOCKS listener.
+- `GUARD_SSH_PROXY_COMMAND` contains an `ssh_config`-compatible
+  `ProxyCommand`, and `GIT_SSH_COMMAND` wraps that command for Git over SSH.
+- Helper scripts should read `GUARD_SOCKS_PROXY` or
+  `GUARD_SSH_PROXY_COMMAND` rather than hardcoding backend internals.
+
+PacketSafari-style helper requirements should be represented as ordinary
+project profile rules: allow read/write for the specific PCAP folder, allow the
+specific SSH key or ssh-agent socket/known_hosts path needed by the workflow,
+and prefer proxy-routed SSH through the SOCKS environment. Add
+`allowedRawTcp` only when the helper cannot use SSH `ProxyCommand` or SOCKS.
+
+User-facing model:
+
+- Profiles: Node app, Cloudflare Wrangler, Zoom, Teams, Webex, unknown repo,
+  AI coding agent, and other reusable app/project templates.
+- Rules: allow domain, deny domain, allow HTTP path, allow local filesystem
+  path, deny secret files, allow once, allow until quit, and persistent allow or
+  deny.
+- Live Monitor: group activity by app, project, profile, process, destination,
+  and rule outcome; clearly distinguish allowed, denied, inspected, direct, and
+  proxied traffic.
+- Alert Popup: show specific decisions such as `node` wanting to `POST` to
+  `api.openai.com/v1/responses`, with actions like Allow Once, Allow Path,
+  Allow Domain, Deny, and Open Rules.
+- Templates: reusable policy packs for workflows such as Node package install,
+  Vite dev server, OpenAI API client, Cloudflare deploy, video calls, and
+  high-risk repo exploration.
+- Settings: proxy CA status, Network Extension status, default deny behavior,
+  log retention, profile storage, privacy controls, update checks, and
+  diagnostics export.

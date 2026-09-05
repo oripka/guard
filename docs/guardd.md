@@ -183,3 +183,72 @@ Current limitations:
 - no signed/notarized installer yet.
 - no production Network Extension activation or recovery lifecycle yet.
 - no replacement for the daemon-free CLI fallback path.
+
+## Shared architecture requirements
+
+## Two-Mode Goal
+
+Keep Guard cleanly split into two supported operating modes:
+
+- Simple per-run mode: `guard`, `guard --ask-network`, and
+  `guard --deep-egress --ask-network` must remain daemon-free, easy to reason
+  about, and suitable for development commands, one-off shells, CI-like local
+  runs, and quick repo exploration. This mode starts any needed local proxy for
+  the current run only, stores temporary state under the run directory, and
+  should keep working even when no Guard daemon, native UI, launch agent, or
+  Network Extension is installed.
+- Daemon/UI mode: `guardd`, Guard.app, native alerts, monitor windows, rule
+  editors, persistent policy databases, and Network Extension integrations can
+  provide the richer Little Snitch-style experience. This mode may manage
+  shared policy state, persistent rules, event history, long-running proxy
+  instances, and native notifications.
+
+Do not make the simple per-run path depend on daemon/UI availability. The daemon
+and UI should be additive: when available, the CLI may delegate richer policy
+decisions to them; when unavailable, the CLI should retain the current local
+fallback behavior.
+
+Shared code should live behind clear boundaries so both modes use the same rule
+language and policy semantics where practical:
+
+- profile loading and template imports
+- host/domain, method, path, and wildcard rule matching
+- raw TCP destination rule normalization and launch-time host resolution
+- iron-proxy config generation
+- proxy environment generation for HTTP, SOCKS, SSH, Git, package managers,
+  and helper scripts
+- network decision/event schemas
+- prompt decision protocol and result shapes
+- audit/discovery summaries
+
+Mode-specific code should stay separate:
+
+- per-run prompt service and temporary decision cache
+- daemon lifecycle and persistent rule store
+- native menu bar app, alerts, rule editor, and monitor UI
+- Network Extension/System Extension setup and adapters
+
+## Target Architecture
+
+The long-term design target is a unified macOS security app that combines
+Guard's process/filesystem policy model with iron-proxy's deep HTTP policy and
+Apple's modern Network Extension model. Prefer a System Extension plus
+`NetworkExtension.framework` over any kernel extension approach.
+
+Core components:
+
+- `Guard.app`: native macOS UI with a menu bar monitor, live activity view,
+  rules editor, profile/template editor, settings, and allow/deny/ask alerts.
+- `guardd`: local policy daemon that owns persistent policy state, launches
+  guarded runs, starts per-profile proxy instances, aggregates events, and
+  exposes a local API to the UI and CLI.
+- `guard` CLI: developer entrypoint that keeps current workflows working and
+  delegates to `guardd` when available.
+- `iron-proxy`: deep HTTP/HTTPS policy backend for domain, method, path,
+  header, and request-level decisions when traffic is routed through the local
+  proxy.
+- Network Extension: app/process/destination-level visibility and coarse
+  allow/deny enforcement for direct egress, bypass detection, and traffic that
+  does not cooperate with proxy environment variables.
+- sandbox layer: per-run filesystem containment, fake home/temp directories,
+  read/write rules, and project/app profile enforcement.
